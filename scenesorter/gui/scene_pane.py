@@ -103,6 +103,7 @@ class ScenePane(QSplitter):
         self.grid.customContextMenuRequested.connect(self._context_menu)
         self.grid.selectionModel().currentChanged.connect(self._current_changed)
         self.grid.deselected.connect(lambda: self.show_scene(None))
+        self.list.needs_repaint.connect(self._repaint)
 
         # Coalesce bursts of changes (typing, several pages arriving) into one background pass.
         self._debounce = QTimer(self, singleShot=True, interval=120, timeout=self._compute)
@@ -205,6 +206,13 @@ class ScenePane(QSplitter):
                 self._scroll_target = first_top + (row // per_row) * cell_h - anchor_offset
                 self._apply_scroll_target()
         self.count_changed.emit(len(rows))
+
+    def _repaint(self, row: int) -> None:
+        """Redraw without telling the view the data changed (that would re-layout 100k cards)."""
+        if row < 0:
+            self.grid.viewport().update()
+        else:
+            self.grid.update(self.list.index(row))
 
     def _grid_geometry(self) -> tuple[int, int, int] | None:
         """(content y of the first card, cards per row, row height) of the current layout."""

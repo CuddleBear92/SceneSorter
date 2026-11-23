@@ -97,7 +97,14 @@ class SceneModel(QObject):
 
 
 class SceneListModel(QAbstractListModel):
-    """One pane's visible scenes (already filtered and sorted)."""
+    """One pane's visible scenes (already filtered and sorted).
+
+    Repaints are *not* signalled with dataChanged: on a 100k+ item wrapping list with
+    batched layout, dataChanged makes the view lay everything out again, which resets the
+    scroll range and throws the user back to the top. Cards read fresh data whenever they
+    are painted, so the pane just redraws the visible area instead (``needs_repaint``)."""
+
+    needs_repaint = Signal(int)  # row, or -1 for everything visible
 
     def __init__(self, store: SceneModel, parent=None):
         super().__init__(parent)
@@ -116,8 +123,7 @@ class SceneListModel(QAbstractListModel):
     def replace_rows(self, rows: list[Scene]) -> None:
         """Same keys in the same order, newer objects: swap without a model reset."""
         self.rows = rows
-        if rows:
-            self.dataChanged.emit(self.index(0), self.index(len(rows) - 1))
+        self.needs_repaint.emit(-1)
 
     def row_of(self, key: str) -> int | None:
         return self._row.get(key)
@@ -126,10 +132,9 @@ class SceneListModel(QAbstractListModel):
         if not self.rows:
             return
         if not key:
-            self.dataChanged.emit(self.index(0), self.index(len(self.rows) - 1))
+            self.needs_repaint.emit(-1)
         elif (row := self._row.get(key)) is not None:
-            idx = self.index(row)
-            self.dataChanged.emit(idx, idx)
+            self.needs_repaint.emit(row)
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.rows)
