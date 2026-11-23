@@ -119,3 +119,55 @@ def test_studio_not_in_tags():
     r = enrich(Release("blog", "1", "", "StudioName.24.01.15.Jane.Doe.XXX.1080p.MP4-PRT",
                        tags=["Studio Name", "Blonde", "studioname.com", "POV", "blonde"]))
     assert r.tags == ["Blonde", "POV"]
+
+
+def _r(title, source, pid, dur=None):
+    return enrich(Release(source, pid, "", title, duration_s=dur))
+
+
+def test_merge_across_sites_with_different_dates_when_runtime_matches():
+    # Real-world case: the two sites list different dates for the same scene.
+    a = _r("MrLuckyPOV.23.08.17.Eve.Marlowe.Sensual.Sex.With.Blue.Haired.Babe.XXX.1080p.HEVC.x265.PRT",
+           "blog", "1", 1772)
+    b = _r("[Mr. LuckyPOV] Eve Marlowe, Tyler D. - Eve Marlowe Sensual Sex With Blue Haired Babe (2023-07-07) [720p]",
+           "premium", "2", 1772)
+    (s,) = merge_releases([a, b])
+    assert s.sources == ["blog", "premium"] and s.resolutions == ["1080p", "720p"]
+
+
+def test_other_date_needs_runtime_or_identical_long_title():
+    t1 = "MrLuckyPOV.23.08.17.Eve.Marlowe.Sensual.Sex.With.Blue.Haired.Babe.XXX.1080p.HEVC.x265.PRT"
+    t2 = "MrLuckyPOV.23.07.07.Eve.Marlowe.Sensual.Sex.With.Blue.Haired.Babe.XXX.720p.MP4-GUSH"
+    # identical long titles, no runtimes -> merge
+    assert len(merge_releases([_r(t1, "a", "1"), _r(t2, "b", "2")])) == 1
+    # clearly different runtimes -> two scenes even with identical titles
+    assert len(merge_releases([_r(t1, "a", "1", 1772), _r(t2, "b", "2", 900)])) == 2
+    # short generic title on different dates, no runtime -> not merged
+    g1, g2 = "Studio.23.01.01.Jane.Doe.Hot.XXX.1080p.MP4-PRT", "Studio.23.05.01.Jane.Doe.Hot.XXX.1080p.MP4-PRT"
+    assert len(merge_releases([_r(g1, "a", "1"), _r(g2, "b", "2")])) == 2
+    # same runtime but different titles -> not merged
+    d1 = "Studio.23.01.01.Jane.Doe.Pool.Party.Fun.XXX.1080p.MP4-PRT"
+    d2 = "Studio.23.03.01.Jane.Doe.Office.Overtime.XXX.1080p.MP4-PRT"
+    assert len(merge_releases([_r(d1, "a", "1", 1800), _r(d2, "b", "2", 1800)])) == 2
+
+
+def test_same_date_but_far_runtime_not_merged():
+    a = _r("Studio.24.01.15.Jane.Doe.Unbound.Part.1.XXX.1080p.MP4-PRT", "a", "1", 4000)
+    b = _r("Studio.24.01.15.Jane.Doe.Unbound.Part.1.Trailer.XXX.1080p.MP4-PRT", "b", "2", 120)
+    assert len(merge_releases([a, b])) == 2
+
+
+def test_file_and_stashbox_match_either_date():
+    from scenesorter.filematch import SceneIndex
+    from scenesorter.stashbox import pick_scene
+    a = _r("MrLuckyPOV.23.08.17.Eve.Marlowe.Sensual.Sex.With.Blue.Haired.Babe.XXX.1080p.HEVC.x265.PRT", "blog", "1", 1772)
+    b = _r("[Mr. LuckyPOV] Eve Marlowe - Eve Marlowe Sensual Sex With Blue Haired Babe (2023-07-07) [720p]",
+           "premium", "2", 1772)
+    (s,) = merge_releases([a, b])
+    idx = SceneIndex([s])
+    for name in ["Mr. LuckyPOV - 2023-07-07 - Eve Marlowe - Sensual Sex With Blue Haired Babe [WEBDL-720p].mp4",
+                 "Mr. LuckyPOV - 2023-08-17 - Eve Marlowe - Sensual Sex With Blue Haired Babe [WEBDL-1080p].mp4"]:
+        assert idx.match(name).scene is s
+    cand = {"id": "x", "title": "Sensual Sex With Blue Haired Babe", "date": "2023-07-07", "studio": "Mr Lucky POV",
+            "parent": "", "performers": [{"id": "e", "name": "Eve Marlowe"}], "image_url": None, "duration": 1770}
+    assert pick_scene(s, [cand])["id"] == "x"

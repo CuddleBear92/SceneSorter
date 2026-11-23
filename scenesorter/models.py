@@ -83,6 +83,11 @@ class Scene:
         return next((r.scene_date for r in self.releases if r.scene_date), None)
 
     @property
+    def scene_dates(self) -> list[date]:
+        """Every date the sites give this scene (they don't always agree)."""
+        return sorted({r.scene_date for r in self.releases if r.scene_date})
+
+    @property
     def posted(self) -> date | None:
         dates = [r.posted for r in self.releases if r.posted]
         return max(dates) if dates else None

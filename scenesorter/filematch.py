@@ -98,8 +98,8 @@ class SceneIndex:
             k = normalise_studio(s.studio)
             self.by_studio[k].append(s)
             # official stash-box spelling resolves to the same key, nothing extra to index
-            if s.scene_date:
-                self.by_date[s.scene_date].append(s)
+            for d in s.scene_dates:
+                self.by_date[d].append(s)
             words: set[str] = set()
             for r in s.releases:
                 words |= set(tokens(" ".join(r.performers) + " " + r.title))
@@ -127,8 +127,8 @@ class SceneIndex:
         for s in cands:
             st = self.toks[s.key]
             overlap = max(_jaccard(words, st), 0.9 * _containment(st, words), 0.9 * _containment(words, st))
-            if d and s.scene_date:
-                delta = abs((s.scene_date - d).days)
+            if d and s.scene_dates:
+                delta = min(abs((sd - d).days) for sd in s.scene_dates)
                 if delta <= 1:
                     if not words:
                         wordless.append(s)

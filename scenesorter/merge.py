@@ -7,6 +7,7 @@ from datetime import date
 
 from .models import Release, Scene
 from .parsing import match_key, normalise_studio, tokens
+from .stashbox import duration_check
 
 FUZZY_THRESHOLD = 0.75
 STRICT_THRESHOLD = 0.85
@@ -14,6 +15,29 @@ STRICT_THRESHOLD = 0.85
 
 def _body_tokens(r: Release) -> frozenset[str]:
     return frozenset(tokens(" ".join(r.performers) + " " + r.title))
+
+
+def _duration(group: list[Release]) -> int | None:
+    return max((r.duration_s for r in group if r.duration_s), default=None)
+
+
+def same_scene_other_date(a: frozenset[str], b: frozenset[str], dur: str) -> bool:
+    """Same studio, but the sites list different dates (one uses the shoot date,
+    the other the release date, or a re-post). Only merge on strong evidence:
+
+    * runtimes agree (``dur == 'close'``) and the words (nearly) match — one side
+      may add performer names the other has only in the title;
+    * no runtime to compare: the word sets must be identical and long enough
+      not to be a generic title ("Hot Sex").
+    """
+    if dur == "far" or not a or not b:
+        return False
+    inter = len(a & b)
+    jaccard = inter / len(a | b)
+    small = min(len(a), len(b))
+    if dur == "close":
+        return jaccard >= 0.8 or (small >= 4 and inter == small)
+    return a == b and len(a) >= 6
 
 
 def similar(a: frozenset[str], b: frozenset[str], strict: bool = False) -> bool:
@@ -52,8 +76,11 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             i = parent[i]
         return i
 
-    # Fuzzy pass, per studio. Same date -> normal threshold. One side undated
-    # (messy post titles often omit it) -> stricter threshold.
+    # Fuzzy pass, per studio:
+    #   same date        -> normal word threshold
+    #   one side undated -> stricter threshold (messy titles often omit the date)
+    #   different dates  -> only with matching runtime or identical long titles
+    # A clearly different runtime (see stashbox.duration_check) never merges.
     by_studio: dict[str, list[int]] = defaultdict(list)
     for i, g in enumerate(groups):
         by_studio[normalise_studio(g[0].studio)].append(i)
@@ -63,14 +90,19 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             continue
         toks = {i: _body_tokens(groups[i][0]) for i in idxs}
         dates = {i: groups[i][0].scene_date for i in idxs}
+        durs = {i: _duration(groups[i]) for i in idxs}
         by_date: dict[date, list[int]] = defaultdict(list)
         undated: list[int] = []
         for i in idxs:
             (by_date[dates[i]] if dates[i] else undated).append(i)
 
+        def union(i: int, j: int) -> None:
+            parent[find(j)] = find(i)
+
         def try_union(i: int, j: int, strict: bool) -> None:
-            if find(i) != find(j) and similar(toks[i], toks[j], strict):
-                parent[find(j)] = find(i)
+            if find(i) != find(j) and duration_check(durs[i], durs[j]) != "far" \
+                    and similar(toks[i], toks[j], strict):
+                union(i, j)
 
         # Same date: buckets are tiny, compare all pairs.
         for same in by_date.values():
@@ -78,18 +110,29 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
                 for y in range(x + 1, len(same)):
                     try_union(same[x], same[y], strict=False)
 
-        # Undated: only compare against groups sharing one of its rarer tokens
-        # (keeps this near-linear for studios with thousands of posts).
-        if undated:
-            index: dict[str, list[int]] = defaultdict(list)
-            for i in idxs:
-                for t in toks[i]:
-                    index[t].append(i)
-            for i in undated:
-                rare = sorted(toks[i], key=lambda t: len(index[t]))[:2]
-                cands = {j for t in rare for j in index[t] if j != i}
-                for j in cands:
-                    try_union(j, i, strict=dates[j] is not None)
+        # Everything else only compares against groups sharing one of its rarer
+        # words (keeps this near-linear for studios with thousands of posts).
+        index: dict[str, list[int]] = defaultdict(list)
+        for i in idxs:
+            for t in toks[i]:
+                index[t].append(i)
+
+        def candidates(i: int) -> set[int]:
+            rare = sorted(toks[i], key=lambda t: len(index[t]))[:2]
+            return {j for t in rare for j in index[t] if j != i}
+
+        for i in undated:
+            for j in candidates(i):
+                try_union(j, i, strict=dates[j] is not None)
+
+        for i in idxs:
+            if not dates[i]:
+                continue
+            for j in candidates(i):
+                if j < i or not dates[j] or abs((dates[i] - dates[j]).days) <= 1 or find(i) == find(j):
+                    continue
+                if same_scene_other_date(toks[i], toks[j], duration_check(durs[i], durs[j])):
+                    union(i, j)
 
     merged: dict[int, list[Release]] = defaultdict(list)
     for i, g in enumerate(groups):

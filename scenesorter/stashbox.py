@@ -200,8 +200,8 @@ def pick_scene(scene, candidates: list[dict]) -> dict | None:
             cdate = _date.fromisoformat(c["date"][:10]) if c.get("date") else None
         except ValueError:
             pass
-        if scene.scene_date and cdate:
-            delta = abs((cdate - scene.scene_date).days)
+        if scene.scene_dates and cdate:
+            delta = min(abs((cdate - d).days) for d in scene.scene_dates)
             if delta > 1 or sim < (0.15 if dur == "close" else 0.3):
                 continue
             score = 0.6 + 0.4 * sim - 0.05 * delta
