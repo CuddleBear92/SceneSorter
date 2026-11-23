@@ -32,7 +32,7 @@ jobs:
         shell: bash
         run: echo "__version__ = \"0.0.0-dev+${GITHUB_SHA::7}\"" > scenesorter/_version.py
       - run: pyinstaller --noconfirm --onefile --windowed --name SceneSorter run.py
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: SceneSorter-${{ github.sha }}
           path: dist/SceneSorter.exe
