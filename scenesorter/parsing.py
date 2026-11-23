@@ -22,7 +22,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "6"
+PARSER_VERSION = "7"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -344,6 +344,13 @@ def enrich(r: Release) -> Release:
     r.release_group = r.release_group or find_group(r.filename or "") or find_group(r.raw_title)
     if not r.resolution and r.filename:
         r.resolution = find_resolution(r.filename)
+    if r.filename and (not r.scene_date or not r.studio):
+        # Sites that post a plain title ("Compilation", "Veronika Lei") often carry the
+        # scene-style release name only as the file name. Its date matters a lot: without it,
+        # every "Compilation" from one studio looks like the same undated scene.
+        f = parse_title(VIDEO_EXT_RE.sub("", r.filename))
+        r.scene_date = r.scene_date or f["scene_date"]
+        r.studio = r.studio or f["studio"]
     r.tags = clean_tags(r.tags, r.studio)
     filled = {f for f in TITLE_FIELDS if not before[f] and getattr(r, f)}
     r.parsed = sorted(set(r.parsed or []) | filled)
@@ -372,11 +379,12 @@ def reparse(r: Release, title_only_source: bool = False) -> Release:
     """Recompute *title-derived* fields after a parser upgrade. Fields the source supplied
     (e.g. a site's own studio/performer/title fields) are never touched.
 
-    Posts cached before field provenance was recorded (``parsed is None``) are only
-    re-parsed for sources whose posts are nothing but a title (``title_only_source``)."""
+    Posts cached before field provenance was recorded (``parsed is None``) are fully
+    re-parsed only for sources whose posts are nothing but a title (``title_only_source``);
+    for other sources they only get *missing* fields filled in (nothing is overwritten)."""
     if r.parsed is None:
         if not title_only_source:
-            return r
+            return enrich(r)  # fill-only: enrich never replaces a value that's already set
         r.parsed = list(TITLE_FIELDS)
     empty = {"studio": "", "performers": [], "title": "", "scene_date": None, "resolution": "", "release_group": ""}
     for f in r.parsed:

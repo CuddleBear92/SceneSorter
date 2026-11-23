@@ -203,6 +203,54 @@ def test_resolution_tags_dropped():
     assert r.tags == ["POV"]
 
 
+def _blog(name, pid):
+    return enrich(Release("pornrips", pid, "", name))
+
+
+def _prem(title, studio, performers, filename, pid):
+    # Shape of real EncodedFapFiles posts: plain title + studio/performers from the site,
+    # no scene date; the scene-style release name only exists as the file name.
+    return enrich(Release("encodedfap", pid, "", title, studio=studio, title=title,
+                          performers=performers, filename=filename))
+
+
+def test_date_taken_from_file_name_when_post_has_none():
+    r = _prem("Compilation", "ATK Girlfriends", [], "ATKGirlfriends.25.09.04.Compilation.XXX.1080p.HEVC.x265.PRT.mp4", "e")
+    assert r.scene_date == date(2025, 9, 4) and "scene_date" in r.parsed
+
+
+def test_premium_compilations_without_dates_do_not_collapse():
+    rels = []
+    for i, d in enumerate(["25.09.04", "25.09.12", "25.10.03", "26.11.23"]):
+        for res in ("1080p", "720p"):
+            n = f"ATKGirlfriends.{d}.Compilation.XXX.{res}.HEVC.x265.PRT"
+            rels += [_blog(n, f"a{i}{res}"), _prem("Compilation", "ATK Girlfriends", [], n + ".mp4", f"ae{i}{res}")]
+    scenes = merge_releases(rels)
+    assert len(scenes) == 4 and {len(s.releases) for s in scenes} == {4}
+
+
+def test_same_title_two_dates_each_premium_post_joins_its_own_date():
+    rels = []
+    for d in ("26.11.09", "26.11.23"):
+        for res in ("1080p", "720p"):
+            n = f"NebraskaCoeds.{d}.Veronika.Lei.XXX.{res}.HEVC.x265.PRT"
+            rels += [_blog(n, f"n{d}{res}"),
+                     _prem("Veronika Lei", "Nebraska Coeds", ["Veronika Lei"], n + ".mp4", f"ne{d}{res}")]
+    scenes = merge_releases(rels)
+    assert len(scenes) == 2
+    for s in scenes:
+        assert len(s.releases) == 4 and len(s.scene_dates) == 1        # both sites, one date each
+
+
+def test_legacy_premium_rows_get_missing_date_filled_on_reparse():
+    from scenesorter.parsing import reparse
+    r = _prem("Veronika Lei", "Nebraska Coeds", ["Veronika Lei"],
+              "NebraskaCoeds.26.11.23.Veronika.Lei.XXX.1080p.HEVC.x265.PRT.mp4", "x")
+    r.scene_date, r.parsed = None, None                              # cached by an older build
+    reparse(r, title_only_source=False)
+    assert r.scene_date == date(2026, 11, 23) and r.performers == ["Veronika Lei"]
+
+
 def _series(n_dates=6, dur=1800):
     days = ["24.11.29", "24.12.06", "24.12.13", "25.01.03", "25.01.10", "25.02.14", "25.03.07"][:n_dates]
     return [_r(f"StoryHotWives.{d}.Cum.Compilation.XXX.{res}.HEVC.x265.PRT", "pornrips", f"{d}{res}", dur)
