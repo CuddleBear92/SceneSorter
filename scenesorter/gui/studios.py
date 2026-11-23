@@ -73,6 +73,11 @@ class LogoService(QObject):
         if not self.boxes:
             return
         known = self.db.studio_keys_checked(RETRY_NOT_FOUND_S)
+        # Logos we know about but whose file is missing get downloaded again (once per session
+        # this scans the folder; files lost to an older build's cache pruning come back).
+        if not getattr(self, "_repair_scanned", False):
+            self._repair_scanned = True
+            known -= {k for k, f in self.db.studio_logo_files().items() if not (self.dir / f).exists()}
         for key, name in studios:
             if key not in known and key not in self.queued:
                 self.queued.add(key)
@@ -90,7 +95,9 @@ class LogoService(QObject):
                 pm = load_file(self.dir / row["logo_file"], LOGO_SIZE)
                 self.mem.put(key, pm)
                 return pm
-            if time.time() - (row["checked_at"] or 0) < RETRY_NOT_FOUND_S:
+            if row["logo_file"] and row["logo_url"]:
+                pass  # known logo whose file is gone (e.g. pruned by an older build): fetch it again
+            elif time.time() - (row["checked_at"] or 0) < RETRY_NOT_FOUND_S:
                 self.mem.put(key, None)
                 return None
         if self.boxes:
@@ -111,6 +118,16 @@ class LogoService(QObject):
         run_async(self._lookup, key, name, on_done=self._done, on_fail=lambda _e: self._failed(key))
 
     def _lookup(self, key: str, name: str):
+        row = self.db.studio(key)
+        if row is not None and row["logo_url"] and row["endpoint"]:
+            # Already matched: just download the logo again (no stash-box search needed).
+            box = next((b for b in self.boxes if b.cfg.endpoint == row["endpoint"]), self.boxes[0])
+            resp = box.session.get(row["logo_url"], timeout=30)
+            fname = None
+            if resp.ok and resp.content:
+                fname = hashlib.sha1(row["logo_url"].encode()).hexdigest()
+                atomic_write(self.dir / fname, shrink_for_disk(resp.content, LOGO_SIZE))
+            return key, row["name"], row["endpoint"], row["stash_id"], row["logo_url"], fname
         for box in self.boxes:
             m = box.find_studio(name)
             if not m:

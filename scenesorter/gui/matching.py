@@ -109,7 +109,9 @@ class PerformerImages(QObject):
                 pm = load_file(self.dir / row["image_file"], PORTRAIT_SIZE)
                 self.mem.put(key, pm)
                 return pm
-            if time.time() - (row["checked_at"] or 0) < RECHECK_PERFORMER_S:
+            if row["image_file"] and row["image_url"]:
+                pass  # known photo whose file is gone: fetch it again
+            elif time.time() - (row["checked_at"] or 0) < RECHECK_PERFORMER_S:
                 self.mem.put(key, None)
                 return None
         self.q.push(key, name, front=True)
@@ -119,11 +121,24 @@ class PerformerImages(QObject):
         if not self.q.enabled:
             return
         known = self.db.performer_keys_checked(RECHECK_PERFORMER_S)
+        if not getattr(self, "_repair_scanned", False):  # restore photos whose files went missing
+            self._repair_scanned = True
+            known -= {k for k, f in self.db.performer_image_files().items() if not (self.dir / f).exists()}
         for key, name in items:
             if key not in known:
                 self.q.push(key, name)
 
     def _work(self, key: str, name: str):
+        row = self.db.performer(key)
+        if row is not None and row["image_url"] and row["endpoint"]:
+            # Already matched: just download the photo again.
+            b = next((x for x in self.boxes if x.cfg.endpoint == row["endpoint"]), self.boxes[0])
+            resp = b.session.get(row["image_url"], timeout=30)
+            fname = None
+            if resp.ok and resp.content:
+                fname = hashlib.sha1(row["image_url"].encode()).hexdigest()
+                atomic_write(self.dir / fname, shrink_for_disk(resp.content, PORTRAIT_SIZE))
+            return row["name"], row["endpoint"], row["stash_id"], row["image_url"], fname
         for b in self.boxes:
             p = b.find_performer(name)
             if not p:

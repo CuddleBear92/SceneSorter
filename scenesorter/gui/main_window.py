@@ -446,11 +446,16 @@ class MainWindow(QMainWindow):
         return out
 
     def prune_image_cache(self, max_mb: int | None = None) -> None:
-        """Keep the on-disk image cache under the configured size (oldest files go first)."""
+        """Optional size limit for cached scene thumbnails (off by default: keep everything).
+        Studio logos and performer photos are never pruned — they're looked up once and
+        must stay (pruning them made the app think it had images it no longer had)."""
         from .images import prune_cache
 
-        limit = (self.settings.image_cache_mb if max_mb is None else max_mb) * 1024 * 1024
-        folders = [CACHE_DIR / d for d in ("thumbs", "logos", "performers")]
+        mb = self.settings.thumb_cache_limit_mb if max_mb is None else max_mb
+        if max_mb is None and mb <= 0:
+            return
+        limit = mb * 1024 * 1024
+        folders = [CACHE_DIR / "thumbs"]
         run_async(prune_cache, folders, limit,
                   on_done=lambda r: r[0] != r[1] and self.status_label.setText(
                       f"Image cache trimmed from {r[0] // 2**20} MB to {r[1] // 2**20} MB"))

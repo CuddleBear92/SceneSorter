@@ -57,16 +57,19 @@ class SettingsDialog(QDialog):
         self.magnets_bh.setChecked(settings.magnets_to_blackhole)
         form.addRow("", self.magnets_bh)
         cache_row = QHBoxLayout()
-        self.cache_mb = QSpinBox(minimum=100, maximum=100_000, value=settings.image_cache_mb, suffix=" MB")
-        self.cache_mb.setSingleStep(256)
-        self.cache_mb.setToolTip("Thumbnails, covers, logos and photos are cached on disk (downscaled). "
-                                 "When the cache grows past this, the least recently used images are removed.")
-        clear = QPushButton("Clear image cache")
-        clear.setToolTip("Delete every cached image now; they're downloaded again when shown")
+        self.cache_mb = QSpinBox(minimum=0, maximum=1_000_000, value=settings.thumb_cache_limit_mb, suffix=" MB")
+        self.cache_mb.setSingleStep(1024)
+        self.cache_mb.setSpecialValueText("no limit")
+        self.cache_mb.setToolTip("Every image is cached on disk (downscaled). Optionally cap the scene "
+                                 "thumbnails/covers; the least recently used go first. Studio logos and "
+                                 "performer photos are always kept.")
+        clear = QPushButton("Clear scene thumbnails")
+        clear.setToolTip("Delete cached scene thumbnails/covers now (downloaded again when shown). "
+                         "Studio logos and performer photos are kept.")
         clear.clicked.connect(self._clear_cache)
         cache_row.addWidget(self.cache_mb)
         cache_row.addWidget(clear)
-        form.addRow("Image cache size", cache_row)
+        form.addRow("Thumbnail cache limit", cache_row)
         self.wanted_res = QComboBox()
         for label, val in (("Best available", ""), ("2160p", "2160p"), ("1080p", "1080p"), ("720p", "720p")):
             self.wanted_res.addItem(label, val)
@@ -358,7 +361,7 @@ class SettingsDialog(QDialog):
             crawl_interval_s=self.crawl_interval.value(),
             auto_refresh_minutes=self.auto_refresh.value(),
             rescan_interval_s=self.rescan_interval.value(),
-            image_cache_mb=self.cache_mb.value(),
+            thumb_cache_limit_mb=self.cache_mb.value(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
             stashboxes=self._stashboxes(),

@@ -520,6 +520,16 @@ class Database:
             self.conn.execute("DELETE FROM scene_groups")
             self.conn.execute("DELETE FROM meta WHERE key='scene_cache_version'")
 
+    def studio_logo_files(self) -> dict[str, str]:
+        with self._lock:
+            return {r[0]: r[1] for r in self.conn.execute(
+                "SELECT key, logo_file FROM studios WHERE logo_file IS NOT NULL AND logo_url IS NOT NULL")}
+
+    def performer_image_files(self) -> dict[str, str]:
+        with self._lock:
+            return {r[0]: r[1] for r in self.conn.execute(
+                "SELECT key, image_file FROM performers WHERE image_file IS NOT NULL AND image_url IS NOT NULL")}
+
     def studio_keys_checked(self, max_age_s: float) -> set[str]:
         """Studios already looked up (matched, or not found within max_age_s)."""
         with self._lock:
