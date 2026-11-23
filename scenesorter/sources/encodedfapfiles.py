@@ -3,18 +3,13 @@
 Site: https://encodedfapfiles.pages.dev/
 Backend: https://encodedfapfiles-backend.liquidxdrive.workers.dev
 
-Login is OTP-based via Telegram (@EncodedFapFilesbot). The user must obtain
-a session token (Bearer) and put it in source options as ``session_token``.
+Login is OTP-based via Telegram (@EncodedFapFilesbot).
+The GUI drives the flow (ask for Telegram ID → bot sends code → enter code).
+The resulting session token is stored in options["session_token"] and saved.
 
-How to get the token:
-1. Open the site in a browser and complete the Telegram login flow.
-2. Open DevTools → Application / Storage → Local Storage → the site.
-3. Copy the value of ``fi_session_token``.
-4. Paste it into the source's options.session_token in Settings.
-
-Direct downloads (via temporary signed URLs) require a premium account on the
-site. Free accounts can only "Send to Telegram". This source resolves a
-download URL when load_details() is called.
+Direct downloads (temporary signed URLs) require a premium account.
+Daily send limits are reported by /api/send-file/status and exposed via
+daily_quota / remaining so the main window can show them.
 """
 from __future__ import annotations
 
@@ -28,27 +23,111 @@ from .base import AuthRequired, RateLimited, Source
 
 BACKEND = "https://encodedfapfiles-backend.liquidxdrive.workers.dev"
 SITE = "https://encodedfapfiles.pages.dev"
+BOT = "EncodedFapFilesbot"
 
 
 class EncodedFapFilesSource(Source):
     display_name = "EncodedFapFiles"
     requires_login = True
-    daily_quota = None  # site has its own limits; track if needed later
+    daily_quota = None  # filled from remote status when logged in
 
     def __init__(self, cfg, session=None):
         super().__init__(cfg, session)
         self.token = (self.options.get("session_token") or "").strip()
         self.per_page = int(self.options.get("per_page", 48))
+        self._remote_remaining: int | None = None
+        self._remote_limit: int | None = None
+        self._remote_used: int | None = None
 
     def is_logged_in(self) -> bool:
         return bool(self.token)
 
+    def set_token(self, token: str) -> None:
+        """Store a new session token (caller should also persist settings)."""
+        self.token = token.strip()
+        self.options["session_token"] = self.token
+        self.cfg.options = self.options
+
+    def logout(self) -> None:
+        self.token = ""
+        self.options.pop("session_token", None)
+        self.cfg.options = self.options
+        self._remote_remaining = self._remote_limit = self._remote_used = None
+
     def _headers(self) -> dict[str, str]:
         if not self.token:
-            raise AuthRequired("session_token missing in source options")
+            raise AuthRequired("not logged in")
         return {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
 
+    # ------------------------------------------------------------------ login
+    def request_otp(self, telegram_id: int) -> dict:
+        """Start the OTP flow. Returns the JSON status from the backend."""
+        resp = self.session.post(
+            f"{BACKEND}/api/auth/request-otp",
+            json={"telegram_id": telegram_id},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def verify_otp(self, telegram_id: int, otp: str) -> dict:
+        """Verify the 6-digit code. On success stores the token and returns the response."""
+        resp = self.session.post(
+            f"{BACKEND}/api/auth/verify-otp",
+            json={"telegram_id": telegram_id, "otp": otp.strip()},
+            timeout=20,
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("status") == "ok" and data.get("token"):
+            self.set_token(data["token"])
+            return data
+        # Surface a useful error
+        raise AuthRequired(data.get("detail") or data.get("message") or f"verify failed ({resp.status_code})")
+
+    def login_status(self) -> dict:
+        """Optional: check if login is available / bot username."""
+        try:
+            resp = self.session.get(f"{BACKEND}/api/auth/login-status", timeout=10)
+            return resp.json() if resp.ok else {}
+        except Exception:
+            return {}
+
+    # ------------------------------------------------------------------ quota
+    def refresh_quota(self) -> None:
+        """Pull daily send limit from the site and update daily_quota / remaining."""
+        if not self.token:
+            return
+        try:
+            resp = self.session.get(f"{BACKEND}/api/send-file/status", headers=self._headers(), timeout=15)
+            if resp.status_code in (401, 403):
+                return
+            resp.raise_for_status()
+            data = resp.json()
+            limit = data.get("daily_limit")
+            remaining = data.get("remaining")
+            used = data.get("sends_today")
+            if isinstance(limit, int) and limit > 0:
+                self.daily_quota = limit
+                self._remote_limit = limit
+            if isinstance(remaining, int):
+                self._remote_remaining = remaining
+            if isinstance(used, int):
+                self._remote_used = used
+        except Exception:
+            pass
+
+    @property
+    def remote_remaining(self) -> int | None:
+        return self._remote_remaining
+
+    # ------------------------------------------------------------------ listing
     def list_page(self, page: int = 1, query: str = "") -> list[Release]:
+        if not self.token:
+            raise AuthRequired("not logged in — use the login dialog")
+        # Refresh quota in the background of the first page
+        if page == 1:
+            self.refresh_quota()
+
         params = {
             "page": page,
             "limit": self.per_page,
@@ -56,7 +135,6 @@ class EncodedFapFilesSource(Source):
         }
         if query:
             params["q"] = query
-        # Optional filters from options (studio, performer, tags, quality, dates)
         for key in ("studio", "performer", "tag", "quality", "upload_from", "upload_to",
                     "release_from", "release_to"):
             val = self.options.get(key)
@@ -66,7 +144,7 @@ class EncodedFapFilesSource(Source):
         url = f"{BACKEND}/api/files?{urlencode(params)}"
         resp = self.session.get(url, headers=self._headers(), timeout=30)
         if resp.status_code in (401, 403):
-            raise AuthRequired("session expired or invalid — refresh the token")
+            raise AuthRequired("session expired — please log in again")
         if resp.status_code in (429, 503):
             ra = resp.headers.get("Retry-After")
             raise RateLimited(float(ra) if ra and ra.isdigit() else None)
@@ -102,7 +180,6 @@ class EncodedFapFilesSource(Source):
                         filename=d.get("file_name") or release.filename,
                         size_bytes=release.size_bytes,
                     )]
-            # 402/403 often means premium required — leave links empty
         except Exception:
             pass
         release.details_loaded = True
@@ -113,14 +190,12 @@ class EncodedFapFilesSource(Source):
         mid = f.get("message_id")
         post_id = f"{cid}:{mid}" if cid is not None and mid is not None else str(f.get("id") or "")
 
-        # Thumbnail preference: hamster CDN, then screenshot proxy
         thumb = None
         if f.get("hamster_url"):
             thumb = f"{BACKEND}/api/img/{f['hamster_url']}"
         elif f.get("screenshot_file_id"):
             thumb = f"{BACKEND}/screenshot/{f['screenshot_file_id']}"
 
-        # Resolution from height or filename
         height = f.get("height") or 0
         res = ""
         if height >= 2160:
@@ -161,7 +236,7 @@ class EncodedFapFilesSource(Source):
             thumbnail_url=thumb,
             posted=posted,
             scene_date=scene_date,
-            links=[],  # resolved in load_details
+            links=[],
             size_bytes=f.get("file_size"),
             filename=f.get("file_name") or "",
             duration_s=f.get("duration"),
