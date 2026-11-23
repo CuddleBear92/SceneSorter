@@ -79,25 +79,90 @@ def download_update(info: UpdateInfo, progress: Callable[[int, int], None] | Non
     return target
 
 
+def build_update_script(pid: int, new_exe: Path, current: Path, log: Path) -> str:
+    """Windows batch script that swaps in the new exe once we've exited.
+
+    Notes on the gotchas this handles:
+    * A PyInstaller one-file exe runs as two processes (bootloader + app). We
+      only know the app's PID, and the bootloader keeps SceneSorter.exe locked
+      for a moment after the app exits while it cleans up — so the move is
+      retried for up to a minute instead of attempted once.
+    * ``timeout`` fails instantly without a console (we run hidden), so sleeps
+      use ``ping -n 2 127.0.0.1`` (~1 s).
+    * Every step is logged to data/update.log.
+    """
+    exe_name = current.name
+    lines = [
+        "@echo off",
+        "chcp 65001 >NUL",
+        "setlocal",
+        f'set "PID={pid}"',
+        f'set "NEW={new_exe}"',
+        f'set "CUR={current}"',
+        f'set "LOG={log}"',
+        "set WAITS=0",
+        "set TRIES=0",
+        'echo [%date% %time%] update: waiting for PID %PID% to exit>>"%LOG%"',
+        ":wait",
+        f'tasklist /FI "PID eq %PID%" /NH 2>NUL | find /I "{exe_name}" >NUL',
+        "if errorlevel 1 goto move",
+        "set /a WAITS+=1",
+        "if %WAITS% GEQ 120 goto move",
+        "ping -n 2 127.0.0.1 >NUL",
+        "goto wait",
+        ":move",
+        'move /Y "%NEW%" "%CUR%" >NUL 2>&1',
+        "if not errorlevel 1 goto moved",
+        "set /a TRIES+=1",
+        "if %TRIES% GEQ 60 goto failed",
+        "ping -n 2 127.0.0.1 >NUL",
+        "goto move",
+        ":moved",
+        'echo [%date% %time%] update: replaced exe (retries: %TRIES%)>>"%LOG%"',
+        'start "" "%CUR%"',
+        "goto end",
+        ":failed",
+        'echo [%date% %time%] update: FAILED to replace exe, still locked after 60 tries; starting old exe>>"%LOG%"',
+        'start "" "%CUR%"',
+        ":end",
+        'del "%~f0"',
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
 def apply_update_and_restart(new_exe: Path) -> None:
     """Replace the running exe after we exit, then relaunch. Windows only."""
     if not (is_frozen() and sys.platform.startswith("win")):
         raise RuntimeError("Self-update is only supported for the packaged Windows build.")
+    from .config import DATA_DIR
+
     current = Path(sys.executable)
-    script = Path(tempfile.gettempdir()) / "scenesorter_update.cmd"
-    script.write_text(
-        "@echo off\r\n"
-        f"set PID={os.getpid()}\r\n"
-        ":wait\r\n"
-        'tasklist /FI "PID eq %PID%" 2>NUL | find "%PID%" >NUL && (timeout /t 1 /nobreak >NUL & goto wait)\r\n'
-        f'move /Y "{new_exe}" "{current}" >NUL\r\n'
-        f'start "" "{current}"\r\n'
-        'del "%~f0"\r\n',
-        encoding="utf-8",
-    )
+    script = Path(tempfile.gettempdir()) / f"scenesorter_update_{os.getpid()}.cmd"
+    script.write_text(build_update_script(os.getpid(), new_exe, current, DATA_DIR / "update.log"),
+                      encoding="utf-8")
     # A PyInstaller one-file exe passes its private env vars (_MEIPASS2, _PYI_*) to child
     # processes; the relaunched exe would then look for its DLLs in *our* temp folder, which
     # is deleted when we exit ("Failed to load Python DLL"). Start it with a clean slate.
     env = {k: v for k, v in os.environ.items() if not (k.startswith("_PYI") or k.startswith("_MEIPASS"))}
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     subprocess.Popen(["cmd", "/c", str(script)], env=env, creationflags=0x08000000)  # CREATE_NO_WINDOW
+
+
+def leftover_update() -> tuple[Path, str] | None:
+    """A downloaded update that never got installed (e.g. the swap failed).
+
+    Returns (file, version) if it's newer than us; stale/older leftovers are deleted.
+    """
+    if not is_frozen():
+        return None
+    best: tuple[Path, str] | None = None
+    for f in Path(sys.executable).parent.glob("SceneSorter-*.exe.new"):
+        ver = f.name[len("SceneSorter-"):-len(".exe.new")]
+        if is_newer(ver) and (best is None or is_newer(ver, best[1])):
+            best = (f, ver)
+        else:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    return best

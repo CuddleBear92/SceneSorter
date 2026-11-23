@@ -47,6 +47,16 @@ def main(argv: list[str] | None = None) -> int:
                              "SceneSorter is portable and keeps its settings and database next to the exe. "
                              "Move it to a folder you can write to (not Program Files).")
         return 1
+    from . import updater
+
+    pending = updater.leftover_update()
+    if pending:
+        f, ver = pending
+        ans = QMessageBox.question(None, "SceneSorter",
+                                   f"Build {ver} was downloaded earlier but didn't get installed.\n\nInstall it now?")
+        if ans == QMessageBox.StandardButton.Yes:
+            updater.apply_update_and_restart(f)
+            return 0
     win = MainWindow(settings)
     win.show()
     return app.exec()

@@ -82,3 +82,17 @@ def test_flat_build_numbers():
     assert is_newer("v10", "9")
     assert not is_newer("v1", "1")
     assert is_newer("v1", "0-dev+abc1234")  # dev builds always see v1+ as newer
+
+
+def test_update_script_retries_and_logs():
+    from pathlib import PureWindowsPath as W
+
+    from scenesorter.updater import build_update_script
+    s = build_update_script(4242, W(r"C:\Apps\Scene Sorter\SceneSorter-6.exe.new"),
+                            W(r"C:\Apps\Scene Sorter\SceneSorter.exe"), W(r"C:\Apps\Scene Sorter\data\update.log"))
+    assert "\r\n" in s and "timeout" not in s           # timeout fails without a console
+    assert 'set "PID=4242"' in s
+    assert 'find /I "SceneSorter.exe"' in s              # waits for *our* exe, not any PID substring
+    assert sum(l.endswith("goto move") for l in s.split("\r\n")) == 3 and "%TRIES% GEQ 60" in s
+    assert 'move /Y "%NEW%" "%CUR%"' in s and 'start "" "%CUR%"' in s
+    assert s.index(":wait") < s.index(":move") < s.index(":moved") < s.index(":failed")
