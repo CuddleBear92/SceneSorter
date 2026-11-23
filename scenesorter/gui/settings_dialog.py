@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, replace
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QHeaderView, QTableWidget, QTableWidgetItem,
     QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -14,6 +16,7 @@ from ..library import render_name
 from ..models import Release
 from ..parsing import enrich
 from ..sources import SOURCE_TYPES, SourceConfig
+from ..stashbox import StashBoxConfig
 
 SAMPLE = enrich(Release("preview", "0", "", "StudioName.24.01.15.Jane.Doe.Example.Scene.XXX.1080p.MP4-GRP"))
 SAMPLE.performers = ["Jane Doe"]
@@ -86,6 +89,31 @@ class SettingsDialog(QDialog):
         v.addWidget(add)
         tabs.addTab(src, "Sources")
 
+        # --- stash-box
+        sb = QWidget()
+        v2 = QVBoxLayout(sb)
+        v2.addWidget(QLabel("stash-box instances, used for studio logos now and scene matching later.\n"
+                            "Get an API key from your account page on each site. Keys are stored in "
+                            "data/settings.json next to the exe."))
+        self.sb_table = QTableWidget(0, 4)
+        self.sb_table.setHorizontalHeaderLabels(["Enabled", "Name", "GraphQL endpoint", "API key"])
+        self.sb_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.sb_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        for c in settings.stashboxes:
+            self._add_sb_row(c)
+        v2.addWidget(self.sb_table)
+        row2 = QHBoxLayout()
+        add_sb = QPushButton("Add")
+        add_sb.clicked.connect(lambda: self._add_sb_row(StashBoxConfig("New", "https://", "")))
+        del_sb = QPushButton("Remove selected")
+        del_sb.clicked.connect(lambda: [self.sb_table.removeRow(i.row()) for i in
+                                        sorted(self.sb_table.selectionModel().selectedRows(), reverse=True)])
+        row2.addWidget(add_sb)
+        row2.addWidget(del_sb)
+        row2.addStretch(1)
+        v2.addLayout(row2)
+        tabs.addTab(sb, "Stash-box")
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
@@ -103,6 +131,29 @@ class SettingsDialog(QDialog):
         row.addWidget(btn)
         form.addRow(label, row)
         return edit
+
+    def _add_sb_row(self, c: StashBoxConfig) -> None:
+        r = self.sb_table.rowCount()
+        self.sb_table.insertRow(r)
+        chk = QTableWidgetItem()
+        chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        chk.setCheckState(Qt.CheckState.Checked if c.enabled else Qt.CheckState.Unchecked)
+        self.sb_table.setItem(r, 0, chk)
+        self.sb_table.setItem(r, 1, QTableWidgetItem(c.name))
+        self.sb_table.setItem(r, 2, QTableWidgetItem(c.endpoint))
+        key = QLineEdit(c.api_key)
+        key.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.sb_table.setCellWidget(r, 3, key)
+
+    def _stashboxes(self) -> list[StashBoxConfig]:
+        out = []
+        for r in range(self.sb_table.rowCount()):
+            out.append(StashBoxConfig(
+                name=self.sb_table.item(r, 1).text().strip(),
+                endpoint=self.sb_table.item(r, 2).text().strip(),
+                api_key=self.sb_table.cellWidget(r, 3).text().strip(),
+                enabled=self.sb_table.item(r, 0).checkState() == Qt.CheckState.Checked))
+        return out
 
     def _update_preview(self) -> None:
         try:
@@ -147,6 +198,7 @@ class SettingsDialog(QDialog):
             auto_refresh_minutes=self.auto_refresh.value(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
+            stashboxes=self._stashboxes(),
         )
         self.accept()
 

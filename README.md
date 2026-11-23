@@ -44,6 +44,15 @@ your library.
   like `…XXX.1080p.HEVC.x265.PRT`, `…MP4-GRP` and `[GRP]`, or from a
   `Group:` / `Filename:` line in the post. You can filter by group. Preferred
   groups (PRT by default) are highlighted and offered first.
+- **Downloaded tracking.** A release is flagged as downloaded when you start
+  its download. You can also flag or unflag a whole scene, or a single
+  release, by hand. The **Downloaded** tab shows those scenes in the same grid
+  as Browse. A filter lets you show all scenes, only ones not downloaded, or
+  only downloaded ones.
+- **Studios tab.** Shows every studio with its logo from StashDB. Logos are
+  looked up one every 1.5 s, only for studios currently on screen, and cached
+  in `data/cache/logos`. Click a studio to browse its scenes. Add your stash-box
+  API keys in **Settings ▸ Stash-box**.
 - **Self-updating exe.** GitHub Actions builds `SceneSorter.exe`. The app checks
   GitHub Releases on start and can update itself in place.
 

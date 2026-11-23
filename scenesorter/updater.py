@@ -95,4 +95,9 @@ def apply_update_and_restart(new_exe: Path) -> None:
         'del "%~f0"\r\n',
         encoding="utf-8",
     )
-    subprocess.Popen(["cmd", "/c", str(script)], creationflags=0x08000000)  # CREATE_NO_WINDOW
+    # A PyInstaller one-file exe passes its private env vars (_MEIPASS2, _PYI_*) to child
+    # processes; the relaunched exe would then look for its DLLs in *our* temp folder, which
+    # is deleted when we exit ("Failed to load Python DLL"). Start it with a clean slate.
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("_PYI") or k.startswith("_MEIPASS"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(["cmd", "/c", str(script)], env=env, creationflags=0x08000000)  # CREATE_NO_WINDOW

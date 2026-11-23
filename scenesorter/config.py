@@ -9,6 +9,7 @@ import os
 import sys
 
 from .sources.base import SourceConfig
+from .stashbox import DEFAULT_STASHBOXES, StashBoxConfig
 
 APP = "SceneSorter"
 
@@ -51,6 +52,10 @@ class Settings:
     preferred_groups: list[str] = field(default_factory=lambda: ["PRT"])
     update_repo: str = "CuddleBear92/SceneSorter"
     sources: list[SourceConfig] = field(default_factory=list)
+    # stash-box instances for studio logos / scene matching. Keys are stored in
+    # data/settings.json (portable), so keep that folder private.
+    stashboxes: list[StashBoxConfig] = field(
+        default_factory=lambda: [StashBoxConfig(**asdict(c)) for c in DEFAULT_STASHBOXES])
 
     @classmethod
     def load(cls, path: Path = CONFIG_FILE) -> "Settings":
@@ -58,8 +63,12 @@ class Settings:
             return cls()
         raw = json.loads(path.read_text(encoding="utf-8"))
         srcs = [SourceConfig(**s) for s in raw.pop("sources", [])]
+        boxes = raw.pop("stashboxes", None)
         known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
-        return cls(**known, sources=srcs)
+        s = cls(**known, sources=srcs)
+        if boxes is not None:
+            s.stashboxes = [StashBoxConfig(**b) for b in boxes]
+        return s
 
     @staticmethod
     def resolve(p: str) -> Path:

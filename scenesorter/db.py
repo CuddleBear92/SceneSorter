@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .models import DownloadLink, LinkKind, Release
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -60,6 +60,29 @@ CREATE TABLE IF NOT EXISTS downloads (
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- What the user has downloaded, per post (= per resolution/site).
+-- state: 'started' (download kicked off), 'manual' (user marked it),
+--        'verified' (file found on disk; set by a library scan later)
+CREATE TABLE IF NOT EXISTS flags (
+    source     TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    marked_at  REAL,
+    path       TEXT,
+    PRIMARY KEY (source, post_id)
+);
+
+-- Studio metadata/logos looked up on stash-box instances (cached forever).
+CREATE TABLE IF NOT EXISTS studios (
+    key         TEXT PRIMARY KEY,   -- normalised studio name
+    name        TEXT,
+    endpoint    TEXT,               -- stash-box that matched (NULL = not found)
+    stash_id    TEXT,
+    logo_url    TEXT,
+    logo_file   TEXT,               -- cached file name under cache/logos
+    checked_at  REAL
+);
 """
 
 
@@ -76,6 +99,11 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        if self.get_meta("schema_version") != str(SCHEMA_VERSION):
+            # v1 -> v2: carry over downloads started by earlier builds as flags
+            self.conn.execute("INSERT OR IGNORE INTO flags(source, post_id, state, marked_at) "
+                              "SELECT source, post_id, 'started', started_at FROM downloads "
+                              "WHERE state IN ('Done', 'Sent to torrent client', 'Downloading', 'Sorting')")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
@@ -198,11 +226,40 @@ class Database:
                  now, now if job.state.name in ("DONE", "FAILED", "CANCELLED", "HANDED_OFF") else None),
             )
 
-    def downloaded_posts(self) -> set[tuple[str, str]]:
+    # ---------------------------------------------------------------- flags
+    def flags(self) -> dict[tuple[str, str], str]:
         with self._lock:
-            rows = self.conn.execute("SELECT DISTINCT source, post_id FROM downloads "
-                                     "WHERE state IN ('Done', 'Sent to torrent client')").fetchall()
-        return {(r["source"], r["post_id"]) for r in rows}
+            rows = self.conn.execute("SELECT source, post_id, state FROM flags").fetchall()
+        return {(r["source"], r["post_id"]): r["state"] for r in rows}
+
+    def set_flag(self, source: str, post_id: str, state: str, path: str | None = None) -> None:
+        """Flag a post as downloaded. Never downgrades 'verified'."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO flags(source, post_id, state, marked_at, path) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(source, post_id) DO UPDATE SET "
+                "state=CASE WHEN flags.state='verified' THEN 'verified' ELSE excluded.state END, "
+                "marked_at=excluded.marked_at, path=COALESCE(excluded.path, flags.path)",
+                (source, post_id, state, time.time(), path))
+
+    def clear_flags(self, posts: list[tuple[str, str]]) -> None:
+        with self._lock:
+            self.conn.executemany("DELETE FROM flags WHERE source=? AND post_id=?", posts)
+
+    # -------------------------------------------------------------- studios
+    def studio(self, key: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute("SELECT * FROM studios WHERE key=?", (key,)).fetchone()
+
+    def save_studio(self, key: str, name: str, endpoint: str | None, stash_id: str | None,
+                    logo_url: str | None, logo_file: str | None) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO studios(key, name, endpoint, stash_id, logo_url, logo_file, checked_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET name=excluded.name, "
+                "endpoint=excluded.endpoint, stash_id=excluded.stash_id, logo_url=excluded.logo_url, "
+                "logo_file=excluded.logo_file, checked_at=excluded.checked_at",
+                (key, name, endpoint, stash_id, logo_url, logo_file, time.time()))
 
 
 def _link_to_json(l: DownloadLink) -> dict:

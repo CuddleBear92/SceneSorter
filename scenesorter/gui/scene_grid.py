@@ -1,11 +1,12 @@
 """Grid of scene cards: model, filter proxy and painting delegate."""
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, QSortFilterProxyModel, Qt
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from ..models import Scene
+from ..parsing import normalise_studio as studio_key
 from .workers import ThumbnailLoader
 
 SceneRole = Qt.ItemDataRole.UserRole + 1
@@ -15,21 +16,39 @@ SOURCE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6"]
 
 
 class SceneModel(QAbstractListModel):
+    status_changed = Signal()
     def __init__(self, thumbs: ThumbnailLoader, parent=None):
         super().__init__(parent)
         self.scenes: list[Scene] = []
-        self.owned: set[str] = set()
+        self.owned: set[str] = set()        # scene keys found in the library on disk
+        self.downloaded: set[str] = set()   # scene keys flagged as downloaded
         self.thumbs = thumbs
         self._row_by_key: dict[str, int] = {}
         thumbs.loaded.connect(self._thumb_ready)
 
-    def set_scenes(self, scenes: list[Scene], owned: set[str] | None = None) -> None:
+    def set_scenes(self, scenes: list[Scene], owned: set[str] | None = None,
+                   downloaded: set[str] | None = None) -> None:
         self.beginResetModel()
         self.scenes = scenes
         if owned is not None:
             self.owned = owned
+        if downloaded is not None:
+            self.downloaded = downloaded
         self._row_by_key = {s.key: i for i, s in enumerate(scenes)}
         self.endResetModel()
+
+    def set_status(self, owned: set[str] | None = None, downloaded: set[str] | None = None) -> None:
+        """Update owned/downloaded marks without resetting the view."""
+        if owned is not None:
+            self.owned = owned
+        if downloaded is not None:
+            self.downloaded = downloaded
+        if self.scenes:
+            self.dataChanged.emit(self.index(0), self.index(len(self.scenes) - 1))
+        self.status_changed.emit()
+
+    def has(self, key: str) -> bool:
+        return key in self.owned or key in self.downloaded
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.scenes)
@@ -56,15 +75,19 @@ class SceneModel(QAbstractListModel):
 
 
 class SceneFilter(QSortFilterProxyModel):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, have: str = ""):
         super().__init__(parent)
         self.text = ""
         self.resolution = ""
         self.source = ""
         self.group = ""
-        self.hide_owned = False
+        self.studio = ""        # normalised studio key
+        self.have = have        # "" = all, "missing" = not downloaded, "have" = downloaded/in library
+        self.locked_have = bool(have)  # the Downloaded tab always shows "have"
 
     def set(self, **kw) -> None:
+        if self.locked_have:
+            kw.pop("have", None)
         for k, v in kw.items():
             setattr(self, k, v)
         self.invalidateFilter()
@@ -72,7 +95,11 @@ class SceneFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
         model: SceneModel = self.sourceModel()
         s = model.scenes[row]
-        if self.hide_owned and s.key in model.owned:
+        if self.have == "have" and not model.has(s.key):
+            return False
+        if self.have == "missing" and model.has(s.key):
+            return False
+        if self.studio and studio_key(s.studio) != self.studio:
             return False
         if self.resolution and self.resolution not in s.resolutions:
             return False
@@ -111,6 +138,7 @@ class SceneDelegate(QStyledItemDelegate):
         s: Scene = index.data(SceneRole)
         model = index.model().sourceModel() if hasattr(index.model(), "sourceModel") else index.model()
         owned = s.key in getattr(model, "owned", set())
+        downloaded = s.key in getattr(model, "downloaded", set())
         r = opt.rect.adjusted(6, 6, -6, -6)
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -169,12 +197,15 @@ class SceneDelegate(QStyledItemDelegate):
             p.setPen(QColor("white"))
             p.drawText(chip, Qt.AlignmentFlag.AlignCenter, grp)
             x += w + 4
-        if owned:
-            badge = QRect(thumb_rect.right() - 70, thumb_rect.bottom() - 24, 64, 18)
-            p.setBrush(QColor("#16a34a"))
+        if owned or downloaded:
+            text, color = ("IN LIBRARY", "#16a34a") if owned else ("DOWNLOADED", "#2563eb")
+            w = p.fontMetrics().horizontalAdvance(text) + 12
+            badge = QRect(thumb_rect.right() - w - 6, thumb_rect.bottom() - 24, w, 18)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(color))
             p.drawRoundedRect(badge, 4, 4)
             p.setPen(QColor("white"))
-            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, "IN LIBRARY")
+            p.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
 
         # text
         text_rect = QRect(r.left() + 8, thumb_rect.bottom() + 4, r.width() - 16, TEXT_H - 8)

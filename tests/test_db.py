@@ -41,3 +41,23 @@ def test_reparse(tmp_path):
     r = db.load_releases()[0]
     assert (r.release_group, r.studio) == ("PRT", "S")
     assert db.reparse_if_needed() == 0
+
+
+def test_flags(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.set_flag("blog", "1", "started")
+    db.set_flag("blog", "2", "manual")
+    assert db.flags() == {("blog", "1"): "started", ("blog", "2"): "manual"}
+    db.set_flag("blog", "1", "verified")
+    db.set_flag("blog", "1", "manual")  # never downgrades verified
+    assert db.flags()[("blog", "1")] == "verified"
+    db.clear_flags([("blog", "1")])
+    assert ("blog", "1") not in db.flags()
+
+
+def test_migrates_old_downloads_to_flags(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.conn.execute("INSERT INTO downloads(id, source, post_id, state) VALUES ('a','blog','9','Sent to torrent client')")
+    db.set_meta("schema_version", "1")
+    db.close()
+    assert Database(tmp_path / "s.db").flags() == {("blog", "9"): "started"}

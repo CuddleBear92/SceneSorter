@@ -1,0 +1,295 @@
+"""Studios tab: one card per studio with its logo from stash-box."""
+from __future__ import annotations
+
+import hashlib
+import time
+from collections import deque
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from PySide6.QtCore import (
+    QAbstractListModel, QByteArray, QModelIndex, QObject, QRect, QSize, QSortFilterProxyModel, Qt,
+    QTimer, Signal,
+)
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+)
+
+from ..db import Database
+from ..models import Scene
+from ..parsing import normalise_studio
+from ..stashbox import StashBox, StashBoxConfig
+from .workers import run_async
+
+RETRY_NOT_FOUND_S = 30 * 24 * 3600
+LOOKUP_INTERVAL_MS = 1500          # one stash-box lookup every 1.5 s — gentle on the API
+CARD_W, LOGO_H, TEXT_H = 220, 110, 46
+StudioRole = Qt.ItemDataRole.UserRole + 2
+
+
+@dataclass
+class StudioEntry:
+    key: str
+    name: str
+    scenes: int
+    have: int
+
+
+def render_image(data: bytes, max_w: int = 440, max_h: int = 220) -> QPixmap | None:
+    """Load PNG/JPEG/WebP or SVG bytes into a pixmap (stash-box logos are often SVG)."""
+    head = data[:300].lstrip().lower()
+    if head.startswith(b"<svg") or head.startswith(b"<?xml"):
+        r = QSvgRenderer(QByteArray(data))
+        if not r.isValid():
+            return None
+        size = r.defaultSize()
+        if size.isEmpty():
+            size = QSize(max_w, max_h)
+        size.scale(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio)
+        img = QImage(size, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        r.render(p)
+        p.end()
+        return QPixmap.fromImage(img)
+    pm = QPixmap()
+    return pm if pm.loadFromData(data) else None
+
+
+class LogoService(QObject):
+    """Looks studios up on stash-box (slowly, only when shown) and caches logos to disk."""
+
+    ready = Signal(str)  # studio key
+
+    def __init__(self, db: Database, cache_dir: Path, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.dir = Path(cache_dir) / "logos"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.boxes: list[StashBox] = []
+        self.mem: dict[str, QPixmap | None] = {}
+        self.queue: deque[tuple[str, str]] = deque()
+        self.queued: set[str] = set()
+        self.busy = False
+        self.timer = QTimer(self, interval=LOOKUP_INTERVAL_MS, timeout=self._next)
+        self.timer.start()
+
+    def configure(self, configs: list[StashBoxConfig]) -> None:
+        self.boxes = [StashBox(c) for c in configs if c.enabled and c.api_key]
+
+    def get(self, key: str, name: str) -> QPixmap | None:
+        if key in self.mem:
+            return self.mem[key]
+        row = self.db.studio(key)
+        if row is not None:
+            if row["logo_file"] and (self.dir / row["logo_file"]).exists():
+                pm = render_image((self.dir / row["logo_file"]).read_bytes())
+                self.mem[key] = pm
+                return pm
+            if time.time() - (row["checked_at"] or 0) < RETRY_NOT_FOUND_S:
+                self.mem[key] = None
+                return None
+        if self.boxes and key not in self.queued:
+            self.queued.add(key)
+            self.queue.appendleft((key, name))  # most recently shown first
+        return None
+
+    def _next(self) -> None:
+        if self.busy or not self.queue or not self.boxes:
+            return
+        key, name = self.queue.popleft()
+        self.busy = True
+        run_async(self._lookup, key, name, on_done=self._done, on_fail=lambda _e: self._failed(key))
+
+    def _lookup(self, key: str, name: str):
+        for box in self.boxes:
+            m = box.find_studio(name)
+            if not m:
+                continue
+            fname = None
+            if m.logo_url:
+                resp = box.session.get(m.logo_url, timeout=30)  # same session -> same ApiKey header
+                if resp.ok and resp.content:
+                    fname = hashlib.sha1(m.logo_url.encode()).hexdigest()
+                    (self.dir / fname).write_bytes(resp.content)
+            return key, m.name, m.endpoint, m.stash_id, m.logo_url, fname
+        return key, name, None, None, None, None
+
+    def _done(self, res) -> None:
+        self.busy = False
+        key, name, endpoint, stash_id, logo_url, fname = res
+        self.db.save_studio(key, name, endpoint, stash_id, logo_url, fname)
+        self.queued.discard(key)
+        self.mem.pop(key, None)
+        self.ready.emit(key)
+
+    def _failed(self, key: str) -> None:
+        self.busy = False
+        self.queued.discard(key)  # network hiccup: try again next time it's shown
+
+
+class StudioModel(QAbstractListModel):
+    def __init__(self, logos: LogoService, parent=None):
+        super().__init__(parent)
+        self.logos = logos
+        self.items: list[StudioEntry] = []
+        self._row: dict[str, int] = {}
+        logos.ready.connect(self._logo_ready)
+
+    def set_scenes(self, scenes: list[Scene], has) -> None:
+        agg: dict[str, StudioEntry] = {}
+        for s in scenes:
+            if not s.studio:
+                continue
+            k = normalise_studio(s.studio)
+            e = agg.get(k) or agg.setdefault(k, StudioEntry(k, s.studio, 0, 0))
+            e.scenes += 1
+            e.have += 1 if has(s.key) else 0
+        self.beginResetModel()
+        self.items = sorted(agg.values(), key=lambda e: e.name.lower())
+        for e in self.items:  # prefer the official stash-box spelling once known
+            row = self.logos.db.studio(e.key)
+            if row is not None and row["endpoint"]:
+                e.name = row["name"]
+        self._row = {e.key: i for i, e in enumerate(self.items)}
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
+        return 0 if parent.isValid() else len(self.items)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        e = self.items[index.row()]
+        if role == StudioRole:
+            return e
+        if role == Qt.ItemDataRole.DisplayRole:
+            return e.name
+        if role == Qt.ItemDataRole.DecorationRole:
+            return self.logos.get(e.key, e.name)
+        return None
+
+    def _logo_ready(self, key: str) -> None:
+        row = self._row.get(key)
+        if row is not None:
+            idx = self.index(row)
+            row_db = self.logos.db.studio(key)
+            if row_db is not None and row_db["endpoint"]:
+                self.items[row] = replace(self.items[row], name=row_db["name"])
+            self.dataChanged.emit(idx, idx)
+
+
+class StudioFilter(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.text = ""
+        self.sort_mode = "name"
+        self.sort(0)
+
+    def set(self, **kw) -> None:
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self.invalidate()
+        self.sort(0)
+
+    def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
+        return not self.text or self.text.lower() in self.sourceModel().items[row].name.lower()
+
+    def lessThan(self, a, b) -> bool:  # noqa: N802
+        ea, eb = a.data(StudioRole), b.data(StudioRole)
+        if self.sort_mode == "scenes":
+            return (eb.scenes, ea.name.lower()) < (ea.scenes, eb.name.lower())
+        if self.sort_mode == "have":
+            return (eb.have, ea.name.lower()) < (ea.have, eb.name.lower())
+        return ea.name.lower() < eb.name.lower()
+
+
+class StudioDelegate(QStyledItemDelegate):
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+        return QSize(CARD_W + 12, LOGO_H + TEXT_H + 12)
+
+    def paint(self, p: QPainter, opt, index) -> None:
+        e: StudioEntry = index.data(StudioRole)
+        r = opt.rect.adjusted(6, 6, -6, -6)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        p.setPen(QColor("#60a5fa") if sel else QColor("#333a45"))
+        p.setBrush(QColor("#1f2530") if sel else QColor("#171b22"))
+        p.drawRoundedRect(r, 8, 8)
+        logo_rect = QRect(r.left() + 12, r.top() + 10, r.width() - 24, LOGO_H - 16)
+        pm: QPixmap | None = index.data(Qt.ItemDataRole.DecorationRole)
+        if pm and not pm.isNull():
+            scaled = pm.scaled(logo_rect.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+            x = logo_rect.left() + (logo_rect.width() - scaled.width()) // 2
+            y = logo_rect.top() + (logo_rect.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        else:
+            f = QFont(opt.font)
+            f.setPointSizeF(opt.font.pointSizeF() * 1.6)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor("#4b5563"))
+            p.drawText(logo_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, e.name)
+        text_rect = QRect(r.left() + 10, r.top() + LOGO_H, r.width() - 20, TEXT_H)
+        f = QFont(opt.font)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor("#e5e7eb"))
+        fm = p.fontMetrics()
+        p.drawText(QRect(text_rect.left(), text_rect.top(), text_rect.width(), fm.height()), 0,
+                   fm.elidedText(e.name, Qt.TextElideMode.ElideRight, text_rect.width()))
+        p.setFont(opt.font)
+        p.setPen(QColor("#9ca3af"))
+        sub = f"{e.scenes} scene{'s' if e.scenes != 1 else ''}" + (f" · {e.have} downloaded" if e.have else "")
+        p.drawText(QRect(text_rect.left(), text_rect.top() + fm.height() + 2, text_rect.width(), fm.height()), 0, sub)
+        p.restore()
+
+
+class StudiosTab(QWidget):
+    studio_activated = Signal(str, str)  # key, display name
+
+    def __init__(self, logos: LogoService, parent=None):
+        super().__init__(parent)
+        self.model = StudioModel(logos)
+        self.proxy = StudioFilter()
+        self.proxy.setSourceModel(self.model)
+        top = QHBoxLayout()
+        self.search = QLineEdit(placeholderText="Filter studios…")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMaximumWidth(300)
+        self.search.textChanged.connect(lambda t: self.proxy.set(text=t))
+        self.sort_box = QComboBox()
+        for label, mode in (("Sort: name", "name"), ("Sort: most scenes", "scenes"), ("Sort: most downloaded", "have")):
+            self.sort_box.addItem(label, mode)
+        self.sort_box.currentIndexChanged.connect(lambda _i: self.proxy.set(sort_mode=self.sort_box.currentData()))
+        self.hint = QLabel()
+        self.hint.setStyleSheet("color:#888")
+        top.addWidget(self.search)
+        top.addWidget(self.sort_box)
+        top.addWidget(self.hint, 1)
+        self.view = QListView()
+        self.view.setViewMode(QListView.ViewMode.IconMode)
+        self.view.setResizeMode(QListView.ResizeMode.Adjust)
+        self.view.setUniformItemSizes(True)
+        self.view.setMovement(QListView.Movement.Static)
+        self.view.setModel(self.proxy)
+        self.view.setItemDelegate(StudioDelegate())
+        self.view.activated.connect(self._activate)
+        self.view.clicked.connect(self._activate)
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(self.view)
+
+    def _activate(self, idx) -> None:
+        e: StudioEntry = idx.data(StudioRole)
+        if e:
+            self.studio_activated.emit(e.key, e.name)
+
+    def set_scenes(self, scenes: list[Scene], has, logos_enabled: bool) -> None:
+        self.model.set_scenes(scenes, has)
+        self.hint.setText(f"{len(self.model.items)} studios · click one to browse its scenes" +
+                          ("" if logos_enabled else " · add a StashDB API key in Settings to load logos"))

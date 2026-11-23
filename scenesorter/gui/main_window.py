@@ -8,8 +8,8 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSplitter, QTableWidget,
+    QComboBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
+    QMainWindow, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -22,8 +22,11 @@ from ..merge import merge_releases
 from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
 from ..sources import RateLimited, Source, build_source
-from .scene_grid import SceneDelegate, SceneFilter, SceneModel, SceneRole, fmt_duration
+from ..parsing import normalise_studio
+from .scene_grid import SceneDelegate, SceneModel, fmt_duration
+from .scene_pane import ScenePane
 from .settings_dialog import SettingsDialog
+from .studios import LogoService, StudiosTab
 from .workers import ThumbnailLoader, run_async
 
 LINK_PREFERENCE = {LinkKind.DIRECT: 0, LinkKind.TORRENT: 1, LinkKind.MAGNET: 2, LinkKind.HOSTER: 3}
@@ -53,7 +56,7 @@ class MainWindow(QMainWindow):
         self.quota = QuotaTracker(DATA_DIR / "quota.json")
         self.db = Database(DATA_DIR / "scenesorter.db")
         self.db.reparse_if_needed()
-        self.downloaded = self.db.downloaded_posts()
+        self.flags: dict[tuple[str, str], str] = self.db.flags()
         self.releases: dict[tuple[str, str], Release] = {}
         self.next_page: dict[str, int | None] = {}
         self.in_flight: set[str] = set()
@@ -62,11 +65,9 @@ class MainWindow(QMainWindow):
         self._crawl_rr = 0
         self._rebuild_running = False
         self._rebuild_dirty = False
-        self._restoring = False
         self.sources: dict[str, Source] = {}
         self.owned: dict[str, list[Path]] = {}
-        self.current: Scene | None = None
-        self.downloaded: set[tuple[str, str]] = set()
+        self.scenes: list[Scene] = []
 
         self.bridge = _JobBridge()
         self.bridge.changed.connect(self._job_changed)
@@ -75,6 +76,8 @@ class MainWindow(QMainWindow):
         self.job_rows: dict[str, int] = {}
 
         self.thumbs = ThumbnailLoader(CACHE_DIR)
+        self.logos = LogoService(self.db, CACHE_DIR, self)
+        self.logos.configure(settings.stashboxes)
         self._build_ui()
         self._load_sources()
         self._load_cached()
@@ -101,25 +104,32 @@ class MainWindow(QMainWindow):
         self.search = QLineEdit(placeholderText="Search studio, performer, title…")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(360)
-        self.search.textChanged.connect(lambda t: self.filter.set(text=t))
+        self.search.textChanged.connect(lambda t: self._set_filter(text=t))
         tb.addWidget(self.search)
         self.res_box = QComboBox()
         self.res_box.addItems(["All resolutions", "2160p", "1080p", "720p", "480p"])
         self.res_box.currentTextChanged.connect(
-            lambda t: self.filter.set(resolution="" if t.startswith("All") else t))
+            lambda t: self._set_filter(resolution="" if t.startswith("All") else t))
         tb.addWidget(self.res_box)
         self.src_box = QComboBox()
         self.src_box.currentIndexChanged.connect(
-            lambda _i: self.filter.set(source=self.src_box.currentData() or ""))
+            lambda _i: self._set_filter(source=self.src_box.currentData() or ""))
         tb.addWidget(self.src_box)
         self.group_box = QComboBox()
         self.group_box.setMinimumWidth(130)
         self.group_box.currentIndexChanged.connect(
-            lambda _i: self.filter.set(group=self.group_box.currentData() or ""))
+            lambda _i: self._set_filter(group=self.group_box.currentData() or ""))
         tb.addWidget(self.group_box)
-        self.hide_owned = QCheckBox("Hide owned")
-        self.hide_owned.toggled.connect(lambda v: self.filter.set(hide_owned=v))
-        tb.addWidget(self.hide_owned)
+        self.have_box = QComboBox()
+        for label, mode in (("Downloaded or not", ""), ("Not downloaded", "missing"), ("Downloaded", "have")):
+            self.have_box.addItem(label, mode)
+        self.have_box.currentIndexChanged.connect(lambda _i: self._set_filter(have=self.have_box.currentData()))
+        tb.addWidget(self.have_box)
+        self.studio_btn = QPushButton()
+        self.studio_btn.setToolTip("Showing one studio — click to show all")
+        self.studio_btn.clicked.connect(lambda: self.filter_studio("", ""))
+        self.studio_btn_action = tb.addWidget(self.studio_btn)
+        self.studio_btn_action.setVisible(False)
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
                              spacer.sizePolicy().verticalPolicy().Preferred)
@@ -127,36 +137,18 @@ class MainWindow(QMainWindow):
         tb.addAction(act_settings)
         tb.addAction(act_update)
 
-        # --- browse tab: grid + detail panel
+        # --- scene panes (Browse + Downloaded share model, delegate and detail rendering)
         self.model = SceneModel(self.thumbs)
-        self.filter = SceneFilter()
-        self.filter.setSourceModel(self.model)
-        self.grid = QListView()
-        self.grid.setViewMode(QListView.ViewMode.IconMode)
-        self.grid.setResizeMode(QListView.ResizeMode.Adjust)
-        self.grid.setUniformItemSizes(True)
-        self.grid.setMovement(QListView.Movement.Static)
-        self.grid.setSpacing(2)
-        self.grid.setModel(self.filter)
         self.delegate = SceneDelegate([])
         self.delegate.preferred_groups = self.settings.preferred_groups
-        self.grid.setItemDelegate(self.delegate)
-        self.grid.selectionModel().currentChanged.connect(lambda cur, _prev: self.show_scene(cur.data(SceneRole)))
+        self.browse = ScenePane(self.model, self.delegate, self.render_detail)
+        self.have_pane = ScenePane(self.model, self.delegate, self.render_detail, have="have",
+                                   empty_text="Scenes you've downloaded or marked as downloaded show up here.")
+        self.panes = [self.browse, self.have_pane]
+        self.model.status_changed.connect(self._update_tab_counts)
 
-        self.detail = QWidget()
-        self.detail_layout = QVBoxLayout(self.detail)
-        self.detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(self.detail)
-        scroll.setMinimumWidth(380)
-
-        split = QSplitter()
-        split.addWidget(self.grid)
-        split.addWidget(scroll)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 1)
+        self.studios = StudiosTab(self.logos)
+        self.studios.studio_activated.connect(self.filter_studio)
 
         # --- downloads tab
         self.table = QTableWidget(0, 6)
@@ -173,8 +165,11 @@ class MainWindow(QMainWindow):
         dl_layout.addWidget(btn_cancel, alignment=Qt.AlignmentFlag.AlignRight)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(split, "Browse")
-        self.tabs.addTab(dl_tab, "Downloads")
+        self.tabs.addTab(self.browse, "Browse")
+        self.tabs.addTab(self.have_pane, "Downloaded")
+        self.tabs.addTab(self.studios, "Studios")
+        self.tabs.addTab(dl_tab, "Queue")
+        self.QUEUE_TAB = 3
         self.setCentralWidget(self.tabs)
 
         self.status_label = QLabel()
@@ -188,20 +183,21 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer(self, timeout=self.refresh)
         self._apply_timers()
         self.rebuild_timer = QTimer(self, singleShot=True, interval=400, timeout=self._start_rebuild)
-        self._render_empty_detail()
 
-    def _render_empty_detail(self, msg: str = "Select a scene") -> None:
-        self._clear_detail()
-        lbl = QLabel(msg)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet("color:#888; padding:20px")
-        self.detail_layout.addWidget(lbl)
+    def _set_filter(self, **kw) -> None:
+        for pane in self.panes:
+            pane.filter.set(**kw)
 
-    def _clear_detail(self) -> None:
-        while self.detail_layout.count():
-            w = self.detail_layout.takeAt(0).widget()
-            if w:
-                w.deleteLater()
+    def filter_studio(self, key: str, name: str) -> None:
+        """Show only one studio's scenes in Browse/Downloaded ('' = all)."""
+        self._set_filter(studio=key)
+        self.studio_btn.setText(f"Studio: {name}  ✕")
+        self.studio_btn_action.setVisible(bool(key))
+        if key:
+            self.tabs.setCurrentWidget(self.browse)
+
+    def _update_tab_counts(self) -> None:
+        self.tabs.setTabText(1, f"Downloaded ({len(self.model.owned | self.model.downloaded)})")
 
     # -------------------------------------------------------------- sources
     def _load_sources(self) -> None:
@@ -231,7 +227,7 @@ class MainWindow(QMainWindow):
     def refresh(self) -> None:
         """Incremental refresh: fetch newest pages until a page has nothing new."""
         if not self.sources:
-            self._render_empty_detail("No sources configured yet. Open Settings ▸ Sources to add one.")
+            self.browse.show_message("No sources configured yet. Open Settings ▸ Sources to add one.")
             return
         for sid in self.sources:
             self._fetch(sid, 1, "refresh")
@@ -372,22 +368,33 @@ class MainWindow(QMainWindow):
     def _apply_rebuild(self, scenes, err: str | None = None) -> None:
         self._rebuild_running = False
         if scenes is not None:
-            current_key = self.current.key if self.current else None
-            scroll = self.grid.verticalScrollBar().value()
-            self._restoring = True
-            self.model.set_scenes(scenes, set(self.owned))
-            if current_key:
-                row = self.model._row_by_key.get(current_key)
-                if row is not None:
-                    self.current = scenes[row]
-                    self.grid.setCurrentIndex(self.filter.mapFromSource(self.model.index(row)))
-            self.grid.verticalScrollBar().setValue(scroll)
-            self._restoring = False
+            self.scenes = scenes
+            self.model.set_scenes(scenes, set(self.owned), self._downloaded_keys())
             self._update_group_box()
+            self._update_tab_counts()
+            self.studios.set_scenes(scenes, self.model.has, bool(self.logos.boxes))
         elif err:
             self.status_label.setText(f"Merge failed: {err.splitlines()[0]}")
         if self._rebuild_dirty:
             self._schedule_rebuild()
+
+    def _downloaded_keys(self) -> set[str]:
+        return {s.key for s in self.scenes if any((r.source, r.post_id) in self.flags for r in s.releases)}
+
+    def _flags_changed(self) -> None:
+        self.flags = self.db.flags()
+        self.model.set_status(downloaded=self._downloaded_keys())
+        for pane in self.panes:
+            pane.refresh_detail()
+        self.studios.set_scenes(self.scenes, self.model.has, bool(self.logos.boxes))
+
+    def mark_downloaded(self, releases: list[Release], on: bool) -> None:
+        if on:
+            for r in releases:
+                self.db.set_flag(r.source, r.post_id, "manual")
+        else:
+            self.db.clear_flags([(r.source, r.post_id) for r in releases])
+        self._flags_changed()
 
     def _update_group_box(self) -> None:
         current = self.group_box.currentData() or ""
@@ -412,16 +419,11 @@ class MainWindow(QMainWindow):
 
     def _library_scanned(self, owned: dict) -> None:
         self.owned = owned
-        self.model.set_scenes(self.model.scenes, set(owned))
+        self.model.set_status(owned=set(owned))
 
     # --------------------------------------------------------------- detail
-    def show_scene(self, scene: Scene | None) -> None:
-        if self._restoring:
-            return
-        self.current = scene
-        if scene is None:
-            return self._render_empty_detail()
-        self._clear_detail()
+    def render_detail(self, pane: ScenePane, scene: Scene) -> None:
+        lay = pane.detail_layout
         thumb = QLabel()
         thumb.setFixedHeight(210)
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -429,12 +431,17 @@ class MainWindow(QMainWindow):
         if pm:
             thumb.setPixmap(pm.scaled(360, 210, Qt.AspectRatioMode.KeepAspectRatio,
                                       Qt.TransformationMode.SmoothTransformation))
-        self.detail_layout.addWidget(thumb)
+        lay.addWidget(thumb)
 
         title = QLabel(f"<h3>{scene.title or scene.primary.raw_title}</h3>")
         title.setWordWrap(True)
-        self.detail_layout.addWidget(title)
-        meta = [("Studio", scene.studio), ("Date", scene.scene_date.isoformat() if scene.scene_date else ""),
+        lay.addWidget(title)
+        studio = QLabel(f"<a href='#' style='color:#60a5fa'>{scene.studio}</a>") if scene.studio else None
+        if studio:
+            studio.setToolTip("Show all scenes from this studio")
+            studio.linkActivated.connect(lambda _l: self.filter_studio(normalise_studio(scene.studio), scene.studio))
+            lay.addWidget(studio)
+        meta = [("Date", scene.scene_date.isoformat() if scene.scene_date else ""),
                 ("Posted", scene.posted.isoformat() if scene.posted else ""),
                 ("Duration", fmt_duration(scene.duration_s)),
                 ("Performers", ", ".join(scene.performers)),
@@ -443,20 +450,33 @@ class MainWindow(QMainWindow):
                 ("Sources", ", ".join(self.sources[s].display_name if s in self.sources else s for s in scene.sources))]
         info = QLabel("<br>".join(f"<b>{k}:</b> {v}" for k, v in meta if v))
         info.setWordWrap(True)
-        self.detail_layout.addWidget(info)
+        lay.addWidget(info)
+
+        flagged = [r for r in scene.releases if (r.source, r.post_id) in self.flags]
         if scene.key in self.owned:
             own = QLabel("✔ In library:<br>" + "<br>".join(p.name for p in self.owned[scene.key]))
             own.setWordWrap(True)
             own.setStyleSheet("color:#22c55e")
-            self.detail_layout.addWidget(own)
+            lay.addWidget(own)
+        if flagged:
+            got = QLabel("✔ Downloaded: " + ", ".join(
+                f"{r.resolution or '?'} {r.release_group}".strip() for r in flagged))
+            got.setStyleSheet("color:#60a5fa")
+            lay.addWidget(got)
+        mark = QPushButton("Unmark as downloaded" if flagged else "Mark as downloaded")
+        mark.setToolTip("Flag this scene as downloaded (e.g. you got it elsewhere)" if not flagged
+                        else "Remove the downloaded flag from every release of this scene")
+        best = sorted(scene.releases, key=self._source_priority)[:1]
+        mark.clicked.connect(lambda: self.mark_downloaded(flagged if flagged else best, not flagged))
+        lay.addWidget(mark)
 
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        self.detail_layout.addWidget(line)
-        self.detail_layout.addWidget(QLabel("<b>Releases</b>"))
+        lay.addWidget(line)
+        lay.addWidget(QLabel("<b>Releases</b>"))
         for res in scene.resolutions or [""]:
             for rel in sorted(scene.releases_for(res), key=self._source_priority):
-                self.detail_layout.addWidget(self._release_row(rel))
+                lay.addWidget(self._release_row(rel))
 
     def _source_priority(self, r: Release) -> tuple[int, int]:
         # Preferred release groups first, then sources in settings order (put premium first).
@@ -496,9 +516,15 @@ class MainWindow(QMainWindow):
         btn_dl.clicked.connect(lambda: self.start_download(rel))
         btn_open = QPushButton("Post")
         btn_open.clicked.connect(lambda: webbrowser.open(rel.post_url))
-        if (rel.source, rel.post_id) in self.downloaded:
+        got = (rel.source, rel.post_id) in self.flags
+        if got:
             btn_dl.setText("Again")
-            btn_dl.setToolTip("Already downloaded once")
+            btn_dl.setToolTip("Already downloaded")
+        btn_flag = QPushButton("✓" if got else "○")
+        btn_flag.setFixedWidth(30)
+        btn_flag.setToolTip("Unmark this release" if got else "Mark this release as downloaded")
+        btn_flag.clicked.connect(lambda: self.mark_downloaded([rel], not got))
+        h.addWidget(btn_flag)
         h.addWidget(btn_dl)
         h.addWidget(btn_open)
         return outer
@@ -532,10 +558,10 @@ class MainWindow(QMainWindow):
                 return
         link = min(rel.links, key=lambda l: LINK_PREFERENCE.get(l.kind, 9))
         self.downloads.enqueue(rel, link, Settings.resolve(self.settings.download_dir))
+        self.db.set_flag(rel.source, rel.post_id, "started")
         self._update_quota_label()
-        self.tabs.setTabText(1, f"Downloads ({len(self.downloads.jobs)})")
-        if self.current:
-            self.show_scene(self.current)
+        self.tabs.setTabText(self.QUEUE_TAB, f"Queue ({len(self.downloads.jobs)})")
+        self._flags_changed()
 
     def _on_download_finished(self, job: Job) -> None:
         """Runs on the download thread."""
@@ -545,8 +571,6 @@ class MainWindow(QMainWindow):
 
     def _job_changed(self, job: Job) -> None:
         self.db.log_download(job)
-        if job.state in (State.DONE, State.HANDED_OFF):
-            self.downloaded.add((job.release.source, job.release.post_id))
         row = self.job_rows.get(job.id)
         if row is None:
             row = self.table.rowCount()
@@ -582,6 +606,7 @@ class MainWindow(QMainWindow):
             self.settings = dlg.result_settings()
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
+            self.logos.configure(self.settings.stashboxes)
             self.act_crawl.setChecked(self.settings.crawl_enabled)
             self._load_sources()
             self._apply_timers()
