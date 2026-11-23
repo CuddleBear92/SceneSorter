@@ -240,6 +240,8 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.quota_label)
 
         self.crawl_timer = QTimer(self, timeout=self._crawl_tick)
+        self.rescan_timer = QTimer(self, timeout=self._rescan_tick)
+        self._rescan_rr = 0
         self.refresh_timer = QTimer(self, timeout=self.refresh)
         self._apply_timers()
         self.rebuild_timer = QTimer(self, singleShot=True, interval=400, timeout=self._start_rebuild)
@@ -529,6 +531,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ crawler
     def _apply_timers(self) -> None:
         self.crawl_timer.start(max(5, self.settings.crawl_interval_s) * 1000)
+        self.rescan_timer.start(max(2, self.settings.rescan_interval_s) * 1000)
         if self.settings.auto_refresh_minutes > 0:
             self.refresh_timer.start(self.settings.auto_refresh_minutes * 60_000)
         else:
@@ -558,9 +561,67 @@ class MainWindow(QMainWindow):
             break
         self._update_crawl_label()
 
+    # -------------------------------------------------------------- rescan
+    # A full pass over every listing page, faster than the background crawler,
+    # that only adds/updates posts (never removes). Used to fill gaps. Progress is
+    # stored in the DB so it resumes after a restart.
+    def is_rescanning(self, sid: str) -> bool:
+        return self.db.get_meta(f"rescan_active:{sid}") == "1"
+
+    def start_rescan(self, sid: str) -> None:
+        self.db.set_meta(f"rescan_active:{sid}", "1")
+        self.db.set_meta(f"rescan_page:{sid}", "0")
+        self.db.set_meta(f"rescan_new:{sid}", "0")
+        self.backoff_until.pop(sid, None)
+        self._update_crawl_label()
+        QTimer.singleShot(200, self._rescan_tick)
+
+    def stop_rescan(self, sid: str, finished: bool = False) -> None:
+        self.db.set_meta(f"rescan_active:{sid}", "0")
+        new = self.db.get_meta(f"rescan_new:{sid}", "0")
+        name = self.sources[sid].display_name if sid in self.sources else sid
+        self.status_label.setText(f"Rescan of {name} {'finished' if finished else 'stopped'}: {new} missing post(s) added")
+        self._update_crawl_label()
+
+    def _rescan_tick(self) -> None:
+        active = [sid for sid in self.sources if self.is_rescanning(sid)]
+        for k in range(len(active)):
+            sid = active[(self._rescan_rr + k) % len(active)]
+            if sid in self.in_flight or time.time() < self.backoff_until.get(sid, 0):
+                continue
+            self._rescan_rr = (self._rescan_rr + k + 1) % len(active)
+            self._fetch(sid, int(self.db.get_meta(f"rescan_page:{sid}", "0")) + 1, "rescan")
+            break
+
+    def _rescan_page_done(self, sid: str, page: int, rels, new: int) -> None:
+        src = self.sources[sid]
+        if not self.is_rescanning(sid):
+            return
+        total_new = int(self.db.get_meta(f"rescan_new:{sid}", "0")) + new
+        self.db.set_meta(f"rescan_new:{sid}", str(total_new))
+        if rels:
+            self.db.set_meta(f"rescan_page:{sid}", str(page))
+        if not rels or (src.total_pages and page >= src.total_pages):
+            # a completed pass has seen every page: the background crawler can stop too
+            last = page if rels else page - 1
+            if last > int(self.db.get_meta(f"backfill_page:{sid}", "0")):
+                self.db.set_meta(f"backfill_page:{sid}", str(last))
+            self.db.set_meta(f"crawl_done:{sid}", "1")
+            self.stop_rescan(sid, finished=True)
+        else:
+            self.status_label.setText(f"Rescan {src.display_name}: page {page}"
+                                      f"{'/' + str(src.total_pages) if src.total_pages else ''} · {total_new} new so far")
+
     def _update_crawl_label(self) -> None:
         parts = []
         for sid, src in self.sources.items():
+            if self.is_rescanning(sid):
+                done = int(self.db.get_meta(f"rescan_page:{sid}", "0"))
+                total = src.total_pages or self.db.get_meta(f"total_pages:{sid}")
+                wait = self.backoff_until.get(sid, 0) - time.time()
+                parts.append(f"Rescan {src.display_name}: {done}/{total or '?'} · "
+                             f"{self.db.get_meta(f'rescan_new:{sid}', '0')} new" + (f" (waiting {int(wait)}s)" if wait > 0 else ""))
+                continue
             if self._crawl_done(sid):
                 parts.append(f"{src.display_name}: fully cached")
                 continue
@@ -600,7 +661,9 @@ class MainWindow(QMainWindow):
         backfill = int(self.db.get_meta(f"backfill_page:{sid}", "0"))
         if mode == "refresh" and rels and page == backfill + 1 and not self._crawl_done(sid):
             self.db.set_meta(f"backfill_page:{sid}", str(page))  # refresh pages count as crawled too
-        if mode == "crawl":
+        if mode == "rescan":
+            self._rescan_page_done(sid, page, rels, new)
+        elif mode == "crawl":
             if rels:
                 self.db.set_meta(f"backfill_page:{sid}", str(page))
                 self.status_label.setText(f"Cached {src.display_name} page {page} ({new} new) · "
@@ -1112,7 +1175,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- settings
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self)
+        dlg = SettingsDialog(self.settings, self, rescan=self)
         if dlg.exec():
             self.settings = dlg.result_settings()
             self.settings.save()

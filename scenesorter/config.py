@@ -61,6 +61,7 @@ class Settings:
     crawl_enabled: bool = True
     crawl_interval_s: int = 30          # one page request every N seconds (across all sources)
     auto_refresh_minutes: int = 30      # check for new posts this often (0 = off)
+    rescan_interval_s: int = 5          # "Rescan all pages": one page request every N seconds
     # Release groups to prefer when picking which release to download (first = best).
     preferred_groups: list[str] = field(default_factory=lambda: ["PRT"])
     update_repo: str = "CuddleBear92/SceneSorter"

@@ -7,7 +7,7 @@ from dataclasses import asdict, replace
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHeaderView, QTableWidget, QTableWidgetItem,
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QDialog, QGroupBox, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -24,7 +24,7 @@ SAMPLE.title = "Example Scene"
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, parent=None):
+    def __init__(self, settings: Settings, parent=None, rescan=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(720, 520)
@@ -113,6 +113,35 @@ class SettingsDialog(QDialog):
         add.setToolTip("Adds PornRips.to and EncodedFapFiles (skips any id already in the list)")
         add.clicked.connect(self._add_example)
         v.addWidget(add)
+
+        # Fill gaps: full pass over every page, adds missing posts, never removes anything
+        self.rescan = rescan
+        gaps = QGroupBox("Fill gaps — rescan every page")
+        gl = QVBoxLayout(gaps)
+        gl.addWidget(QLabel("Walks all listing pages from newest to oldest and adds any post that's missing from the "
+                            "local cache. Nothing is removed. Faster than background caching; resumes after a restart."))
+        self.rescan_rows: list[tuple[str, QPushButton, QLabel]] = []
+        for c in settings.sources:
+            row = QHBoxLayout()
+            name = (c.options or {}).get("display_name", c.id)
+            btn = QPushButton()
+            state = QLabel()
+            state.setStyleSheet("color:#9ca3af")
+            btn.clicked.connect(lambda _=False, sid=c.id: self._toggle_rescan(sid))
+            row.addWidget(QLabel(f"<b>{name}</b>"), 1)
+            row.addWidget(state, 2)
+            row.addWidget(btn)
+            gl.addLayout(row)
+            self.rescan_rows.append((c.id, btn, state))
+        speed = QHBoxLayout()
+        self.rescan_interval = QSpinBox(minimum=2, maximum=600, value=settings.rescan_interval_s, suffix=" s")
+        self.rescan_interval.setToolTip("Seconds between page requests during a rescan (higher = gentler on the site)")
+        speed.addWidget(QLabel("Seconds between page requests:"))
+        speed.addWidget(self.rescan_interval)
+        speed.addStretch(1)
+        gl.addLayout(speed)
+        v.addWidget(gaps)
+        self._update_rescan_rows()
         tabs.addTab(src, "Sources")
 
         # --- import folders + matching
@@ -187,6 +216,38 @@ class SettingsDialog(QDialog):
         row.addWidget(btn)
         form.addRow(label, row)
         return edit
+
+    def _toggle_rescan(self, sid: str) -> None:
+        if self.rescan is None:
+            return
+        if self.rescan.is_rescanning(sid):
+            self.rescan.stop_rescan(sid)
+        else:
+            # use the pace from this dialog right away, even before OK is pressed
+            self.rescan.settings.rescan_interval_s = self.rescan_interval.value()
+            self.rescan._apply_timers()
+            self.rescan.start_rescan(sid)
+        self._update_rescan_rows()
+
+    def _update_rescan_rows(self) -> None:
+        for sid, btn, state in self.rescan_rows:
+            loaded = self.rescan is not None and sid in self.rescan.sources
+            btn.setEnabled(loaded)
+            if not loaded:
+                btn.setText("Rescan all pages")
+                state.setText("save and enable this source first")
+                continue
+            db = self.rescan.db
+            total = db.get_meta(f"total_pages:{sid}") or "?"
+            if self.rescan.is_rescanning(sid):
+                btn.setText("Stop rescan")
+                state.setText(f"running: page {db.get_meta(f'rescan_page:{sid}', '0')}/{total} · "
+                              f"{db.get_meta(f'rescan_new:{sid}', '0')} new")
+            else:
+                btn.setText("Rescan all pages")
+                cached = "fully cached" if db.get_meta(f"crawl_done:{sid}") == "1" else \
+                    f"{db.get_meta(f'backfill_page:{sid}', '0')}/{total} pages cached"
+                state.setText(cached)
 
     def _add_import_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Import folder")
@@ -270,6 +331,7 @@ class SettingsDialog(QDialog):
             crawl_enabled=self.crawl.isChecked(),
             crawl_interval_s=self.crawl_interval.value(),
             auto_refresh_minutes=self.auto_refresh.value(),
+            rescan_interval_s=self.rescan_interval.value(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
             stashboxes=self._stashboxes(),

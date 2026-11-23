@@ -51,6 +51,12 @@ your library.
   as `Retry-After` says, and on other errors it backs off exponentially. Once a
   source is fully cached, the app only checks for new posts, every 30 minutes by
   default. Search and filters run on the local database, so they work offline.
+- **Fill gaps (rescan all pages).** In **Settings ▸ Sources**, each source has
+  a **Rescan all pages** button. It walks every listing page from newest to
+  oldest, one request every 5 s by default, and adds any post missing from the
+  cache. Nothing is removed. It resumes after a restart, waits when a site
+  says to slow down, and shows progress in the status bar. The same button
+  stops it.
 - **Release groups.** The group is detected from the release name, in forms
   like `…XXX.1080p.HEVC.x265.PRT`, `…MP4-GRP` and `[GRP]`, or from a
   `Group:` / `Filename:` line in the post. You can filter by group. Preferred
