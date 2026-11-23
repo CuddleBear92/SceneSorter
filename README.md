@@ -44,15 +44,37 @@ your library.
   like `…XXX.1080p.HEVC.x265.PRT`, `…MP4-GRP` and `[GRP]`, or from a
   `Group:` / `Filename:` line in the post. You can filter by group. Preferred
   groups (PRT by default) are highlighted and offered first.
-- **Downloaded tracking.** A release is flagged as downloaded when you start
-  its download. You can also flag or unflag a whole scene, or a single
-  release, by hand. The **Downloaded** tab shows those scenes in the same grid
-  as Browse. A filter lets you show all scenes, only ones not downloaded, or
-  only downloaded ones.
-- **Studios tab.** Shows every studio with its logo from StashDB. Logos are
-  looked up one every 1.5 s, only for studios currently on screen, and cached
-  in `data/cache/logos`. Click a studio to browse its scenes. Add your stash-box
-  API keys in **Settings ▸ Stash-box**.
+- **Download tracking, including partial downloads.** Each release is
+  recorded as *grabbed*, *done* or *failed*:
+  - **grabbed:** an HTTP download started, or the release was sent to the
+    torrent client or black hole
+  - **done:** the HTTP download finished, or you marked it by hand
+  - **failed:** the download failed or you cancelled it
+
+  A scene counts as **Downloaded** only once a release at your *wanted
+  resolution* (Settings), or higher, is done. If that resolution isn't posted,
+  the best posted one counts. Otherwise the scene is **Partial** (for example,
+  720p finished but 1080p didn't) or **Grabbed**, and stays wanted. The
+  **Downloaded** tab shows all three, each with its own badge. The toolbar
+  filter has options for all scenes, still wanted, grabbed/partial, and
+  downloaded.
+- **Right-click menu and blacklist.** Right-click a scene, or a Ctrl/Shift
+  selection of several, to:
+  - mark it as downloaded, or as not downloaded
+  - hide the scene
+  - hide every scene from its studio
+  - show only that studio
+  - open the post
+
+  Hidden items come back with **Show hidden**, where you can unhide them. You
+  can also hide studios from the Studios tab.
+- **Studios.** Every studio gets a card with its StashDB logo and official name.
+  Scene cards use the official name too. Clicking a studio filters Browse, and
+  the filter chip shows the logo. Logos are fetched slowly in the background,
+  one every 1.5 s, with on-screen studios first. Add API keys in
+  **Settings ▸ Stash-box**.
+- **Torrent black hole.** Set a folder and `.torrent` files are saved there for
+  your client's watch folder. Magnets can optionally be saved as `.magnet` files.
 - **Self-updating exe.** GitHub Actions builds `SceneSorter.exe`. The app checks
   GitHub Releases on start and can update itself in place.
 

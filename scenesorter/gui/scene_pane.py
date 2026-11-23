@@ -3,14 +3,16 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QListView, QScrollArea, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtWidgets import QAbstractItemView, QLabel, QListView, QScrollArea, QSplitter, QVBoxLayout, QWidget
 
 from ..models import Scene
 from .scene_grid import SceneDelegate, SceneFilter, SceneModel, SceneRole
 
 
 class ScenePane(QSplitter):
+    #: right-click on the grid: (selected scenes, global position)
+    context_requested = Signal(list, QPoint)
     def __init__(self, model: SceneModel, delegate: SceneDelegate,
                  render_detail: Callable[["ScenePane", Scene], None], have: str = "",
                  empty_text: str = "Select a scene"):
@@ -31,6 +33,9 @@ class ScenePane(QSplitter):
         self.grid.setSpacing(2)
         self.grid.setModel(self.filter)
         self.grid.setItemDelegate(delegate)
+        self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)  # ctrl/shift for bulk
+        self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self._context_menu)
         self.grid.selectionModel().currentChanged.connect(lambda cur, _p: self.show_scene(cur.data(SceneRole)))
         model.modelAboutToBeReset.connect(self._before_reset)
         model.modelReset.connect(self._after_reset)
@@ -65,6 +70,15 @@ class ScenePane(QSplitter):
                 self.grid.setCurrentIndex(self.filter.mapFromSource(self.model.index(row)))
         self.grid.verticalScrollBar().setValue(scroll)
         self._restoring = False
+
+    def _context_menu(self, pos) -> None:
+        idx = self.grid.indexAt(pos)
+        if not idx.isValid():
+            return
+        if not self.grid.selectionModel().isSelected(idx):
+            self.grid.setCurrentIndex(idx)
+        scenes = [i.data(SceneRole) for i in self.grid.selectionModel().selectedIndexes()]
+        self.context_requested.emit(scenes or [idx.data(SceneRole)], self.grid.viewport().mapToGlobal(pos))
 
     def show_scene(self, scene: Scene | None) -> None:
         if self._restoring:

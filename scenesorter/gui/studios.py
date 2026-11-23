@@ -14,7 +14,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from ..db import Database
@@ -79,6 +79,20 @@ class LogoService(QObject):
     def configure(self, configs: list[StashBoxConfig]) -> None:
         self.boxes = [StashBox(c) for c in configs if c.enabled and c.api_key]
 
+    def prefetch(self, studios: list[tuple[str, str]]) -> None:
+        """Queue every studio we know nothing about yet, behind whatever is on screen.
+        Runs in the background at the same gentle pace (one lookup per 1.5 s)."""
+        if not self.boxes:
+            return
+        known = self.db.studio_keys_checked(RETRY_NOT_FOUND_S)
+        for key, name in studios:
+            if key not in known and key not in self.queued:
+                self.queued.add(key)
+                self.queue.append((key, name))
+
+    def pending(self) -> int:
+        return len(self.queue) + (1 if self.busy else 0)
+
     def get(self, key: str, name: str) -> QPixmap | None:
         if key in self.mem:
             return self.mem[key]
@@ -91,7 +105,12 @@ class LogoService(QObject):
             if time.time() - (row["checked_at"] or 0) < RETRY_NOT_FOUND_S:
                 self.mem[key] = None
                 return None
-        if self.boxes and key not in self.queued:
+        if self.boxes:
+            if key in self.queued:  # already waiting (e.g. prefetch) — bump it to the front
+                try:
+                    self.queue.remove((key, name))
+                except ValueError:
+                    return None
             self.queued.add(key)
             self.queue.appendleft((key, name))  # most recently shown first
         return None
@@ -134,6 +153,7 @@ class StudioModel(QAbstractListModel):
     def __init__(self, logos: LogoService, parent=None):
         super().__init__(parent)
         self.logos = logos
+        self.hidden: set[str] = set()
         self.items: list[StudioEntry] = []
         self._row: dict[str, int] = {}
         logos.ready.connect(self._logo_ready)
@@ -212,6 +232,8 @@ class StudioDelegate(QStyledItemDelegate):
 
     def paint(self, p: QPainter, opt, index) -> None:
         e: StudioEntry = index.data(StudioRole)
+        model = index.model().sourceModel()
+        hidden = e.key in model.hidden
         r = opt.rect.adjusted(6, 6, -6, -6)
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -246,11 +268,19 @@ class StudioDelegate(QStyledItemDelegate):
         p.setPen(QColor("#9ca3af"))
         sub = f"{e.scenes} scene{'s' if e.scenes != 1 else ''}" + (f" · {e.have} downloaded" if e.have else "")
         p.drawText(QRect(text_rect.left(), text_rect.top() + fm.height() + 2, text_rect.width(), fm.height()), 0, sub)
+        if hidden:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 160))
+            p.drawRoundedRect(r, 8, 8)
+            p.setPen(QColor("#f87171"))
+            p.drawText(QRect(r.left(), r.top() + 6, r.width() - 10, 18),
+                       Qt.AlignmentFlag.AlignRight, "HIDDEN")
         p.restore()
 
 
 class StudiosTab(QWidget):
     studio_activated = Signal(str, str)  # key, display name
+    hide_requested = Signal(str, str, bool)  # key, name, hide?
 
     def __init__(self, logos: LogoService, parent=None):
         super().__init__(parent)
@@ -280,6 +310,8 @@ class StudiosTab(QWidget):
         self.view.setItemDelegate(StudioDelegate())
         self.view.activated.connect(self._activate)
         self.view.clicked.connect(self._activate)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._menu)
         lay = QVBoxLayout(self)
         lay.addLayout(top)
         lay.addWidget(self.view)
@@ -289,7 +321,25 @@ class StudiosTab(QWidget):
         if e:
             self.studio_activated.emit(e.key, e.name)
 
+    def _menu(self, pos) -> None:
+        idx = self.view.indexAt(pos)
+        e: StudioEntry | None = idx.data(StudioRole) if idx.isValid() else None
+        if not e:
+            return
+        menu = QMenu(self)
+        menu.addAction(f"Show scenes from {e.name}", lambda: self.studio_activated.emit(e.key, e.name))
+        hidden = e.key in self.model.hidden
+        menu.addAction(f"{'Unhide' if hidden else 'Hide'} studio “{e.name}”",
+                       lambda: self.hide_requested.emit(e.key, e.name, not hidden))
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def set_hidden(self, hidden: set[str]) -> None:
+        self.model.hidden = hidden
+        if self.model.items:
+            self.model.dataChanged.emit(self.model.index(0), self.model.index(len(self.model.items) - 1))
+
     def set_scenes(self, scenes: list[Scene], has, logos_enabled: bool) -> None:
         self.model.set_scenes(scenes, has)
+        self.model.logos.prefetch([(e.key, e.name) for e in self.model.items])
         self.hint.setText(f"{len(self.model.items)} studios · click one to browse its scenes" +
                           ("" if logos_enabled else " · add a StashDB API key in Settings to load logos"))

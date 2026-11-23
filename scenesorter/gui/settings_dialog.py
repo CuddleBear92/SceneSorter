@@ -7,7 +7,7 @@ from dataclasses import asdict, replace
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHeaderView, QTableWidget, QTableWidgetItem,
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -51,6 +51,18 @@ class SettingsDialog(QDialog):
         form.addRow("Preview", self.preview)
         self.parallel = QSpinBox(minimum=1, maximum=8, value=settings.max_parallel_downloads)
         form.addRow("Parallel downloads", self.parallel)
+        self.blackhole = self._dir_row(form, "Torrent black hole", settings.torrent_blackhole_dir)
+        self.blackhole.setPlaceholderText("empty = open torrents/magnets with your default torrent app")
+        self.magnets_bh = QCheckBox("Also save magnet links into the black hole as .magnet files")
+        self.magnets_bh.setChecked(settings.magnets_to_blackhole)
+        form.addRow("", self.magnets_bh)
+        self.wanted_res = QComboBox()
+        for label, val in (("Best available", ""), ("2160p", "2160p"), ("1080p", "1080p"), ("720p", "720p")):
+            self.wanted_res.addItem(label, val)
+        self.wanted_res.setCurrentIndex(max(0, self.wanted_res.findData(settings.preferred_resolution)))
+        self.wanted_res.setToolTip("A scene counts as downloaded once this resolution (or higher) is done. "
+                                   "If it isn't posted, the best posted one counts. Anything less = partial.")
+        form.addRow("Wanted resolution", self.wanted_res)
         self.auto_sort = QCheckBox("Rename && move finished downloads into the library")
         self.auto_sort.setChecked(settings.auto_sort_completed)
         form.addRow("", self.auto_sort)
@@ -189,6 +201,9 @@ class SettingsDialog(QDialog):
             library_dir=self.library_dir.text(),
             rename_template=self.template.text(),
             max_parallel_downloads=self.parallel.value(),
+            torrent_blackhole_dir=self.blackhole.text().strip(),
+            magnets_to_blackhole=self.magnets_bh.isChecked(),
+            preferred_resolution=self.wanted_res.currentData(),
             auto_sort_completed=self.auto_sort.isChecked(),
             check_updates_on_start=self.updates.isChecked(),
             refresh_on_start=self.refresh_start.isChecked(),

@@ -39,6 +39,9 @@ class Settings:
     rename_template: str = DEFAULT_TEMPLATE
     preferred_resolution: str = "1080p"
     max_parallel_downloads: int = 2
+    # Torrent black hole: .torrent files are saved here for your torrent client's watch folder.
+    torrent_blackhole_dir: str = ""
+    magnets_to_blackhole: bool = True   # also write magnet links as .magnet files
     auto_sort_completed: bool = True
     check_updates_on_start: bool = True
     refresh_on_start: bool = True

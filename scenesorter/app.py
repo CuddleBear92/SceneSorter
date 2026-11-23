@@ -23,6 +23,12 @@ def _dark_palette(app: QApplication) -> None:
     for role, color in roles.items():
         pal.setColor(role, QColor(color))
     app.setPalette(pal)
+    # Fusion's checkbox indicator is near-invisible on this dark palette; give it an outline.
+    app.setStyleSheet(
+        "QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #6b7280; border-radius: 3px;"
+        " background: #0d1014; }"
+        "QCheckBox::indicator:checked { background: #2563eb; border-color: #3b82f6; }"
+        "QCheckBox::indicator:hover { border-color: #9ca3af; }")
 
 
 def main(argv: list[str] | None = None) -> int:

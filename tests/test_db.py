@@ -45,14 +45,31 @@ def test_reparse(tmp_path):
 
 def test_flags(tmp_path):
     db = Database(tmp_path / "s.db")
-    db.set_flag("blog", "1", "started")
-    db.set_flag("blog", "2", "manual")
-    assert db.flags() == {("blog", "1"): "started", ("blog", "2"): "manual"}
+    db.set_flag("blog", "1", "grabbed")
+    db.set_flag("blog", "2", "done")
+    assert db.flags() == {("blog", "1"): "grabbed", ("blog", "2"): "done"}
+    db.set_flag("blog", "2", "failed")            # a failed retry keeps 'done'
+    assert db.flags()[("blog", "2")] == "done"
+    db.set_flag("blog", "1", "failed")            # grabbed -> failed is fine
+    assert db.flags()[("blog", "1")] == "failed"
     db.set_flag("blog", "1", "verified")
-    db.set_flag("blog", "1", "manual")  # never downgrades verified
+    db.set_flag("blog", "1", "done")              # never downgrades verified
     assert db.flags()[("blog", "1")] == "verified"
+    db.set_flag("blog", "2", "grabbed", force=True)  # explicit user action wins
+    assert db.flags()[("blog", "2")] == "grabbed"
     db.clear_flags([("blog", "1")])
     assert ("blog", "1") not in db.flags()
+
+
+def test_hidden(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.hide_scene("k1", "Scene", [("blog", "1"), ("blog", "2")])
+    db.hide_studio("studio", "Studio")
+    keys, posts, studios = db.hidden()
+    assert keys == {"k1"} and posts == {("blog", "1"), ("blog", "2")} and studios == {"studio": "Studio"}
+    db.hide_scene("k1", "Scene", [("blog", "1"), ("blog", "2")], hide=False)
+    db.hide_studio("studio", "Studio", hide=False)
+    assert db.hidden() == (set(), set(), {})
 
 
 def test_migrates_old_downloads_to_flags(tmp_path):
@@ -60,4 +77,15 @@ def test_migrates_old_downloads_to_flags(tmp_path):
     db.conn.execute("INSERT INTO downloads(id, source, post_id, state) VALUES ('a','blog','9','Sent to torrent client')")
     db.set_meta("schema_version", "1")
     db.close()
-    assert Database(tmp_path / "s.db").flags() == {("blog", "9"): "started"}
+    assert Database(tmp_path / "s.db").flags() == {("blog", "9"): "grabbed"}
+
+
+def test_migrates_build3_flag_names(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.conn.execute("INSERT INTO flags(source, post_id, state) VALUES ('blog','1','started'), ('blog','2','manual'),"
+                    " ('blog','3','started')")
+    db.conn.execute("INSERT INTO downloads(id, source, post_id, state) VALUES ('x','blog','3','Done')")
+    db.set_meta("schema_version", "2")
+    db.close()
+    assert Database(tmp_path / "s.db").flags() == {("blog", "1"): "grabbed", ("blog", "2"): "done",
+                                                   ("blog", "3"): "done"}

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .models import DownloadLink, LinkKind, Release
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -62,8 +62,7 @@ CREATE TABLE IF NOT EXISTS downloads (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 
 -- What the user has downloaded, per post (= per resolution/site).
--- state: 'started' (download kicked off), 'manual' (user marked it),
---        'verified' (file found on disk; set by a library scan later)
+-- state: see status.py — grabbed / done / failed / verified
 CREATE TABLE IF NOT EXISTS flags (
     source     TEXT NOT NULL,
     post_id    TEXT NOT NULL,
@@ -72,6 +71,12 @@ CREATE TABLE IF NOT EXISTS flags (
     path       TEXT,
     PRIMARY KEY (source, post_id)
 );
+
+-- Blacklist: hidden scenes (by match key AND by post, so a re-parse or a new
+-- resolution of the same scene stays hidden) and hidden studios.
+CREATE TABLE IF NOT EXISTS hidden_scenes (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
+CREATE TABLE IF NOT EXISTS hidden_posts (source TEXT, post_id TEXT, PRIMARY KEY (source, post_id));
+CREATE TABLE IF NOT EXISTS hidden_studios (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
 
 -- Studio metadata/logos looked up on stash-box instances (cached forever).
 CREATE TABLE IF NOT EXISTS studios (
@@ -99,11 +104,19 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
-        if self.get_meta("schema_version") != str(SCHEMA_VERSION):
-            # v1 -> v2: carry over downloads started by earlier builds as flags
+        old = int(self.get_meta("schema_version") or SCHEMA_VERSION)
+        if old < 2:
+            # carry over downloads started by build 1-2 as flags
             self.conn.execute("INSERT OR IGNORE INTO flags(source, post_id, state, marked_at) "
                               "SELECT source, post_id, 'started', started_at FROM downloads "
                               "WHERE state IN ('Done', 'Sent to torrent client', 'Downloading', 'Sorting')")
+        if old < 3:
+            # build 3 flag names -> grabbed/done; finished HTTP downloads count as done
+            self.conn.execute("UPDATE flags SET state='grabbed' WHERE state='started'")
+            self.conn.execute("UPDATE flags SET state='done' WHERE state='manual'")
+            self.conn.execute("UPDATE flags SET state='done' WHERE state='grabbed' AND EXISTS ("
+                              "SELECT 1 FROM downloads d WHERE d.source=flags.source "
+                              "AND d.post_id=flags.post_id AND d.state='Done')")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
@@ -223,7 +236,7 @@ class Database:
                 (job.id, r.source, r.post_id, r.resolution, r.release_group, job.link.kind.value,
                  job.path.name if job.path else (job.link.filename or r.filename or None),
                  str(job.final_path) if job.final_path else None, job.state.value, job.error or None,
-                 now, now if job.state.name in ("DONE", "FAILED", "CANCELLED", "HANDED_OFF") else None),
+                 now, now if job.state.name in ("DONE", "FAILED", "CANCELLED", "HANDED_OFF", "BLACKHOLE") else None),
             )
 
     # ---------------------------------------------------------------- flags
@@ -232,21 +245,68 @@ class Database:
             rows = self.conn.execute("SELECT source, post_id, state FROM flags").fetchall()
         return {(r["source"], r["post_id"]): r["state"] for r in rows}
 
-    def set_flag(self, source: str, post_id: str, state: str, path: str | None = None) -> None:
-        """Flag a post as downloaded. Never downgrades 'verified'."""
+    def set_flag(self, source: str, post_id: str, state: str, path: str | None = None,
+                 force: bool = False) -> None:
+        """Record a release's download state.
+
+        Automatic updates never lose progress: 'verified' always stays, and a
+        finished ('done') release isn't knocked back to grabbed/failed by a
+        later retry. ``force`` (user action) sets the state as given.
+        """
         with self._lock:
             self.conn.execute(
                 "INSERT INTO flags(source, post_id, state, marked_at, path) VALUES (?,?,?,?,?) "
-                "ON CONFLICT(source, post_id) DO UPDATE SET "
-                "state=CASE WHEN flags.state='verified' THEN 'verified' ELSE excluded.state END, "
+                "ON CONFLICT(source, post_id) DO UPDATE SET state=CASE "
+                "  WHEN ? THEN excluded.state "
+                "  WHEN flags.state='verified' THEN 'verified' "
+                "  WHEN flags.state='done' AND excluded.state IN ('grabbed','failed') THEN 'done' "
+                "  ELSE excluded.state END, "
                 "marked_at=excluded.marked_at, path=COALESCE(excluded.path, flags.path)",
-                (source, post_id, state, time.time(), path))
+                (source, post_id, state, time.time(), path, int(force)))
+
+    # -------------------------------------------------------------- hidden
+    def hidden(self) -> tuple[set[str], set[tuple[str, str]], dict[str, str]]:
+        """(hidden scene keys, hidden posts, hidden studios key->name)"""
+        with self._lock:
+            keys = {r[0] for r in self.conn.execute("SELECT key FROM hidden_scenes")}
+            posts = {(r[0], r[1]) for r in self.conn.execute("SELECT source, post_id FROM hidden_posts")}
+            studios = {r[0]: r[1] for r in self.conn.execute("SELECT key, name FROM hidden_studios")}
+        return keys, posts, studios
+
+    def hide_scene(self, key: str, name: str, posts: list[tuple[str, str]], hide: bool = True) -> None:
+        with self._lock:
+            if hide:
+                self.conn.execute("INSERT OR REPLACE INTO hidden_scenes VALUES (?,?,?)", (key, name, time.time()))
+                self.conn.executemany("INSERT OR IGNORE INTO hidden_posts VALUES (?,?)", posts)
+            else:
+                self.conn.execute("DELETE FROM hidden_scenes WHERE key=?", (key,))
+                self.conn.executemany("DELETE FROM hidden_posts WHERE source=? AND post_id=?", posts)
+
+    def hide_studio(self, key: str, name: str, hide: bool = True) -> None:
+        with self._lock:
+            if hide:
+                self.conn.execute("INSERT OR REPLACE INTO hidden_studios VALUES (?,?,?)", (key, name, time.time()))
+            else:
+                self.conn.execute("DELETE FROM hidden_studios WHERE key=?", (key,))
 
     def clear_flags(self, posts: list[tuple[str, str]]) -> None:
         with self._lock:
             self.conn.executemany("DELETE FROM flags WHERE source=? AND post_id=?", posts)
 
     # -------------------------------------------------------------- studios
+    def studio_names(self) -> dict[str, str]:
+        """Official stash-box spelling for every matched studio (key -> name)."""
+        with self._lock:
+            rows = self.conn.execute("SELECT key, name FROM studios WHERE endpoint IS NOT NULL").fetchall()
+        return {r["key"]: r["name"] for r in rows}
+
+    def studio_keys_checked(self, max_age_s: float) -> set[str]:
+        """Studios already looked up (matched, or not found within max_age_s)."""
+        with self._lock:
+            rows = self.conn.execute("SELECT key FROM studios WHERE endpoint IS NOT NULL OR checked_at > ?",
+                                     (time.time() - max_age_s,)).fetchall()
+        return {r["key"] for r in rows}
+
     def studio(self, key: str) -> sqlite3.Row | None:
         with self._lock:
             return self.conn.execute("SELECT * FROM studios WHERE key=?", (key,)).fetchone()

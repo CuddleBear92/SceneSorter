@@ -17,38 +17,53 @@ SOURCE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6"]
 
 class SceneModel(QAbstractListModel):
     status_changed = Signal()
+
     def __init__(self, thumbs: ThumbnailLoader, parent=None):
         super().__init__(parent)
         self.scenes: list[Scene] = []
-        self.owned: set[str] = set()        # scene keys found in the library on disk
-        self.downloaded: set[str] = set()   # scene keys flagged as downloaded
+        self.owned: set[str] = set()          # scene keys found in the library on disk
+        self.status: dict[str, str] = {}      # scene key -> grabbed / partial / complete (see status.py)
+        self.hidden: set[str] = set()         # scene keys hidden by the user (scene or studio blacklist)
+        self.studio_names: dict[str, str] = {}  # studio key -> official stash-box name
         self.thumbs = thumbs
         self._row_by_key: dict[str, int] = {}
         thumbs.loaded.connect(self._thumb_ready)
 
-    def set_scenes(self, scenes: list[Scene], owned: set[str] | None = None,
-                   downloaded: set[str] | None = None) -> None:
+    def set_scenes(self, scenes: list[Scene], owned: set[str] | None = None) -> None:
         self.beginResetModel()
         self.scenes = scenes
         if owned is not None:
             self.owned = owned
-        if downloaded is not None:
-            self.downloaded = downloaded
         self._row_by_key = {s.key: i for i, s in enumerate(scenes)}
         self.endResetModel()
 
-    def set_status(self, owned: set[str] | None = None, downloaded: set[str] | None = None) -> None:
-        """Update owned/downloaded marks without resetting the view."""
+    def set_status(self, owned: set[str] | None = None, status: dict[str, str] | None = None,
+                   hidden: set[str] | None = None) -> None:
+        """Update marks without resetting the view."""
         if owned is not None:
             self.owned = owned
-        if downloaded is not None:
-            self.downloaded = downloaded
-        if self.scenes:
-            self.dataChanged.emit(self.index(0), self.index(len(self.scenes) - 1))
+        if status is not None:
+            self.status = status
+        if hidden is not None:
+            self.hidden = hidden
+        self.repaint_all()
         self.status_changed.emit()
 
+    def repaint_all(self) -> None:
+        if self.scenes:
+            self.dataChanged.emit(self.index(0), self.index(len(self.scenes) - 1))
+
+    def state(self, key: str) -> str:
+        """'complete' (incl. found in library), 'partial', 'grabbed' or 'none'."""
+        if key in self.owned:
+            return "complete"
+        return self.status.get(key, "none")
+
     def has(self, key: str) -> bool:
-        return key in self.owned or key in self.downloaded
+        return self.state(key) == "complete"
+
+    def display_studio(self, s: Scene) -> str:
+        return self.studio_names.get(studio_key(s.studio), s.studio) if s.studio else ""
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.scenes)
@@ -82,8 +97,11 @@ class SceneFilter(QSortFilterProxyModel):
         self.source = ""
         self.group = ""
         self.studio = ""        # normalised studio key
-        self.have = have        # "" = all, "missing" = not downloaded, "have" = downloaded/in library
-        self.locked_have = bool(have)  # the Downloaded tab always shows "have"
+        # "" = all, "missing" = still wanted (none/grabbed/partial), "partial" = grabbed or partial,
+        # "have" = complete, "any" = anything grabbed/partial/complete (the Downloaded tab)
+        self.have = have
+        self.locked_have = bool(have)
+        self.show_hidden = False
 
     def set(self, **kw) -> None:
         if self.locked_have:
@@ -95,9 +113,16 @@ class SceneFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
         model: SceneModel = self.sourceModel()
         s = model.scenes[row]
-        if self.have == "have" and not model.has(s.key):
+        if s.key in model.hidden and not self.show_hidden:
             return False
-        if self.have == "missing" and model.has(s.key):
+        st = model.state(s.key)
+        if self.have == "have" and st != "complete":
+            return False
+        if self.have == "missing" and st == "complete":
+            return False
+        if self.have == "partial" and st not in ("partial", "grabbed"):
+            return False
+        if self.have == "any" and st == "none":
             return False
         if self.studio and studio_key(s.studio) != self.studio:
             return False
@@ -108,7 +133,7 @@ class SceneFilter(QSortFilterProxyModel):
         if self.group and self.group not in s.release_groups:
             return False
         if self.text:
-            hay = " ".join([s.studio, s.title, *s.performers, *s.tags, *s.release_groups,
+            hay = " ".join([s.studio, model.display_studio(s), s.title, *s.performers, *s.tags, *s.release_groups,
                             *(r.raw_title for r in s.releases), *(r.filename for r in s.releases)]).lower()
             return all(w in hay for w in self.text.lower().split())
         return True
@@ -137,8 +162,9 @@ class SceneDelegate(QStyledItemDelegate):
     def paint(self, p: QPainter, opt: QStyleOptionViewItem, index) -> None:
         s: Scene = index.data(SceneRole)
         model = index.model().sourceModel() if hasattr(index.model(), "sourceModel") else index.model()
-        owned = s.key in getattr(model, "owned", set())
-        downloaded = s.key in getattr(model, "downloaded", set())
+        owned = s.key in model.owned
+        state = model.state(s.key)
+        hidden = s.key in model.hidden
         r = opt.rect.adjusted(6, 6, -6, -6)
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -197,8 +223,11 @@ class SceneDelegate(QStyledItemDelegate):
             p.setPen(QColor("white"))
             p.drawText(chip, Qt.AlignmentFlag.AlignCenter, grp)
             x += w + 4
-        if owned or downloaded:
-            text, color = ("IN LIBRARY", "#16a34a") if owned else ("DOWNLOADED", "#2563eb")
+        badge_info = (("IN LIBRARY", "#16a34a") if owned else
+                      {"complete": ("DOWNLOADED", "#2563eb"), "partial": ("PARTIAL", "#d97706"),
+                       "grabbed": ("GRABBED", "#7c3aed")}.get(state))
+        if badge_info:
+            text, color = badge_info
             w = p.fontMetrics().horizontalAdvance(text) + 12
             badge = QRect(thumb_rect.right() - w - 6, thumb_rect.bottom() - 24, w, 18)
             p.setPen(Qt.PenStyle.NoPen)
@@ -219,7 +248,7 @@ class SceneDelegate(QStyledItemDelegate):
         p.setFont(opt.font)
         p.setPen(QColor("#9ca3af"))
         fm = p.fontMetrics()
-        line2 = " · ".join(x for x in [s.studio, s.scene_date.isoformat() if s.scene_date else "",
+        line2 = " · ".join(x for x in [model.display_studio(s), s.scene_date.isoformat() if s.scene_date else "",
                                        fmt_duration(s.duration_s)] if x)
         line3 = ", ".join(s.performers)
         y = text_rect.top() + fm.height() + 4
@@ -228,4 +257,11 @@ class SceneDelegate(QStyledItemDelegate):
         if line3:
             p.drawText(QRect(text_rect.left(), y + fm.height(), text_rect.width(), fm.height()), 0,
                        fm.elidedText(line3, Qt.TextElideMode.ElideRight, text_rect.width()))
+        if hidden:  # dim blacklisted cards (only visible with "Show hidden")
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 150))
+            p.drawRoundedRect(r, 8, 8)
+            p.setPen(QColor("#f87171"))
+            p.setFont(small)
+            p.drawText(QRect(r.left(), r.top() + THUMB_H // 2 - 10, r.width(), 20), Qt.AlignmentFlag.AlignCenter, "HIDDEN")
         p.restore()

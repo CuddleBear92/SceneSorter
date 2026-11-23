@@ -32,6 +32,7 @@ class State(str, Enum):
     QUEUED = "Queued"
     RUNNING = "Downloading"
     HANDED_OFF = "Sent to torrent client"
+    BLACKHOLE = "Saved to black hole"
     SORTING = "Sorting"
     DONE = "Done"
     FAILED = "Failed"
@@ -83,6 +84,10 @@ class DownloadManager:
     def __init__(self, max_parallel: int = 2, session: requests.Session | None = None,
                  on_finished: Callable[[Job], None] | None = None):
         self.session = session or requests.Session()
+        #: If set, .torrent files are saved here (for a torrent client's watch folder)
+        self.blackhole_dir: Path | None = None
+        #: Also write magnet links as .magnet files into the black hole
+        self.magnets_to_blackhole: bool = True
         self.pool = ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="dl")
         self.jobs: dict[str, Job] = {}
         self.listeners: list[Listener] = []
@@ -121,11 +126,38 @@ class DownloadManager:
     # ----------------------------------------------------------------- workers
     def _hand_off(self, job: Job) -> None:
         try:
-            open_with_system(job.link.url)
-            job.state = State.HANDED_OFF
+            kind = job.link.kind
+            if self.blackhole_dir and (kind is LinkKind.TORRENT or
+                                       (kind is LinkKind.MAGNET and self.magnets_to_blackhole)):
+                job.path = self._to_blackhole(job)
+                job.state = State.BLACKHOLE
+            else:
+                open_with_system(job.link.url)
+                job.state = State.HANDED_OFF
         except Exception as e:  # noqa: BLE001
             job.state, job.error = State.FAILED, str(e)
         self._emit(job)
+
+    def _to_blackhole(self, job: Job) -> Path:
+        from .library import safe_component
+
+        folder = Path(self.blackhole_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = safe_component(job.release.filename.rsplit(".", 1)[0] if job.release.filename
+                              else job.release.raw_title)
+        if job.link.kind is LinkKind.MAGNET:
+            target = folder / f"{stem}.magnet"
+            target.write_text(job.link.url, encoding="utf-8")
+            return target
+        resp = self.session.get(job.link.url, timeout=60)
+        resp.raise_for_status()
+        if not resp.content.startswith(b"d"):  # bencoded dict; anything else is an error page
+            raise ValueError("Download didn't return a .torrent file")
+        target = folder / f"{stem}.torrent"
+        tmp = target.with_suffix(".torrent.part")  # write-then-rename so watchers never see half a file
+        tmp.write_bytes(resp.content)
+        tmp.replace(target)
+        return target
 
     def _run_http(self, job: Job) -> None:
         if job._cancel.is_set():

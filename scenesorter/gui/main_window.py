@@ -5,10 +5,10 @@ import time
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
+    QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
     QMainWindow, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
@@ -23,6 +23,7 @@ from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
 from ..sources import RateLimited, Source, build_source
 from ..parsing import normalise_studio
+from ..status import DONE, FINISHED, GRABBED, scene_status, target_release
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
 from .scene_pane import ScenePane
 from .settings_dialog import SettingsDialog
@@ -57,6 +58,8 @@ class MainWindow(QMainWindow):
         self.db = Database(DATA_DIR / "scenesorter.db")
         self.db.reparse_if_needed()
         self.flags: dict[tuple[str, str], str] = self.db.flags()
+        self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
+        self.studio_filter: tuple[str, str] = ("", "")
         self.releases: dict[tuple[str, str], Release] = {}
         self.next_page: dict[str, int | None] = {}
         self.in_flight: set[str] = set()
@@ -72,12 +75,14 @@ class MainWindow(QMainWindow):
         self.bridge = _JobBridge()
         self.bridge.changed.connect(self._job_changed)
         self.downloads = DownloadManager(settings.max_parallel_downloads, on_finished=self._on_download_finished)
+        self._apply_blackhole()
         self.downloads.subscribe(self.bridge.changed.emit)
         self.job_rows: dict[str, int] = {}
 
         self.thumbs = ThumbnailLoader(CACHE_DIR)
         self.logos = LogoService(self.db, CACHE_DIR, self)
         self.logos.configure(settings.stashboxes)
+        self.logos.ready.connect(self._studio_info_ready)
         self._build_ui()
         self._load_sources()
         self._load_cached()
@@ -121,11 +126,19 @@ class MainWindow(QMainWindow):
             lambda _i: self._set_filter(group=self.group_box.currentData() or ""))
         tb.addWidget(self.group_box)
         self.have_box = QComboBox()
-        for label, mode in (("Downloaded or not", ""), ("Not downloaded", "missing"), ("Downloaded", "have")):
+        for label, mode in (("Downloaded or not", ""), ("Still wanted", "missing"),
+                            ("Grabbed / partial", "partial"), ("Downloaded", "have")):
             self.have_box.addItem(label, mode)
+        self.have_box.setToolTip("Still wanted = not downloaded at your wanted resolution yet "
+                                 "(includes grabbed and partial)")
         self.have_box.currentIndexChanged.connect(lambda _i: self._set_filter(have=self.have_box.currentData()))
         tb.addWidget(self.have_box)
+        self.show_hidden = QCheckBox("Show hidden")
+        self.show_hidden.setToolTip("Show scenes and studios you've hidden (right-click to unhide)")
+        self.show_hidden.toggled.connect(lambda v: self._set_filter(show_hidden=v))
+        tb.addWidget(self.show_hidden)
         self.studio_btn = QPushButton()
+        self.studio_btn.setIconSize(QSize(96, 22))
         self.studio_btn.setToolTip("Showing one studio — click to show all")
         self.studio_btn.clicked.connect(lambda: self.filter_studio("", ""))
         self.studio_btn_action = tb.addWidget(self.studio_btn)
@@ -142,13 +155,16 @@ class MainWindow(QMainWindow):
         self.delegate = SceneDelegate([])
         self.delegate.preferred_groups = self.settings.preferred_groups
         self.browse = ScenePane(self.model, self.delegate, self.render_detail)
-        self.have_pane = ScenePane(self.model, self.delegate, self.render_detail, have="have",
-                                   empty_text="Scenes you've downloaded or marked as downloaded show up here.")
+        self.have_pane = ScenePane(self.model, self.delegate, self.render_detail, have="any",
+                                   empty_text="Scenes you've grabbed, partly downloaded or downloaded show up here.")
         self.panes = [self.browse, self.have_pane]
+        for pane in self.panes:
+            pane.context_requested.connect(self._scene_menu)
         self.model.status_changed.connect(self._update_tab_counts)
 
         self.studios = StudiosTab(self.logos)
         self.studios.studio_activated.connect(self.filter_studio)
+        self.studios.hide_requested.connect(self.hide_studio)
 
         # --- downloads tab
         self.table = QTableWidget(0, 6)
@@ -190,14 +206,40 @@ class MainWindow(QMainWindow):
 
     def filter_studio(self, key: str, name: str) -> None:
         """Show only one studio's scenes in Browse/Downloaded ('' = all)."""
+        self.studio_filter = (key, name)
         self._set_filter(studio=key)
-        self.studio_btn.setText(f"Studio: {name}  ✕")
+        self._update_studio_chip()
         self.studio_btn_action.setVisible(bool(key))
         if key:
             self.tabs.setCurrentWidget(self.browse)
 
+    def _update_studio_chip(self) -> None:
+        """Show the studio's logo in the filter chip when we have one, else its name."""
+        key, name = self.studio_filter
+        if not key:
+            return
+        name = self.model.studio_names.get(key, name)
+        pm = self.logos.get(key, name)
+        self.studio_btn.setToolTip(f"Showing only {name} — click to show all studios")
+        if pm and not pm.isNull():
+            self.studio_btn.setIcon(pm.scaled(96, 22, Qt.AspectRatioMode.KeepAspectRatio,
+                                              Qt.TransformationMode.SmoothTransformation))
+            self.studio_btn.setText("  ✕")
+        else:
+            self.studio_btn.setIcon(QPixmap())
+            self.studio_btn.setText(f"Studio: {name}  ✕")
+
+    def _studio_info_ready(self, key: str) -> None:
+        name = self.db.studio_names().get(key)
+        if name and self.model.studio_names.get(key) != name:
+            self.model.studio_names[key] = name
+            self.model.repaint_all()
+        if key == self.studio_filter[0]:
+            self._update_studio_chip()
+
     def _update_tab_counts(self) -> None:
-        self.tabs.setTabText(1, f"Downloaded ({len(self.model.owned | self.model.downloaded)})")
+        n = sum(1 for s in self.scenes if self.model.state(s.key) != "none" and s.key not in self.model.hidden)
+        self.tabs.setTabText(1, f"Downloaded ({n})")
 
     # -------------------------------------------------------------- sources
     def _load_sources(self) -> None:
@@ -369,32 +411,109 @@ class MainWindow(QMainWindow):
         self._rebuild_running = False
         if scenes is not None:
             self.scenes = scenes
-            self.model.set_scenes(scenes, set(self.owned), self._downloaded_keys())
+            self.model.studio_names = self.db.studio_names()
+            self.model.status, self.model.hidden = self._scene_status(), self._hidden_scene_keys()
+            self.model.set_scenes(scenes, set(self.owned))
             self._update_group_box()
             self._update_tab_counts()
             self.studios.set_scenes(scenes, self.model.has, bool(self.logos.boxes))
+            self.studios.set_hidden(set(self.hidden_studios))
         elif err:
             self.status_label.setText(f"Merge failed: {err.splitlines()[0]}")
         if self._rebuild_dirty:
             self._schedule_rebuild()
 
-    def _downloaded_keys(self) -> set[str]:
-        return {s.key for s in self.scenes if any((r.source, r.post_id) in self.flags for r in s.releases)}
+    # ------------------------------------------------------- status/hidden
+    def _scene_status(self) -> dict[str, str]:
+        pref = self.settings.preferred_resolution
+        out = {}
+        for s in self.scenes:
+            st = scene_status(s, self.flags, pref)
+            if st != "none":
+                out[s.key] = st
+        return out
+
+    def _hidden_scene_keys(self) -> set[str]:
+        hs = self.hidden_studios
+        return {s.key for s in self.scenes
+                if s.key in self.hidden_keys or normalise_studio(s.studio) in hs
+                or any((r.source, r.post_id) in self.hidden_posts for r in s.releases)}
+
+    def _scene_hidden(self, s: Scene) -> bool:
+        """Hidden as a scene (not just because its studio is hidden)."""
+        return s.key in self.hidden_keys or any((r.source, r.post_id) in self.hidden_posts for r in s.releases)
 
     def _flags_changed(self) -> None:
         self.flags = self.db.flags()
-        self.model.set_status(downloaded=self._downloaded_keys())
+        self.model.set_status(status=self._scene_status())
         for pane in self.panes:
             pane.refresh_detail()
+        self._update_tab_counts()
         self.studios.set_scenes(self.scenes, self.model.has, bool(self.logos.boxes))
 
+    def _hidden_changed(self) -> None:
+        self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
+        self.model.set_status(hidden=self._hidden_scene_keys())
+        self.studios.set_hidden(set(self.hidden_studios))
+        self._update_tab_counts()
+
     def mark_downloaded(self, releases: list[Release], on: bool) -> None:
+        """User action: flag releases as done, or clear their flags (= wanted again)."""
         if on:
             for r in releases:
-                self.db.set_flag(r.source, r.post_id, "manual")
+                self.db.set_flag(r.source, r.post_id, DONE, force=True)
         else:
             self.db.clear_flags([(r.source, r.post_id) for r in releases])
         self._flags_changed()
+
+    def mark_scenes(self, scenes: list[Scene], on: bool) -> None:
+        if on:
+            rels = [target_release(s, self.settings.preferred_resolution, self._source_priority) for s in scenes]
+        else:
+            rels = [r for s in scenes for r in s.releases]
+        self.mark_downloaded(rels, on)
+
+    def hide_scenes(self, scenes: list[Scene], hide: bool) -> None:
+        for s in scenes:
+            self.db.hide_scene(s.key, s.title or s.primary.raw_title,
+                               [(r.source, r.post_id) for r in s.releases], hide)
+        self._hidden_changed()
+
+    def hide_studio(self, key: str, name: str, hide: bool) -> None:
+        self.db.hide_studio(key, name, hide)
+        if hide and self.studio_filter[0] == key:
+            self.filter_studio("", "")
+        self._hidden_changed()
+        self.status_label.setText(f"{'Hid' if hide else 'Unhid'} all scenes from {name}"
+                                  + (" — tick “Show hidden” to see them" if hide else ""))
+
+    def _scene_menu(self, scenes: list[Scene], pos) -> None:
+        if not scenes:
+            return
+        one = scenes[0] if len(scenes) == 1 else None
+        what = "scene" if one else f"{len(scenes)} scenes"
+        menu = QMenu(self)
+        states = {self.model.state(s.key) for s in scenes}
+        if states != {"complete"}:
+            menu.addAction(f"Mark {what} as downloaded", lambda: self.mark_scenes(scenes, True))
+        if states != {"none"}:
+            menu.addAction(f"Mark {what} as not downloaded (wanted)", lambda: self.mark_scenes(scenes, False))
+        menu.addSeparator()
+        hidden = all(self._scene_hidden(s) for s in scenes)
+        menu.addAction(f"{'Unhide' if hidden else 'Hide'} {what}", lambda: self.hide_scenes(scenes, not hidden))
+        studios = {normalise_studio(s.studio): s for s in scenes if s.studio}
+        for skey, s in list(studios.items())[:3]:
+            name = self.model.display_studio(s)
+            sh = skey in self.hidden_studios
+            menu.addAction(f"{'Unhide' if sh else 'Hide'} all from studio “{name}”",
+                           lambda k=skey, n=name, h=sh: self.hide_studio(k, n, not h))
+        if one and one.studio:
+            menu.addSeparator()
+            menu.addAction(f"Show only “{self.model.display_studio(one)}”",
+                           lambda: self.filter_studio(normalise_studio(one.studio), self.model.display_studio(one)))
+        if one:
+            menu.addAction("Open post in browser", lambda: webbrowser.open(one.primary.post_url))
+        menu.exec(pos)
 
     def _update_group_box(self) -> None:
         current = self.group_box.currentData() or ""
@@ -453,21 +572,32 @@ class MainWindow(QMainWindow):
         lay.addWidget(info)
 
         flagged = [r for r in scene.releases if (r.source, r.post_id) in self.flags]
+        state = self.model.state(scene.key)
         if scene.key in self.owned:
             own = QLabel("✔ In library:<br>" + "<br>".join(p.name for p in self.owned[scene.key]))
             own.setWordWrap(True)
             own.setStyleSheet("color:#22c55e")
             lay.addWidget(own)
-        if flagged:
-            got = QLabel("✔ Downloaded: " + ", ".join(
-                f"{r.resolution or '?'} {r.release_group}".strip() for r in flagged))
-            got.setStyleSheet("color:#60a5fa")
-            lay.addWidget(got)
-        mark = QPushButton("Unmark as downloaded" if flagged else "Mark as downloaded")
-        mark.setToolTip("Flag this scene as downloaded (e.g. you got it elsewhere)" if not flagged
-                        else "Remove the downloaded flag from every release of this scene")
-        best = sorted(scene.releases, key=self._source_priority)[:1]
-        mark.clicked.connect(lambda: self.mark_downloaded(flagged if flagged else best, not flagged))
+        if state in ("partial", "grabbed"):
+            note = QLabel("◐ Partial — " + ("a lower resolution finished, the wanted one hasn't"
+                                            if state == "partial" else "grabbed, nothing finished yet")
+                          + ". Still wanted.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#f59e0b")
+            lay.addWidget(note)
+        elif state == "complete" and scene.key not in self.owned:
+            done = QLabel("✔ Downloaded")
+            done.setStyleSheet("color:#60a5fa")
+            lay.addWidget(done)
+        if scene.key in self.model.hidden:
+            hid = QLabel("Hidden (blacklisted scene or studio)")
+            hid.setStyleSheet("color:#f87171")
+            lay.addWidget(hid)
+        complete = state == "complete"
+        mark = QPushButton("Mark as not downloaded" if complete else "Mark as downloaded")
+        mark.setToolTip("Clear every flag on this scene so it's wanted again" if complete else
+                        f"Flag the {self.settings.preferred_resolution or 'best'} release as downloaded")
+        mark.clicked.connect(lambda: self.mark_scenes([scene], not complete))
         lay.addWidget(mark)
 
         line = QFrame()
@@ -516,14 +646,24 @@ class MainWindow(QMainWindow):
         btn_dl.clicked.connect(lambda: self.start_download(rel))
         btn_open = QPushButton("Post")
         btn_open.clicked.connect(lambda: webbrowser.open(rel.post_url))
-        got = (rel.source, rel.post_id) in self.flags
+        flag = self.flags.get((rel.source, rel.post_id))
+        got = flag in FINISHED
         if got:
             btn_dl.setText("Again")
             btn_dl.setToolTip("Already downloaded")
-        btn_flag = QPushButton("✓" if got else "○")
+        elif flag == GRABBED:
+            btn_dl.setText("Retry")
+            btn_dl.setToolTip("Grabbed but not confirmed finished — download again")
+        elif flag == "failed":
+            btn_dl.setText("Retry")
+            btn_dl.setToolTip("The last attempt failed or was cancelled")
+        icon, tip = {"done": ("✓", "Done"), "verified": ("✓", "Verified on disk"),
+                     "grabbed": ("◐", "Grabbed — not finished yet"),
+                     "failed": ("✗", "Failed / cancelled — still wanted")}.get(flag, ("○", "Not downloaded"))
+        btn_flag = QPushButton(icon)
         btn_flag.setFixedWidth(30)
-        btn_flag.setToolTip("Unmark this release" if got else "Mark this release as downloaded")
-        btn_flag.clicked.connect(lambda: self.mark_downloaded([rel], not got))
+        btn_flag.setToolTip(f"{tip}. Click to {'clear' if flag else 'mark as done'}.")
+        btn_flag.clicked.connect(lambda: self.mark_downloaded([rel], not flag))
         h.addWidget(btn_flag)
         h.addWidget(btn_dl)
         h.addWidget(btn_open)
@@ -558,7 +698,7 @@ class MainWindow(QMainWindow):
                 return
         link = min(rel.links, key=lambda l: LINK_PREFERENCE.get(l.kind, 9))
         self.downloads.enqueue(rel, link, Settings.resolve(self.settings.download_dir))
-        self.db.set_flag(rel.source, rel.post_id, "started")
+        self.db.set_flag(rel.source, rel.post_id, GRABBED)
         self._update_quota_label()
         self.tabs.setTabText(self.QUEUE_TAB, f"Queue ({len(self.downloads.jobs)})")
         self._flags_changed()
@@ -571,6 +711,11 @@ class MainWindow(QMainWindow):
 
     def _job_changed(self, job: Job) -> None:
         self.db.log_download(job)
+        new_flag = {State.DONE: DONE, State.FAILED: "failed", State.CANCELLED: "failed"}.get(job.state)
+        if new_flag:  # set_flag never knocks a finished release back to failed
+            self.db.set_flag(job.release.source, job.release.post_id, new_flag,
+                             path=str(job.final_path or job.path or "") or None)
+            self._flags_changed()
         row = self.job_rows.get(job.id)
         if row is None:
             row = self.table.rowCount()
@@ -594,6 +739,11 @@ class MainWindow(QMainWindow):
         for idx in self.table.selectionModel().selectedRows():
             self.downloads.cancel(self.table.item(idx.row(), 0).data(Qt.ItemDataRole.UserRole))
 
+    def _apply_blackhole(self) -> None:
+        d = self.settings.torrent_blackhole_dir.strip()
+        self.downloads.blackhole_dir = Settings.resolve(d) if d else None
+        self.downloads.magnets_to_blackhole = self.settings.magnets_to_blackhole
+
     def _update_quota_label(self) -> None:
         parts = [f"{s.display_name}: {self.quota.remaining(s.id, s.daily_quota)}/{s.daily_quota}"
                  for s in self.sources.values() if s.daily_quota]
@@ -607,6 +757,7 @@ class MainWindow(QMainWindow):
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
             self.logos.configure(self.settings.stashboxes)
+            self._apply_blackhole()
             self.act_crawl.setChecked(self.settings.crawl_enabled)
             self._load_sources()
             self._apply_timers()
