@@ -543,6 +543,9 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self._update_crawl_label()
 
+    def _has_cache(self, sid: str) -> bool:
+        return self._crawl_done(sid) or int(self.db.get_meta(f"backfill_page:{sid}", "0")) > self.settings.max_refresh_pages
+
     def _crawl_done(self, sid: str) -> bool:
         return self.db.get_meta(f"crawl_done:{sid}") == "1"
 
@@ -671,9 +674,16 @@ class MainWindow(QMainWindow):
             if not rels or (src.total_pages and page >= src.total_pages):
                 self.db.set_meta(f"crawl_done:{sid}", "1")
                 self.status_label.setText(f"{src.display_name}: every page is now cached.")
-        elif rels and new == len(rels) and page < self.settings.max_refresh_pages:
+        elif rels and new == len(rels) and (page < self.settings.max_refresh_pages or self._has_cache(sid)):
+            # Keep going until we reach posts we already have. The page cap only protects a
+            # brand-new source; once older posts are cached, stopping early would leave a hole
+            # between the newest pages and the cache (e.g. after being away for a while).
             self.status_label.setText(f"{src.display_name}: {new} new post(s) on page {page}, checking further…")
-            self._fetch(sid, page + 1, "refresh")
+            if page < self.settings.max_refresh_pages:
+                self._fetch(sid, page + 1, "refresh")
+            else:  # beyond the usual few pages: pace it like a rescan so a long gap isn't a burst
+                QTimer.singleShot(max(2, self.settings.rescan_interval_s) * 1000,
+                                  lambda: self._fetch(sid, page + 1, "refresh"))
         else:
             self.status_label.setText(f"{src.display_name}: up to date · {len(self.releases)} posts cached")
         if new:
