@@ -101,6 +101,36 @@ class SettingsDialog(QDialog):
         v.addWidget(add)
         tabs.addTab(src, "Sources")
 
+        # --- import folders + matching
+        imp = QWidget()
+        f2 = QFormLayout(imp)
+        f2.addRow(QLabel("Video files in these folders are matched to scenes by file name and marked as "
+                         "downloaded — e.g. your browser or JDownloader download folder, or Whisparr's library.\n"
+                         "Unfinished downloads (.part, .crdownload, files still being written) are skipped. "
+                         "You can also drag files or folders onto the main window."))
+        self.import_dirs = QPlainTextEdit("\n".join(settings.import_dirs))
+        self.import_dirs.setPlaceholderText("One folder per line")
+        self.import_dirs.setMaximumHeight(110)
+        add_dir = QPushButton("Add folder…")
+        add_dir.clicked.connect(self._add_import_dir)
+        col = QVBoxLayout()
+        col.addWidget(self.import_dirs)
+        col.addWidget(add_dir, alignment=Qt.AlignmentFlag.AlignLeft)
+        f2.addRow("Import folders", col)
+        self.import_minutes = QSpinBox(minimum=0, maximum=1440, value=settings.import_scan_minutes, suffix=" min")
+        self.import_minutes.setSpecialValueText("off")
+        f2.addRow("Scan every", self.import_minutes)
+        self.scan_lib = QCheckBox("Also scan the library folder")
+        self.scan_lib.setChecked(settings.scan_library_dir)
+        f2.addRow("", self.scan_lib)
+        self.matching = QCheckBox("Match scenes on stash-box (ThePornDB / StashDB) in the background")
+        self.matching.setChecked(settings.scene_matching)
+        f2.addRow("", self.matching)
+        self.match_interval = QSpinBox(minimum=1, maximum=600, value=settings.match_interval_s, suffix=" s")
+        self.match_interval.setToolTip("One scene lookup every N seconds (each lookup asks every enabled stash-box)")
+        f2.addRow("Seconds between lookups", self.match_interval)
+        tabs.addTab(imp, "Import && matching")
+
         # --- stash-box
         sb = QWidget()
         v2 = QVBoxLayout(sb)
@@ -143,6 +173,12 @@ class SettingsDialog(QDialog):
         row.addWidget(btn)
         form.addRow(label, row)
         return edit
+
+    def _add_import_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Import folder")
+        if d:
+            cur = self.import_dirs.toPlainText().strip()
+            self.import_dirs.setPlainText((cur + "\n" if cur else "") + d)
 
     def _add_sb_row(self, c: StashBoxConfig) -> None:
         r = self.sb_table.rowCount()
@@ -214,6 +250,11 @@ class SettingsDialog(QDialog):
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
             stashboxes=self._stashboxes(),
+            import_dirs=[l.strip() for l in self.import_dirs.toPlainText().splitlines() if l.strip()],
+            import_scan_minutes=self.import_minutes.value(),
+            scan_library_dir=self.scan_lib.isChecked(),
+            scene_matching=self.matching.isChecked(),
+            match_interval_s=self.match_interval.value(),
         )
         self.accept()
 

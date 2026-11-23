@@ -42,6 +42,13 @@ class Settings:
     # Torrent black hole: .torrent files are saved here for your torrent client's watch folder.
     torrent_blackhole_dir: str = ""
     magnets_to_blackhole: bool = True   # also write magnet links as .magnet files
+    # Import folders: scanned regularly; video files found are matched by name and flagged as downloaded.
+    import_dirs: list[str] = field(default_factory=list)
+    import_scan_minutes: int = 5
+    scan_library_dir: bool = True       # treat the library folder as an import folder too
+    # stash-box scene matching (needs API keys under stashboxes)
+    scene_matching: bool = True
+    match_interval_s: int = 3           # one scene lookup every N seconds
     auto_sort_completed: bool = True
     check_updates_on_start: bool = True
     refresh_on_start: bool = True

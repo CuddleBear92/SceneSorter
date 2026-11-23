@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .models import DownloadLink, LinkKind, Release
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -77,6 +77,46 @@ CREATE TABLE IF NOT EXISTS flags (
 CREATE TABLE IF NOT EXISTS hidden_scenes (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
 CREATE TABLE IF NOT EXISTS hidden_posts (source TEXT, post_id TEXT, PRIMARY KEY (source, post_id));
 CREATE TABLE IF NOT EXISTS hidden_studios (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
+
+-- Video files seen on disk (drag & drop, import folders, library) and what they matched.
+CREATE TABLE IF NOT EXISTS scanned_files (
+    path       TEXT PRIMARY KEY,
+    size       INTEGER,
+    mtime      REAL,
+    scene_key  TEXT,
+    source     TEXT,
+    post_id    TEXT,
+    score      REAL,
+    scanned_at REAL
+);
+
+-- Scenes matched on stash-box instances (one row per scene key + endpoint;
+-- stash_id NULL = looked up, nothing found).
+CREATE TABLE IF NOT EXISTS scene_matches (
+    key        TEXT NOT NULL,
+    endpoint   TEXT NOT NULL,
+    stash_id   TEXT,
+    title      TEXT,
+    date       TEXT,
+    studio     TEXT,
+    performers TEXT,      -- JSON [{id, name}]
+    image_url  TEXT,
+    duration   INTEGER,
+    score      REAL,
+    checked_at REAL,
+    PRIMARY KEY (key, endpoint)
+);
+
+-- Performer pictures/ids from stash-box, keyed by normalised name.
+CREATE TABLE IF NOT EXISTS performers (
+    key        TEXT PRIMARY KEY,
+    name       TEXT,
+    endpoint   TEXT,
+    stash_id   TEXT,
+    image_url  TEXT,
+    image_file TEXT,
+    checked_at REAL
+);
 
 -- Studio metadata/logos looked up on stash-box instances (cached forever).
 CREATE TABLE IF NOT EXISTS studios (
@@ -294,6 +334,68 @@ class Database:
             self.conn.executemany("DELETE FROM flags WHERE source=? AND post_id=?", posts)
 
     # -------------------------------------------------------------- studios
+    # -------------------------------------------------------- scanned files
+    def scanned(self, matched_only: bool = False) -> dict[str, tuple[int, float]]:
+        q = "SELECT path, size, mtime FROM scanned_files" + (" WHERE scene_key IS NOT NULL" if matched_only else "")
+        with self._lock:
+            return {r["path"]: (r["size"], r["mtime"]) for r in self.conn.execute(q)}
+
+    def save_scanned(self, rows: list[tuple]) -> None:
+        """rows: (path, size, mtime, scene_key, source, post_id, score)"""
+        now = time.time()
+        with self._lock:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO scanned_files(path, size, mtime, scene_key, source, post_id, score, scanned_at) "
+                "VALUES (?,?,?,?,?,?,?,?)", [(*r, now) for r in rows])
+
+    def unmatched_files(self) -> list[str]:
+        with self._lock:
+            return [r[0] for r in self.conn.execute("SELECT path FROM scanned_files WHERE scene_key IS NULL")]
+
+    # ------------------------------------------------------- scene matches
+    def save_scene_match(self, key: str, endpoint: str, m: dict | None) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO scene_matches(key, endpoint, stash_id, title, date, studio, performers, "
+                "image_url, duration, score, checked_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (key, endpoint, *(
+                    (m["id"], m["title"], m.get("date"), m.get("studio"), json.dumps(m.get("performers", [])),
+                     m.get("image_url"), m.get("duration"), m.get("score")) if m else (None,) * 8), time.time()))
+
+    def scene_matches(self) -> dict[str, list[dict]]:
+        """scene key -> matches found (not-found rows excluded)."""
+        out: dict[str, list[dict]] = {}
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM scene_matches WHERE stash_id IS NOT NULL").fetchall()
+        for r in rows:
+            d = dict(r)
+            d["performers"] = json.loads(d["performers"] or "[]")
+            out.setdefault(r["key"], []).append(d)
+        return out
+
+    def scene_match_checked(self, max_age_s: float) -> set[tuple[str, str]]:
+        with self._lock:
+            rows = self.conn.execute("SELECT key, endpoint FROM scene_matches WHERE stash_id IS NOT NULL "
+                                     "OR checked_at > ?", (time.time() - max_age_s,)).fetchall()
+        return {(r[0], r[1]) for r in rows}
+
+    # ----------------------------------------------------------- performers
+    def performer(self, key: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute("SELECT * FROM performers WHERE key=?", (key,)).fetchone()
+
+    def save_performer(self, key: str, name: str, endpoint: str | None, stash_id: str | None,
+                       image_url: str | None, image_file: str | None) -> None:
+        with self._lock:
+            self.conn.execute("INSERT OR REPLACE INTO performers VALUES (?,?,?,?,?,?,?)",
+                              (key, name, endpoint, stash_id, image_url, image_file, time.time()))
+
+    def performer_keys_checked(self, max_age_s: float) -> set[str]:
+        with self._lock:
+            rows = self.conn.execute("SELECT key FROM performers WHERE endpoint IS NOT NULL OR checked_at > ?",
+                                     (time.time() - max_age_s,)).fetchall()
+        return {r[0] for r in rows}
+
     def studio_names(self) -> dict[str, str]:
         """Official stash-box spelling for every matched studio (key -> name)."""
         with self._lock:

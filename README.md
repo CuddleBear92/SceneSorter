@@ -73,6 +73,32 @@ your library.
   the filter chip shows the logo. Logos are fetched slowly in the background,
   one every 1.5 s, with on-screen studios first. Add API keys in
   **Settings ▸ Stash-box**.
+- **Import by file name.** Drag video files or folders onto the window, or
+  use **Import files…**, and SceneSorter marks the matching releases as
+  downloaded (verified). Matching is fuzzy. It understands:
+  - original release names
+  - Whisparr/Sonarr renames, for example
+    `Studio - 2024-01-15 - Performer - Title [WEBDL-1080p][PRT].mp4`
+  - SceneSorter's own rename template
+  - release names that are only in the parent folder's name
+
+  It requires the studio and date to agree (±1 day) or a strong title match,
+  and it skips unfinished downloads (`.part`, `.crdownload` and so on).
+- **Import folders.** Folders such as your browser or JDownloader download
+  folder are scanned on a timer (every 5 min by default), and so is the library
+  folder if you allow it. Files still being written are skipped until they've
+  been unchanged for a minute.
+- **stash-box scene matching.** Each scene is looked up on ThePornDB and
+  StashDB in the background, one lookup every 3 s, with on-screen scenes first.
+  A match is accepted only when studio and date agree. Matches add performers,
+  duration and links to the scene pages.
+- **Performers tab.** Builds the performer list from three places:
+  - stash-box matches
+  - names in post titles
+  - known names spotted inside dotted release names
+
+  Portraits come from StashDB or ThePornDB. Click a performer to filter
+  Browse.
 - **Torrent black hole.** Set a folder and `.torrent` files are saved there for
   your client's watch folder. Magnets can optionally be saved as `.magnet` files.
 - **Self-updating exe.** GitHub Actions builds `SceneSorter.exe`. The app checks

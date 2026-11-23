@@ -6,7 +6,7 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QUrl, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
@@ -106,3 +106,64 @@ class ThumbnailLoader(QObject):
             self.loaded.emit(key, pm)
         else:
             self._fetch(key, rest)  # fall back to the other site's thumbnail
+
+
+class BackgroundQueue(QObject):
+    """A slow, polite work queue: one job every ``interval_ms`` on the thread pool.
+
+    Items on screen go to the front (``push(..., front=True)``); prefetch work
+    goes to the back. ``worker(key, payload)`` runs off the UI thread and its
+    return value is delivered to ``on_result(key, result)`` on the UI thread.
+    """
+
+    def __init__(self, interval_ms: int, worker: Callable, on_result: Callable, parent=None):
+        super().__init__(parent)
+        from collections import deque
+
+        self.worker, self.on_result = worker, on_result
+        self.queue: deque = deque()
+        self.queued: set = set()
+        self.busy = False
+        self.enabled = True
+        self.timer = QTimer(self, interval=interval_ms, timeout=self._next)
+        self.timer.start()
+
+    def set_interval(self, ms: int) -> None:
+        self.timer.setInterval(ms)
+
+    def push(self, key, payload, front: bool = False) -> None:
+        if key in self.queued:
+            if not front:
+                return
+            for i, (k, _p) in enumerate(self.queue):
+                if k == key:
+                    del self.queue[i]
+                    break
+            else:
+                return  # currently running
+        self.queued.add(key)
+        (self.queue.appendleft if front else self.queue.append)((key, payload))
+
+    def clear(self) -> None:
+        self.queue.clear()
+        self.queued.clear()
+
+    def pending(self) -> int:
+        return len(self.queue) + (1 if self.busy else 0)
+
+    def _next(self) -> None:
+        if self.busy or not self.queue or not self.enabled:
+            return
+        key, payload = self.queue.popleft()
+        self.busy = True
+
+        def done(res, key=key):
+            self.busy = False
+            self.queued.discard(key)
+            self.on_result(key, res)
+
+        def failed(_err, key=key):
+            self.busy = False
+            self.queued.discard(key)  # transient error: it will be queued again when needed
+
+        run_async(self.worker, key, payload, on_done=done, on_fail=failed)

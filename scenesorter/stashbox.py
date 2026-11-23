@@ -60,6 +60,43 @@ class StashBox:
     def supports(self, field: str) -> bool:
         return field not in self._unsupported
 
+    def match_scene(self, scene) -> dict | None:
+        """Find this merged scene on the stash-box (verified by studio + date)."""
+        if not self.supports("searchScene"):
+            return None
+        for term in scene_terms(scene)[:2]:
+            try:
+                data = self.query(f"query($t: String!) {{ searchScene(term: $t, limit: 15) {{ {SCENE_FIELDS} }} }}",
+                                  {"t": term[:120]})
+            except StashBoxError as e:
+                if "Cannot query field" in str(e):
+                    self._unsupported.add("searchScene")
+                    return None
+                raise
+            m = pick_scene(scene, [normalise_scene(x) for x in data.get("searchScene") or []])
+            if m:
+                return m
+        return None
+
+    def find_performer(self, name: str) -> dict | None:
+        """Exact (normalised) name/alias match -> {id, name, image_url}."""
+        if not self.supports("searchPerformer"):
+            return None
+        try:
+            data = self.query("query($t: String!) { searchPerformer(term: $t, limit: 10) "
+                              "{ id name aliases images { url width } } }", {"t": name})
+        except StashBoxError as e:
+            if "Cannot query field" in str(e):
+                self._unsupported.add("searchPerformer")
+                return None
+            raise
+        want = normalise_studio(name)  # same squash-and-lowercase normalisation
+        for p in data.get("searchPerformer") or []:
+            if any(normalise_studio(n) == want for n in [p.get("name", "")] + list(p.get("aliases") or []) if n):
+                imgs = sorted(p.get("images") or [], key=lambda i: (i.get("width") or 0), reverse=True)
+                return {"id": p["id"], "name": p["name"], "image_url": imgs[0]["url"] if imgs else None}
+        return None
+
     def find_studio(self, name: str) -> StudioMatch | None:
         """Best match for a studio name, or None. Exact (normalised) name/alias match only."""
         if not self.supports("searchStudio"):
@@ -83,6 +120,76 @@ class StashBox:
             if m:
                 return m
         return None
+
+
+SCENE_FIELDS = ("id title date release_date duration studio { name parent { name } } "
+                "performers { as performer { id name } } images { url width }")
+
+
+def scene_terms(scene) -> list[str]:
+    """Search strings for a merged scene, most specific first."""
+    studio = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", scene.studio or "")
+    title = scene.title or scene.primary.raw_title
+    perf = " ".join(scene.performers)
+    terms = []
+    if perf and perf.lower() not in title.lower():
+        terms.append(f"{perf} {title}")
+    terms.append(f"{studio} {title}".strip())
+    terms.append(title)
+    seen: list[str] = []
+    return [t for t in terms if t and not (t in seen or seen.append(t))]
+
+
+def normalise_scene(raw: dict) -> dict:
+    imgs = sorted(raw.get("images") or [], key=lambda i: (i.get("width") or 0), reverse=True)
+    st = raw.get("studio") or {}
+    return {
+        "id": raw["id"], "title": raw.get("title") or "",
+        "date": raw.get("date") or raw.get("release_date"),
+        "studio": st.get("name") or "", "parent": (st.get("parent") or {}).get("name") or "",
+        "performers": [{"id": p["performer"]["id"], "name": p["performer"]["name"]}
+                       for p in raw.get("performers") or [] if p.get("performer")],
+        "image_url": imgs[0]["url"] if imgs else None, "duration": raw.get("duration"),
+    }
+
+
+def pick_scene(scene, candidates: list[dict]) -> dict | None:
+    """Accept a stash-box scene only if studio and date agree (±1 day) and the
+    words overlap; undated scenes need a strong title match."""
+    from datetime import date as _date
+
+    from .parsing import tokens
+
+    want_studio = normalise_studio(scene.studio) if scene.studio else ""
+    want_words = set(tokens(" ".join(scene.performers) + " " + (scene.title or "")))
+    best, best_score = None, 0.0
+    for c in candidates:
+        studios = {normalise_studio(c["studio"]), normalise_studio(c.get("parent", ""))} - {""}
+        if want_studio and want_studio not in studios:
+            continue
+        words = set(tokens(c["title"] + " " + " ".join(p["name"] for p in c["performers"])))
+        overlap = len(want_words & words) / len(want_words | words) if want_words and words else 0.0
+        contain = len(want_words & words) / len(want_words) if want_words else 0.0
+        sim = max(overlap, 0.9 * contain)
+        cdate = None
+        try:
+            cdate = _date.fromisoformat(c["date"][:10]) if c.get("date") else None
+        except ValueError:
+            pass
+        if scene.scene_date and cdate:
+            delta = abs((cdate - scene.scene_date).days)
+            if delta > 1 or sim < 0.3:
+                continue
+            score = 0.6 + 0.4 * sim - 0.05 * delta
+        else:
+            if sim < 0.7:
+                continue
+            score = 0.3 + 0.5 * sim
+        if score > best_score:
+            best, best_score = c, score
+    if best:
+        best = dict(best, score=round(best_score, 3))
+    return best
 
 
 def pick_studio(name: str, results: list[dict], endpoint: str) -> StudioMatch | None:

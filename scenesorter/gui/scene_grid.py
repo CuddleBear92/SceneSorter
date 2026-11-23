@@ -25,6 +25,9 @@ class SceneModel(QAbstractListModel):
         self.status: dict[str, str] = {}      # scene key -> grabbed / partial / complete (see status.py)
         self.hidden: set[str] = set()         # scene keys hidden by the user (scene or studio blacklist)
         self.studio_names: dict[str, str] = {}  # studio key -> official stash-box name
+        self.scene_performers: dict[str, list[str]] = {}  # scene key -> performer keys
+        self.performer_names: dict[str, str] = {}         # performer key -> display name
+        self.on_visible = None  # callback(scene) when a card is painted (drives on-screen-first matching)
         self.thumbs = thumbs
         self._row_by_key: dict[str, int] = {}
         thumbs.loaded.connect(self._thumb_ready)
@@ -77,6 +80,8 @@ class SceneModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return s.title
         if role == Qt.ItemDataRole.DecorationRole:
+            if self.on_visible:
+                self.on_visible(s)
             return self.thumbs.get(s.key, s.thumbnail_urls)
         if role == Qt.ItemDataRole.ToolTipRole:
             return "\n".join(sorted({r.raw_title for r in s.releases}))
@@ -97,6 +102,7 @@ class SceneFilter(QSortFilterProxyModel):
         self.source = ""
         self.group = ""
         self.studio = ""        # normalised studio key
+        self.performer = ""     # performer key
         # "" = all, "missing" = still wanted (none/grabbed/partial), "partial" = grabbed or partial,
         # "have" = complete, "any" = anything grabbed/partial/complete (the Downloaded tab)
         self.have = have
@@ -126,6 +132,8 @@ class SceneFilter(QSortFilterProxyModel):
             return False
         if self.studio and studio_key(s.studio) != self.studio:
             return False
+        if self.performer and self.performer not in model.scene_performers.get(s.key, ()):
+            return False
         if self.resolution and self.resolution not in s.resolutions:
             return False
         if self.source and self.source not in s.sources:
@@ -133,7 +141,8 @@ class SceneFilter(QSortFilterProxyModel):
         if self.group and self.group not in s.release_groups:
             return False
         if self.text:
-            hay = " ".join([s.studio, model.display_studio(s), s.title, *s.performers, *s.tags, *s.release_groups,
+            hay = " ".join([s.studio, model.display_studio(s), s.title,
+                            *(model.performer_names.get(k, "") for k in model.scene_performers.get(s.key, ())), *s.performers, *s.tags, *s.release_groups,
                             *(r.raw_title for r in s.releases), *(r.filename for r in s.releases)]).lower()
             return all(w in hay for w in self.text.lower().split())
         return True

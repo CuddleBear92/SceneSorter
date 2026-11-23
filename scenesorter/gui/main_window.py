@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
-    QMainWindow, QMessageBox, QPushButton, QTableWidget,
+    QFileDialog, QMainWindow, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -27,7 +27,12 @@ from ..status import DONE, FINISHED, GRABBED, scene_status, target_release
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
 from .scene_pane import ScenePane
 from .settings_dialog import SettingsDialog
+from .matching import MatchService, PerformerImages
+from .performers_tab import PerformersTab
 from .studios import LogoService, StudiosTab
+from ..importer import scan as scan_files
+from ..performers import collect as collect_performers
+from ..status import VERIFIED
 from .workers import ThumbnailLoader, run_async
 
 LINK_PREFERENCE = {LinkKind.DIRECT: 0, LinkKind.TORRENT: 1, LinkKind.MAGNET: 2, LinkKind.HOSTER: 3}
@@ -60,6 +65,9 @@ class MainWindow(QMainWindow):
         self.flags: dict[tuple[str, str], str] = self.db.flags()
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
         self.studio_filter: tuple[str, str] = ("", "")
+        self.performer_filter: tuple[str, str] = ("", "")
+        self.matches: dict[str, list[dict]] = self.db.scene_matches()
+        self._import_running = False
         self.releases: dict[tuple[str, str], Release] = {}
         self.next_page: dict[str, int | None] = {}
         self.in_flight: set[str] = set()
@@ -83,6 +91,13 @@ class MainWindow(QMainWindow):
         self.logos = LogoService(self.db, CACHE_DIR, self)
         self.logos.configure(settings.stashboxes)
         self.logos.ready.connect(self._studio_info_ready)
+        self.matcher = MatchService(self.db, settings.match_interval_s, self)
+        self.matcher.configure(settings.stashboxes, settings.scene_matching, settings.match_interval_s)
+        self.matcher.matched.connect(self._scene_matched)
+        self.perf_images = PerformerImages(self.db, CACHE_DIR, self)
+        self.perf_images.configure(settings.stashboxes)
+        self.perf_images.ready.connect(lambda k: k == self.performer_filter[0] and self._update_performer_chip())
+        self.setAcceptDrops(True)
         self._build_ui()
         self._load_sources()
         self._load_cached()
@@ -102,6 +117,8 @@ class MainWindow(QMainWindow):
         self.act_crawl.setToolTip("Slowly fetch every page of each source so everything is cached locally")
         self.act_crawl.toggled.connect(self._toggle_crawl)
         act_settings = QAction("Settings", self, triggered=self.open_settings)
+        act_import = QAction("Import files…", self, triggered=self._import_dialog)
+        act_import.setToolTip("Pick a folder of videos to mark as downloaded (or just drag files/folders onto the window)")
         act_update = QAction("Check for updates", self, triggered=lambda: self.check_updates(False))
         for a in (act_refresh, self.act_crawl):
             tb.addAction(a)
@@ -143,10 +160,16 @@ class MainWindow(QMainWindow):
         self.studio_btn.clicked.connect(lambda: self.filter_studio("", ""))
         self.studio_btn_action = tb.addWidget(self.studio_btn)
         self.studio_btn_action.setVisible(False)
+        self.perf_btn = QPushButton()
+        self.perf_btn.setIconSize(QSize(22, 28))
+        self.perf_btn.clicked.connect(lambda: self.filter_performer("", ""))
+        self.perf_btn_action = tb.addWidget(self.perf_btn)
+        self.perf_btn_action.setVisible(False)
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
                              spacer.sizePolicy().verticalPolicy().Preferred)
         tb.addWidget(spacer)
+        tb.addAction(act_import)
         tb.addAction(act_settings)
         tb.addAction(act_update)
 
@@ -161,10 +184,13 @@ class MainWindow(QMainWindow):
         for pane in self.panes:
             pane.context_requested.connect(self._scene_menu)
         self.model.status_changed.connect(self._update_tab_counts)
+        self.model.on_visible = self.matcher.visible
 
         self.studios = StudiosTab(self.logos)
         self.studios.studio_activated.connect(self.filter_studio)
         self.studios.hide_requested.connect(self.hide_studio)
+        self.performers_tab = PerformersTab(self.perf_images)
+        self.performers_tab.performer_activated.connect(self.filter_performer)
 
         # --- downloads tab
         self.table = QTableWidget(0, 6)
@@ -184,8 +210,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.browse, "Browse")
         self.tabs.addTab(self.have_pane, "Downloaded")
         self.tabs.addTab(self.studios, "Studios")
+        self.tabs.addTab(self.performers_tab, "Performers")
         self.tabs.addTab(dl_tab, "Queue")
-        self.QUEUE_TAB = 3
+        self.QUEUE_TAB = 4
         self.setCentralWidget(self.tabs)
 
         self.status_label = QLabel()
@@ -199,6 +226,9 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer(self, timeout=self.refresh)
         self._apply_timers()
         self.rebuild_timer = QTimer(self, singleShot=True, interval=400, timeout=self._start_rebuild)
+        self.perf_timer = QTimer(self, singleShot=True, interval=3000, timeout=self._rebuild_performers)
+        self.import_timer = QTimer(self, timeout=lambda: self.scan_import_dirs(interactive=False))
+        self._apply_import_timer()
 
     def _set_filter(self, **kw) -> None:
         for pane in self.panes:
@@ -212,6 +242,119 @@ class MainWindow(QMainWindow):
         self.studio_btn_action.setVisible(bool(key))
         if key:
             self.tabs.setCurrentWidget(self.browse)
+
+    def filter_performer(self, key: str, name: str) -> None:
+        self.performer_filter = (key, name)
+        self._set_filter(performer=key)
+        self._update_performer_chip()
+        self.perf_btn_action.setVisible(bool(key))
+        if key:
+            self.tabs.setCurrentWidget(self.browse)
+
+    def _update_performer_chip(self) -> None:
+        key, name = self.performer_filter
+        if not key:
+            return
+        pm = self.perf_images.get(key, name)
+        self.perf_btn.setIcon(pm.scaled(22, 28, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                        Qt.TransformationMode.SmoothTransformation) if pm else QPixmap())
+        self.perf_btn.setText(f" {name}  ✕")
+        self.perf_btn.setToolTip(f"Showing only scenes with {name} — click to clear")
+
+    # ------------------------------------------------- performers/matching
+    def _scene_matched(self, key: str) -> None:
+        self.matches = self.db.scene_matches()
+        self.perf_timer.start()  # debounce: matches arrive every few seconds
+        for pane in self.panes:
+            if pane.current and pane.current.key == key:
+                pane.refresh_detail()
+
+    def _rebuild_performers(self) -> None:
+        run_async(collect_performers, list(self.scenes), dict(self.matches), on_done=self._performers_ready)
+
+    def _performers_ready(self, res) -> None:
+        perf, by_scene = res
+        self.model.scene_performers = by_scene
+        self.model.performer_names = {k: e.name for k, e in perf.items()}
+        self.performers_tab.set_performers(perf, self.model.has, bool(self.perf_images.boxes))
+        if self.performer_filter[0]:
+            self._set_filter(performer=self.performer_filter[0])
+
+    # ------------------------------------------------------------ importing
+    def dragEnterEvent(self, ev) -> None:  # noqa: N802
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev) -> None:  # noqa: N802
+        paths = [u.toLocalFile() for u in ev.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.import_paths(paths, interactive=True)
+
+    def _import_dialog(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Folder with videos to mark as downloaded")
+        if d:
+            self.import_paths([d], interactive=True)
+
+    def _apply_import_timer(self) -> None:
+        mins = self.settings.import_scan_minutes
+        if mins > 0 and (self.settings.import_dirs or self.settings.scan_library_dir):
+            self.import_timer.start(mins * 60_000)
+            QTimer.singleShot(20_000, lambda: self.scan_import_dirs(interactive=False))
+        else:
+            self.import_timer.stop()
+
+    def scan_import_dirs(self, interactive: bool) -> None:
+        dirs = [str(Settings.resolve(d)) for d in self.settings.import_dirs if d.strip()]
+        if self.settings.scan_library_dir:
+            dirs.append(str(Settings.resolve(self.settings.library_dir)))
+        dirs = [d for d in dirs if Path(d).is_dir()]
+        if dirs:
+            self.import_paths(dirs, interactive=interactive, incremental=True)
+
+    def import_paths(self, paths: list[str], interactive: bool, incremental: bool = False) -> None:
+        """Match video files by name and flag their releases as downloaded (verified)."""
+        if self._import_running or not self.scenes:
+            if interactive:
+                QMessageBox.information(self, "Import", "Still loading scenes or another scan is running — "
+                                                        "try again in a moment.")
+            return
+        self._import_running = True
+        known = self.db.scanned(matched_only=True) if incremental else None
+        if interactive:
+            self.status_label.setText("Scanning files…")
+        run_async(scan_files, paths, list(self.scenes), known, 60 if incremental else 0,
+                  on_done=lambda r: self._import_done(r, interactive),
+                  on_fail=lambda e: self._import_failed(e, interactive))
+
+    def _import_failed(self, err: str, interactive: bool) -> None:
+        self._import_running = False
+        if interactive:
+            QMessageBox.warning(self, "Import failed", err.splitlines()[0])
+
+    def _import_done(self, res, interactive: bool) -> None:
+        self._import_running = False
+        self.db.save_scanned(res.rows())
+        new = 0
+        for path, m in res.matched:
+            if self.flags.get((m.release.source, m.release.post_id)) != VERIFIED:
+                new += 1
+            self.db.set_flag(m.release.source, m.release.post_id, VERIFIED, path=str(path))
+        if res.matched:
+            self._flags_changed()
+        if interactive:
+            self.status_label.setText(f"Import: {len(res.matched)} matched, {len(res.unmatched)} not matched")
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Import")
+            msg.setText(f"Matched {len(res.matched)} file(s) to scenes and marked them as downloaded "
+                        f"({new} newly).\n{len(res.unmatched)} file(s) didn't match anything.")
+            if res.unmatched or res.matched:
+                lines = [f"✓ {p.name}  →  {m.scene.title or m.scene.primary.raw_title} "
+                         f"[{m.release.resolution} {m.release.release_group}]".rstrip() for p, m in res.matched]
+                lines += [f"✗ {p.name}" for p in res.unmatched]
+                msg.setDetailedText("\n".join(lines))
+            msg.exec()
+        elif new:
+            self.status_label.setText(f"Import folders: {new} new file(s) matched and marked as downloaded")
 
     def _update_studio_chip(self) -> None:
         """Show the studio's logo in the filter chip when we have one, else its name."""
@@ -418,6 +561,8 @@ class MainWindow(QMainWindow):
             self._update_tab_counts()
             self.studios.set_scenes(scenes, self.model.has, bool(self.logos.boxes))
             self.studios.set_hidden(set(self.hidden_studios))
+            self.matcher.prefetch(scenes)
+            self.perf_timer.start()
         elif err:
             self.status_label.setText(f"Merge failed: {err.splitlines()[0]}")
         if self._rebuild_dirty:
@@ -555,15 +700,34 @@ class MainWindow(QMainWindow):
         title = QLabel(f"<h3>{scene.title or scene.primary.raw_title}</h3>")
         title.setWordWrap(True)
         lay.addWidget(title)
-        studio = QLabel(f"<a href='#' style='color:#60a5fa'>{scene.studio}</a>") if scene.studio else None
+        studio_name = self.model.display_studio(scene)
+        studio = QLabel(f"<a href='#' style='color:#60a5fa'>{studio_name}</a>") if scene.studio else None
         if studio:
             studio.setToolTip("Show all scenes from this studio")
-            studio.linkActivated.connect(lambda _l: self.filter_studio(normalise_studio(scene.studio), scene.studio))
+            studio.linkActivated.connect(lambda _l: self.filter_studio(normalise_studio(scene.studio), studio_name))
             lay.addWidget(studio)
+        perf_keys = self.model.scene_performers.get(scene.key, [])
+        if perf_keys:
+            links = ", ".join(f"<a href='{k}' style='color:#60a5fa'>{self.model.performer_names.get(k, k)}</a>"
+                              for k in perf_keys)
+            perf = QLabel(f"<b>Performers:</b> {links}")
+            perf.setWordWrap(True)
+            perf.linkActivated.connect(lambda k: self.filter_performer(k, self.model.performer_names.get(k, k)))
+            lay.addWidget(perf)
+        found = self.matches.get(scene.key, [])
+        if found:
+            parts = []
+            for m in found:
+                base = m["endpoint"].rsplit("/graphql", 1)[0]
+                box = next((b.name for b in self.settings.stashboxes if b.endpoint == m["endpoint"]), base)
+                parts.append(f"<a href='{base}/scenes/{m['stash_id']}' style='color:#60a5fa'>{box}</a>")
+            ml = QLabel("<b>Matched on:</b> " + " · ".join(parts) + f"<br><i>{found[0]['title']}</i>")
+            ml.setWordWrap(True)
+            ml.setOpenExternalLinks(True)
+            lay.addWidget(ml)
         meta = [("Date", scene.scene_date.isoformat() if scene.scene_date else ""),
                 ("Posted", scene.posted.isoformat() if scene.posted else ""),
-                ("Duration", fmt_duration(scene.duration_s)),
-                ("Performers", ", ".join(scene.performers)),
+                ("Duration", fmt_duration(scene.duration_s or next((m["duration"] for m in found if m["duration"]), None))),
                 ("Groups", ", ".join(scene.release_groups)),
                 ("Tags", ", ".join(scene.tags)),
                 ("Sources", ", ".join(self.sources[s].display_name if s in self.sources else s for s in scene.sources))]
@@ -757,6 +921,10 @@ class MainWindow(QMainWindow):
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
             self.logos.configure(self.settings.stashboxes)
+            self.matcher.configure(self.settings.stashboxes, self.settings.scene_matching,
+                                   self.settings.match_interval_s)
+            self.perf_images.configure(self.settings.stashboxes)
+            self._apply_import_timer()
             self._apply_blackhole()
             self.act_crawl.setChecked(self.settings.crawl_enabled)
             self._load_sources()
