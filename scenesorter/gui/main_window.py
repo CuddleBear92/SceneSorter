@@ -287,7 +287,7 @@ class MainWindow(QMainWindow):
         self.group_box.blockSignals(False)
 
     def rescan_library(self) -> None:
-        lib = Path(self.settings.library_dir)
+        lib = Settings.resolve(self.settings.library_dir)
         run_async(scan_library, lib, on_done=self._library_scanned)
 
     def _library_scanned(self, owned: dict) -> None:
@@ -409,7 +409,7 @@ class MainWindow(QMainWindow):
                                     f"{int(wait // 3600)}h {int(wait % 3600 // 60)}m.")
                 return
         link = min(rel.links, key=lambda l: LINK_PREFERENCE.get(l.kind, 9))
-        self.downloads.enqueue(rel, link, Path(self.settings.download_dir))
+        self.downloads.enqueue(rel, link, Settings.resolve(self.settings.download_dir))
         self._update_quota_label()
         self.tabs.setTabText(1, f"Downloads ({len(self.downloads.jobs)})")
         if self.current:
@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
     def _on_download_finished(self, job: Job) -> None:
         """Runs on the download thread."""
         if self.settings.auto_sort_completed and job.path:
-            job.final_path = sort_into_library(job.path, job.release, Path(self.settings.library_dir),
+            job.final_path = sort_into_library(job.path, job.release, Settings.resolve(self.settings.library_dir),
                                                self.settings.rename_template)
 
     def _job_changed(self, job: Job) -> None:

@@ -4,9 +4,9 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from .config import Settings
+from .config import DATA_DIR, Settings
 
 
 def _dark_palette(app: QApplication) -> None:
@@ -31,6 +31,16 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("SceneSorter")
     _dark_palette(app)
-    win = MainWindow(Settings.load())
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        settings = Settings.load()
+        settings.save()  # creates data/settings.json on first run
+    except OSError as e:
+        QMessageBox.critical(None, "SceneSorter",
+                             f"Can't write to the data folder:\n{DATA_DIR}\n\n{e}\n\n"
+                             "SceneSorter is portable and keeps its settings and database next to the exe. "
+                             "Move it to a folder you can write to (not Program Files).")
+        return 1
+    win = MainWindow(settings)
     win.show()
     return app.exec()

@@ -40,6 +40,27 @@ your library.
 - **Self-updating exe.** GitHub Actions builds `SceneSorter.exe`. The app checks
   GitHub Releases on start and can update itself in place.
 
+## Portable install
+
+SceneSorter doesn't install anything and never writes to AppData. Everything
+is kept beside the exe:
+
+```
+SceneSorter.exe
+data/
+  settings.json      your settings
+  scenesorter.db     cached posts, metadata, download history
+  quota.json         daily action counters
+  cache/thumbs/      cached thumbnails
+downloads/           default download folder   (configurable)
+library/             default sorted library    (configurable)
+```
+
+Relative paths in Settings are resolved against the exe's folder, so you can
+move the whole folder or run it from a USB drive. Self-updates replace only the
+exe and leave `data/` alone. Put it somewhere you can write to, not
+`Program Files`.
+
 ## Project layout
 
 ```
