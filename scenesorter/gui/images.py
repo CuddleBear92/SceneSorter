@@ -53,6 +53,13 @@ class PixmapLRU:
         return len(self._d)
 
 
+def atomic_write(path: Path, data: bytes) -> None:
+    """Write via a temp file + rename, so a crash/close never leaves half an image."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
 def is_svg(data: bytes) -> bool:
     head = data[:300].lstrip().lower()
     return head.startswith(b"<svg") or head.startswith(b"<?xml")
@@ -108,7 +115,7 @@ def load_file(path: Path, box: QSize, shrink_over: int = 200_000) -> QPixmap | N
         return None
     if len(data) > shrink_over and not is_svg(data):
         try:
-            path.write_bytes(encode(img))
+            atomic_write(path, encode(img))
         except OSError:
             pass
     return QPixmap.fromImage(img)
@@ -120,7 +127,7 @@ def save_and_load(path: Path, data: bytes, box: QSize) -> QPixmap | None:
     if img is None:
         return None
     try:
-        path.write_bytes(data if is_svg(data) else encode(img))  # SVGs are tiny and stay sharp
+        atomic_write(path, data if is_svg(data) else encode(img))  # SVGs are tiny and stay sharp
     except OSError:
         pass
     return QPixmap.fromImage(img)

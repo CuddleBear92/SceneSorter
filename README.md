@@ -139,6 +139,23 @@ your library.
   date, studio A–Z (newest first within each studio), title or length. Filter
   by video codec (HEVC, AVC, AV1, VP9, …), read from the release name, file
   name or tags.
+- **Safe to close, update or pause at any time.**
+  - **Closing, updating and pausing:** nothing new starts, and anything already
+    running is allowed to finish: a page being fetched, a merge, a file scan,
+    a stash-box lookup. Only then does the app close, install the update or
+    report that it's paused. If HTTP downloads are running, you're asked
+    first, and stopped downloads show as failed so you can retry them.
+  - **Crashes and power cuts:** each page's posts are saved in one database
+    transaction, and a page is marked done only after its posts are stored.
+    A cut-off can cause a page to be fetched again, but never skipped.
+  - **Interrupted checks:** a check for new posts that's cut off partway
+    remembers where it stopped and finishes before anything else, so no hole
+    is left between the newest posts and the cache.
+  - **Offline or VPN switching:** shows "Can't reach …" and retries within
+    2 minutes instead of backing off for an hour. Images and stash-box lookups
+    retry once the connection is back.
+  - **Interrupted HTTP downloads:** shown as failed after a restart, so you
+    can retry them. Image cache files are written atomically.
 - **Bounded memory.** Images are decoded straight to display size, so a
   4000 px portrait never sits in memory at full size. Only the most recently
   used few hundred of each kind are kept in memory. The disk cache stores

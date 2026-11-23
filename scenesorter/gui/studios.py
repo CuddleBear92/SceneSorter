@@ -21,7 +21,7 @@ from ..db import Database
 from ..models import Scene
 from ..parsing import normalise_studio
 from ..stashbox import StashBox, StashBoxConfig
-from .images import LOGO_SIZE, PixmapLRU, load_file, shrink_for_disk
+from .images import atomic_write, LOGO_SIZE, PixmapLRU, load_file, shrink_for_disk
 from .workers import run_async
 
 RETRY_NOT_FOUND_S = 30 * 24 * 3600
@@ -120,7 +120,7 @@ class LogoService(QObject):
                 resp = box.session.get(m.logo_url, timeout=30)  # same session -> same ApiKey header
                 if resp.ok and resp.content:
                     fname = hashlib.sha1(m.logo_url.encode()).hexdigest()
-                    (self.dir / fname).write_bytes(shrink_for_disk(resp.content, LOGO_SIZE))
+                    atomic_write(self.dir / fname, shrink_for_disk(resp.content, LOGO_SIZE))
             return key, m.name, m.endpoint, m.stash_id, m.logo_url, fname
         return key, name, None, None, None, None
 

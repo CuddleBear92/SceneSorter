@@ -6,7 +6,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
@@ -50,6 +50,19 @@ def fmt_bytes(n: float | None) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+NETWORK_ERROR_MARKERS = (
+    "ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout", "timed out", "Max retries exceeded",
+    "Failed to establish a new connection", "NameResolutionError", "getaddrinfo", "Network is unreachable",
+    "Connection reset", "Connection aborted", "RemoteDisconnected", "ProxyError", "SSLError",
+)
+
+
+def is_network_error(err: str) -> bool:
+    """Our side can't reach the site (offline, VPN switching, DNS), as opposed to the site
+    answering with an error."""
+    return any(m in err for m in NETWORK_ERROR_MARKERS)
 
 
 def compute_status(scenes: list[Scene], flags: dict, preferred_resolution: str) -> dict[str, str]:
@@ -96,12 +109,16 @@ class MainWindow(QMainWindow):
         self.quota = QuotaTracker(DATA_DIR / "quota.json")
         self.db = Database(DATA_DIR / "scenesorter.db")
         self.db.reparse_if_needed()
+        self.db.mark_interrupted_downloads()
         self.flags: dict[tuple[str, str], str] = self.db.flags()
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
         self.studio_filter: tuple[str, str] = ("", "")
         self.performer_filter: tuple[str, str] = ("", "")
         self.matches: dict[str, list[dict]] = self.db.scene_matches()
         self._import_running = False
+        self.draining = False          # closing/updating: start nothing new, let running work finish
+        self._close_ok = False
+        self._refresh_page1_after: set[str] = set()
         self.fav = {"studio": self.db.favorites("studio"), "performer": self.db.favorites("performer")}
         self.releases: dict[tuple[str, str], Release] = {}
         self.next_page: dict[str, int | None] = {}
@@ -149,7 +166,7 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Main")
         tb.setMovable(False)
         self.addToolBar(tb)
-        act_refresh = QAction("⟳ Refresh", self, triggered=self.refresh)
+        act_refresh = QAction("⟳ Refresh", self, triggered=lambda: self.refresh(manual=True))
         self.act_crawl = QAction("Background caching", self, checkable=True, checked=self.settings.crawl_enabled)
         self.act_crawl.setToolTip("Slowly fetch every page of each source so everything is cached locally")
         self.act_crawl.toggled.connect(self._toggle_crawl)
@@ -553,18 +570,34 @@ class MainWindow(QMainWindow):
         self._rebuild()
         self.status_label.setText(f"{len(self.releases)} posts loaded from the local cache")
 
-    def refresh(self) -> None:
-        """Incremental refresh: fetch newest pages until a page has nothing new."""
+    def refresh(self, manual: bool = False) -> None:
+        """Incremental refresh: fetch newest pages until a page has nothing new.
+
+        While background fetching is paused, automatic checks only look at page 1 (and
+        remember where to continue); a manual Refresh click does the full check."""
+        if manual:
+            self._manual_chain = set(self.sources)
         if not self.sources:
             self.browse.show_message("No sources configured yet. Open Settings ▸ Sources to add one.")
             return
         for sid in self.sources:
-            self._fetch(sid, 1, "refresh")
+            resume = int(self.db.get_meta(f"refresh_resume:{sid}", "0"))
+            if resume > 1:
+                # An earlier check was cut off (app closed, network drop): finish it first so no
+                # hole is left between the newest pages and the cache, then look at page 1.
+                self._refresh_page1_after.add(sid)
+                self._fetch(sid, resume, "refresh")
+            else:
+                self._fetch(sid, 1, "refresh")
 
     def _fetch(self, sid: str, page: int, mode: str) -> None:
         """mode: 'refresh' (newest pages until nothing new) or 'crawl' (backfill one older page)."""
-        if sid in self.in_flight or time.time() < self.backoff_until.get(sid, 0):
+        if self.draining or sid in self.in_flight or time.time() < self.backoff_until.get(sid, 0):
             return
+        if mode != "refresh" or page > 1:
+            manual = mode == "refresh" and sid in getattr(self, "_manual_chain", set())
+            if not self.settings.crawl_enabled and not manual:  # paused: only page 1 / manual checks
+                return
         src = self.sources[sid]
         self.in_flight.add(sid)
         if mode == "refresh":
@@ -593,8 +626,16 @@ class MainWindow(QMainWindow):
         self._update_crawl_label()
 
     def _toggle_crawl(self, on: bool) -> None:
+        """Pause/resume all background fetching (crawl, rescans, continuing new-post checks).
+        A page that's already being fetched is finished and saved; nothing new starts."""
         self.settings.crawl_enabled = on
         self.settings.save()
+        if not on and self.in_flight:
+            self.status_label.setText("Pausing — finishing the page that's already being fetched…")
+            self._wait_idle(lambda: self.status_label.setText("Background fetching paused."),
+                            lambda: not self.in_flight)
+        elif not on:
+            self.status_label.setText("Background fetching paused.")
         self._update_crawl_label()
 
     def _has_cache(self, sid: str) -> bool:
@@ -605,9 +646,15 @@ class MainWindow(QMainWindow):
 
     def _crawl_tick(self) -> None:
         """One page request per tick, round-robin over sources that aren't fully cached."""
-        if not self.settings.crawl_enabled:
+        if not self.settings.crawl_enabled or self.draining:
             self._update_crawl_label()
             return
+        for sid in self.sources:  # an interrupted new-post check takes priority over backfilling
+            resume = int(self.db.get_meta(f"refresh_resume:{sid}", "0"))
+            if resume > 1 and sid not in self.in_flight and time.time() >= self.backoff_until.get(sid, 0):
+                self._fetch(sid, resume, "refresh")
+                self._update_crawl_label()
+                return
         pending = [sid for sid in self.sources if not self._crawl_done(sid)]
         for k in range(len(pending)):
             sid = pending[(self._crawl_rr + k) % len(pending)]
@@ -641,6 +688,8 @@ class MainWindow(QMainWindow):
         self._update_crawl_label()
 
     def _rescan_tick(self) -> None:
+        if not self.settings.crawl_enabled or self.draining:
+            return
         active = [sid for sid in self.sources if self.is_rescanning(sid)]
         for k in range(len(active)):
             sid = active[(self._rescan_rr + k) % len(active)]
@@ -729,6 +778,8 @@ class MainWindow(QMainWindow):
                 self.db.set_meta(f"crawl_done:{sid}", "1")
                 self.status_label.setText(f"{src.display_name}: every page is now cached.")
         elif rels and new == len(rels) and (page < self.settings.max_refresh_pages or self._has_cache(sid)):
+            # remember where to continue if we're interrupted before reaching known posts
+            self.db.set_meta(f"refresh_resume:{sid}", str(page + 1))
             # Keep going until we reach posts we already have. The page cap only protects a
             # brand-new source; once older posts are cached, stopping early would leave a hole
             # between the newest pages and the cache (e.g. after being away for a while).
@@ -739,16 +790,30 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(max(2, self.settings.rescan_interval_s) * 1000,
                                   lambda: self._fetch(sid, page + 1, "refresh"))
         else:
+            self.db.set_meta(f"refresh_resume:{sid}", "0")  # reached known posts: check complete
+            getattr(self, "_manual_chain", set()).discard(sid)
             self.status_label.setText(f"{src.display_name}: up to date · {len(self.releases)} posts cached")
+            if sid in self._refresh_page1_after:
+                self._refresh_page1_after.discard(sid)
+                QTimer.singleShot(500, lambda: self._fetch(sid, 1, "refresh"))
         if new:
             self._schedule_rebuild()
         self._update_crawl_label()
 
     def _page_failed(self, sid: str, page: int, err: str) -> None:
         self.in_flight.discard(sid)
-        self._backoff(sid, None)
         first = err.splitlines()[0] if err else "unknown error"
-        self.status_label.setText(f"{sid}: page {page} failed ({first}) — retrying later")
+        name = self.sources[sid].display_name if sid in self.sources else sid
+        if is_network_error(err):
+            # Offline / VPN switching / DNS: retry soon (max 2 min), not the long site-error backoff.
+            n = self.fail_count.get(sid, 0) + 1
+            self.fail_count[sid] = n
+            delay = min(120, 10 * 2 ** (n - 1))
+            self.backoff_until[sid] = time.time() + delay
+            self.status_label.setText(f"Can't reach {name} (offline or VPN switching?) — retrying in {delay}s")
+        else:
+            self._backoff(sid, None)
+            self.status_label.setText(f"{sid}: page {page} failed ({first}) — retrying later")
         self._update_crawl_label()
 
         # If this is an EncodedFapFiles source that needs login, open the dialog
@@ -1292,11 +1357,75 @@ class MainWindow(QMainWindow):
                   on_fail=lambda e: QMessageBox.warning(self, "Update failed", e.splitlines()[0]))
 
     def _apply_update(self, path: Path) -> None:
-        updater.apply_update_and_restart(path)
-        self.close()
+        """Let running work finish (current page, merge, imports) before swapping the exe."""
+        def go():
+            updater.apply_update_and_restart(path)
+            self._close_ok = True
+            self.close()
+        self._drain("Installing the update", go)
+
+    # ------------------------------------------------------------ shutdown
+    def _busy(self) -> list[str]:
+        """Work that's mid-way and would be cut off by quitting now."""
+        out = []
+        if self.in_flight:
+            out.append("fetching " + ", ".join(self.sources[s].display_name for s in self.in_flight if s in self.sources))
+        if self._rebuild_running:
+            out.append("merging scenes")
+        if self._import_running:
+            out.append("scanning files")
+        if self.matcher.q.busy or self.perf_images.q.busy or self.logos.busy:
+            out.append("a stash-box lookup")
+        return out
+
+    def _active_downloads(self) -> list[Job]:
+        return [j for j in self.downloads.jobs.values() if j.state in (State.QUEUED, State.RUNNING, State.SORTING)]
+
+    def _wait_idle(self, done, is_idle=None, timeout_s: float = 90) -> None:
+        is_idle = is_idle or (lambda: not self._busy())
+        start = time.time()
+
+        def poll():
+            if is_idle() or time.time() - start > timeout_s:
+                done()
+            else:
+                QTimer.singleShot(200, poll)
+        poll()
+
+    def _drain(self, what: str, then) -> None:
+        """Stop starting new work, let running jobs finish, then run ``then``."""
+        active = self._active_downloads()
+        if active:
+            ans = QMessageBox.question(
+                self, "Downloads running",
+                f"{len(active)} download(s) are still running.\n\nStop them and continue? They'll show as "
+                f"failed so you can retry them later.")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            for j in active:
+                self.downloads.cancel(j.id)
+        self.draining = True
+        for q in (self.matcher.q, self.perf_images.q):
+            q.enabled = False
+        self.logos.timer.stop()
+        busy = self._busy()
+        if busy:
+            self.status_label.setText(f"{what}: finishing {', '.join(busy)} first…")
+        self._wait_idle(then)
 
     def closeEvent(self, ev) -> None:  # noqa: N802
+        if not self._close_ok and (self._busy() or self._active_downloads()):
+            ev.ignore()  # finish the current work first, then close for real
+
+            def really_close():
+                self._close_ok = True
+                self.close()
+            if not self.draining:
+                self._drain("Closing", really_close)
+            return
+        self.draining = True
         self.downloads.shutdown()
+        QThreadPool.globalInstance().waitForDone(5000)  # let any last DB write complete
         self.db.close()
         super().closeEvent(ev)
 

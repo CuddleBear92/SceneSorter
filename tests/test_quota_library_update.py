@@ -121,3 +121,13 @@ def test_update_script_retries_and_logs():
     assert sum(l.endswith("goto move") for l in s.split("\r\n")) == 3 and "%TRIES% GEQ 60" in s
     assert 'move /Y "%NEW%" "%CUR%"' in s and 'start "" "%CUR%"' in s
     assert s.index(":wait") < s.index(":move") < s.index(":moved") < s.index(":failed")
+
+
+def test_network_error_classification():
+    import pytest
+    pytest.importorskip("PySide6")
+    from scenesorter.gui.main_window import is_network_error
+    assert is_network_error("HTTPSConnectionPool(host='x', port=443): Max retries exceeded ... NameResolutionError")
+    assert is_network_error("Traceback ...\nrequests.exceptions.ConnectionError: ('Connection aborted.')")
+    assert is_network_error("HTTPSConnectionPool(host='x'): Read timed out. (read timeout=30)")
+    assert not is_network_error("500 Server Error: Internal Server Error for url: https://x/wp-json")

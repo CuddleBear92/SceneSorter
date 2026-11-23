@@ -98,3 +98,15 @@ def test_favorites(tmp_path):
     assert db.favorites("studio") == {"tushy": "Tushy"} and db.favorites("performer") == {"lilylou": "Lily Lou"}
     db.set_favorite("studio", "tushy", "Tushy", False)
     assert db.favorites("studio") == {}
+
+
+def test_interrupted_http_downloads_marked_failed(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.conn.execute("INSERT INTO downloads(id, source, post_id, link_kind, state) VALUES "
+                    "('a','blog','1','direct','Downloading'), ('b','blog','2','magnet','Sent to torrent client'),"
+                    "('c','blog','3','direct','Done')")
+    db.set_flag("blog", "1", "grabbed")
+    db.set_flag("blog", "2", "grabbed")
+    db.set_flag("blog", "3", "done")
+    assert db.mark_interrupted_downloads() == 1
+    assert db.flags() == {("blog", "1"): "failed", ("blog", "2"): "grabbed", ("blog", "3"): "done"}

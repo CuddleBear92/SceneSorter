@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import traceback
 from pathlib import Path
 from typing import Callable
@@ -65,7 +66,7 @@ class ThumbnailLoader(QObject):
         # ~0.9 MB per 640x360 pixmap -> ~270 MB at most, however far you scroll
         self.mem = PixmapLRU(300)
         self.pending: set[str] = set()
-        self.failed: set[str] = set()              # URLs that didn't load this session (don't hammer them)
+        self.failed: dict[str, float] = {}          # URL -> when it failed; retried after 10 min
         self.host_headers: dict[str, dict[str, str]] = {}  # e.g. stash-box image hosts need the ApiKey
 
     def set_host_headers(self, headers: dict[str, dict[str, str]]) -> None:
@@ -79,7 +80,8 @@ class ThumbnailLoader(QObject):
 
         if key in self.mem:
             return self.mem.get(key)
-        urls = [u for u in urls if u not in self.failed]
+        now = time.time()
+        urls = [u for u in urls if now - self.failed.get(u, 0) > 600]
         if key in self.pending or not urls:
             return None
         for url in urls:
@@ -120,7 +122,7 @@ class ThumbnailLoader(QObject):
             self.pending.discard(key)
             self.loaded.emit(key, pm)
         else:
-            self.failed.add(url)
+            self.failed[url] = time.time()
             self._fetch(key, rest)  # fall back to the next image (other site / stash-box cover)
 
 
@@ -141,6 +143,8 @@ class BackgroundQueue(QObject):
         self.queued: set = set()
         self.busy = False
         self.enabled = True
+        self.fails = 0
+        self.pause_until = 0.0
         self.timer = QTimer(self, interval=interval_ms, timeout=self._next)
         self.timer.start()
 
@@ -168,18 +172,26 @@ class BackgroundQueue(QObject):
         return len(self.queue) + (1 if self.busy else 0)
 
     def _next(self) -> None:
-        if self.busy or not self.queue or not self.enabled:
+        import time as _time
+
+        if self.busy or not self.queue or not self.enabled or _time.time() < self.pause_until:
             return
         key, payload = self.queue.popleft()
         self.busy = True
 
         def done(res, key=key):
             self.busy = False
+            self.fails = 0
             self.queued.discard(key)
             self.on_result(key, res)
 
         def failed(_err, key=key):
+            import time as _time
+
             self.busy = False
             self.queued.discard(key)  # transient error: it will be queued again when needed
+            # offline / VPN switching: pause instead of burning through the whole queue
+            self.fails += 1
+            self.pause_until = _time.time() + min(600, 15 * 2 ** (self.fails - 1))
 
         run_async(self.worker, key, payload, on_done=done, on_fail=failed)

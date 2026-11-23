@@ -282,6 +282,20 @@ class Database:
                  now, now if job.state.name in ("DONE", "FAILED", "CANCELLED", "HANDED_OFF", "BLACKHOLE") else None),
             )
 
+    def mark_interrupted_downloads(self) -> int:
+        """HTTP downloads that were running when the app last closed/crashed are marked
+        failed (still wanted, shows Retry). Torrent hand-offs are left alone: the torrent
+        client keeps downloading them."""
+        with self._lock:
+            rows = self.conn.execute("SELECT id, source, post_id FROM downloads WHERE link_kind='direct' "
+                                     "AND state IN ('Queued', 'Downloading', 'Sorting')").fetchall()
+            for r in rows:
+                self.conn.execute("UPDATE downloads SET state='Failed', error='Interrupted (app closed)' "
+                                  "WHERE id=?", (r["id"],))
+                self.conn.execute("UPDATE flags SET state='failed' WHERE source=? AND post_id=? AND state='grabbed'",
+                                  (r["source"], r["post_id"]))
+        return len(rows)
+
     # ---------------------------------------------------------------- flags
     def flags(self) -> dict[tuple[str, str], str]:
         with self._lock:
