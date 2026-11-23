@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         self.matcher = MatchService(self.db, settings.match_interval_s, self)
         self.matcher.configure(settings.stashboxes, settings.scene_matching, settings.match_interval_s)
         self.matcher.matched.connect(self._scene_matched)
+        self.matcher.lookup = lambda key: self.model.by_key.get(key)
         self.perf_images = PerformerImages(self.db, CACHE_DIR, self)
         self.perf_images.configure(settings.stashboxes)
         self.perf_images.ready.connect(lambda k: k == self.performer_filter[0] and self._update_performer_chip())
@@ -566,6 +567,11 @@ class MainWindow(QMainWindow):
     def _load_cached(self) -> None:
         """Show everything already in the local DB without touching the network."""
         self.releases = {(r.source, r.post_id): r for r in self.db.load_releases(list(self.sources))}
+        # The cached posts live as long as the app: move them out of the garbage collector's
+        # way once (a full pass over them stalls every thread). Only done here, right after a
+        # fresh load — freezing repeatedly would also make any garbage alive at that moment
+        # permanent.
+        gc.collect()
         gc.freeze()
         self._rebuild()
         self.status_label.setText(f"{len(self.releases)} posts loaded from the local cache")
@@ -878,10 +884,6 @@ class MainWindow(QMainWindow):
             self.studios.set_hidden(set(self.hidden_studios))
             self._drop_bad_matches()
             self.matcher.prefetch(scenes)
-            # Long-lived data: keep the garbage collector from re-walking it (a full pass over
-            # millions of objects stops every thread, UI included, for seconds). It has no
-            # reference cycles, so it's still freed normally when replaced.
-            gc.freeze()
             self.perf_timer.start()
         elif err:
             self.status_label.setText(f"Merge failed: {err.splitlines()[0]}")

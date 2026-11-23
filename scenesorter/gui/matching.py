@@ -31,6 +31,9 @@ class MatchService(QObject):
         self.db = db
         self.boxes: list[StashBox] = []
         self.checked: set[tuple[str, str]] = set()
+        # The queue holds scene *keys*; the current Scene object is looked up when the job runs,
+        # so queued work never pins an old scene list in memory.
+        self.lookup = lambda key: None
         self.q = BackgroundQueue(interval_s * 1000, self._work, self._done, self)
 
     def configure(self, configs: list[StashBoxConfig], enabled: bool, interval_s: int) -> None:
@@ -44,19 +47,22 @@ class MatchService(QObject):
 
     def visible(self, s: Scene) -> None:
         if self.q.enabled and self._needs(s):
-            self.q.push(s.key, s, front=True)
+            self.q.push(s.key, None, front=True)
 
     def prefetch(self, scenes: list[Scene]) -> None:
         if not self.q.enabled:
             return
         for s in scenes:  # already newest first
             if self._needs(s):
-                self.q.push(s.key, s)
+                self.q.push(s.key, None)
 
     def pending(self) -> int:
         return self.q.pending()
 
-    def _work(self, key: str, scene: Scene):
+    def _work(self, key: str, _payload=None):
+        scene = self.lookup(key)
+        if scene is None:  # merged away since it was queued
+            return []
         out = []
         for b in self.boxes:
             if (key, b.cfg.endpoint) in self.checked:

@@ -29,8 +29,11 @@ class Task(QRunnable):
         try:
             res = self.fn(*self.args, **self.kwargs)
         except Exception as e:  # noqa: BLE001
-            self.signals.failed.emit(f"{e}\n{traceback.format_exc(limit=3)}")
+            msg = f"{e}\n{traceback.format_exc(limit=3)}"
+            self.fn = self.args = self.kwargs = None  # don't keep (possibly huge) inputs alive
+            self.signals.failed.emit(msg)
         else:
+            self.fn = self.args = self.kwargs = None
             self.signals.done.emit(res)
 
 
@@ -38,15 +41,34 @@ _live: set[Task] = set()  # keep Python wrappers alive until the task reports ba
 
 
 def run_async(fn: Callable, *args, on_done=None, on_fail=None, **kwargs) -> Task:
+    """Run ``fn`` on the thread pool; ``on_done(result)`` / ``on_fail(error)`` run on the UI thread.
+
+    Memory note: a task's signals hold Python callbacks inside Qt (C++), where Python's
+    garbage collector can't see them, so any callback referring back to the task forms a
+    cycle that is never freed — and every task's arguments/results with it (whole scene
+    lists, every rebuild). So once a task has reported back, its signals are disconnected
+    and every reference is dropped explicitly.
+    """
     t = Task(fn, *args, **kwargs)
     t.setAutoDelete(False)
     _live.add(t)
-    t.signals.done.connect(lambda _r: _live.discard(t))
-    t.signals.failed.connect(lambda _e: _live.discard(t))
     if on_done:
         t.signals.done.connect(on_done)
     if on_fail:
         t.signals.failed.connect(on_fail)
+
+    def finish(*_):  # connected last, so it runs after the user's callback
+        _live.discard(t)
+        sig = t.signals
+        for signal in (sig.done, sig.failed):
+            try:
+                signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        sig.deleteLater()
+
+    t.signals.done.connect(finish)
+    t.signals.failed.connect(finish)
     QThreadPool.globalInstance().start(t)
     return t
 
