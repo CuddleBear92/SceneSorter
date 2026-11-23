@@ -163,10 +163,10 @@ class Database:
             self.conn.execute("BEGIN")
             for r in rels:
                 self.conn.execute(
-                    "UPDATE posts SET studio=?, performers=?, title=?, scene_date=?, resolution=?, release_group=? "
+                    "UPDATE posts SET studio=?, performers=?, title=?, scene_date=?, resolution=?, release_group=?, tags=? "
                     "WHERE source=? AND post_id=?",
                     (r.studio, json.dumps(r.performers), r.title, r.scene_date.isoformat() if r.scene_date else None,
-                     r.resolution, r.release_group, r.source, r.post_id))
+                     r.resolution, r.release_group, json.dumps(r.tags), r.source, r.post_id))
             self.conn.execute("COMMIT")
         self.set_meta("parser_version", PARSER_VERSION)
         return len(rels)

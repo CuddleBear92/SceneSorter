@@ -113,3 +113,9 @@ def test_post_metadata():
 
 def test_studio_domain_suffix_stripped():
     assert parse_title("StudioName.com - Jane Doe - Some Title [720p]")["studio"] == "StudioName"
+
+
+def test_studio_not_in_tags():
+    r = enrich(Release("blog", "1", "", "StudioName.24.01.15.Jane.Doe.XXX.1080p.MP4-PRT",
+                       tags=["Studio Name", "Blonde", "studioname.com", "POV", "blonde"]))
+    assert r.tags == ["Blonde", "POV"]

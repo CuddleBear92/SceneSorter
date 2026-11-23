@@ -29,6 +29,14 @@ class AuthRequired(Exception):
     """Raised when a source needs the user to (re)log in."""
 
 
+class RateLimited(Exception):
+    """The site asked us to slow down (HTTP 429/503). ``retry_after`` in seconds."""
+
+    def __init__(self, retry_after: float | None = None):
+        super().__init__(f"rate limited, retry after {retry_after or '?'}s")
+        self.retry_after = retry_after
+
+
 class Source(abc.ABC):
     #: Shown in the UI (badge on each scene card)
     display_name: str = "Source"
@@ -36,6 +44,8 @@ class Source(abc.ABC):
     requires_login: bool = False
     #: Daily action limit; None = unlimited. Each started download is one action.
     daily_quota: int | None = None
+    #: Total listing pages, if the site reports it (set by list_page).
+    total_pages: int | None = None
 
     def __init__(self, cfg: SourceConfig, session: requests.Session | None = None):
         self.cfg = cfg

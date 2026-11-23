@@ -21,7 +21,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "3"
+PARSER_VERSION = "4"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -307,7 +307,23 @@ def enrich(r: Release) -> Release:
     r.release_group = r.release_group or find_group(r.filename or "") or find_group(r.raw_title)
     if not r.resolution and r.filename:
         r.resolution = find_resolution(r.filename)
+    r.tags = clean_tags(r.tags, r.studio)
     return r
+
+
+def clean_tags(tags: list[str], studio: str) -> list[str]:
+    """Drop studio names (sites often file posts under the studio as a tag/category)
+    and duplicates."""
+    st = normalise_studio(studio) if studio else ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tags:
+        key = "".join(tokens(t)) or t.lower()
+        if not t.strip() or key in seen or (st and normalise_studio(t) == st):
+            continue
+        seen.add(key)
+        out.append(t.strip())
+    return out
 
 
 def reparse(r: Release) -> Release:

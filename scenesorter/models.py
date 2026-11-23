@@ -98,9 +98,10 @@ class Scene:
 
     @property
     def tags(self) -> list[str]:
+        studios = {_squash(r.studio) for r in self.releases if r.studio}
         out: list[str] = []
         for r in self.releases:
-            out += [t for t in r.tags if t not in out]
+            out += [t for t in r.tags if t not in out and _squash(t) not in studios]
         return out
 
     @property
@@ -122,6 +123,10 @@ class Scene:
 
     def releases_for(self, resolution: str) -> list[Release]:
         return [r for r in self.releases if r.resolution == resolution]
+
+
+def _squash(s: str) -> str:
+    return "".join(c for c in s.lower() if c.isalnum())
 
 
 def _display_score(r: Release) -> tuple:

@@ -72,14 +72,24 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             if find(i) != find(j) and similar(toks[i], toks[j], strict):
                 parent[find(j)] = find(i)
 
-        for same in list(by_date.values()) + [undated]:
+        # Same date: buckets are tiny, compare all pairs.
+        for same in by_date.values():
             for x in range(len(same)):
                 for y in range(x + 1, len(same)):
                     try_union(same[x], same[y], strict=False)
-        for i in undated:
-            for same in by_date.values():
-                for j in same:
-                    try_union(j, i, strict=True)
+
+        # Undated: only compare against groups sharing one of its rarer tokens
+        # (keeps this near-linear for studios with thousands of posts).
+        if undated:
+            index: dict[str, list[int]] = defaultdict(list)
+            for i in idxs:
+                for t in toks[i]:
+                    index[t].append(i)
+            for i in undated:
+                rare = sorted(toks[i], key=lambda t: len(index[t]))[:2]
+                cands = {j for t in rare for j in index[t] if j != i}
+                for j in cands:
+                    try_union(j, i, strict=dates[j] is not None)
 
     merged: dict[int, list[Release]] = defaultdict(list)
     for i, g in enumerate(groups):

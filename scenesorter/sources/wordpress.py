@@ -13,7 +13,7 @@ from urllib.parse import urljoin
 
 from ..models import DownloadLink, LinkKind, Release
 from ..parsing import enrich, extract_post_metadata
-from .base import Source
+from .base import RateLimited, Source
 
 IMG_RE = re.compile(r"<img[^>]+?(?:data-src|data-lazy-src|src)=[\"']([^\"']+)[\"']", re.I)
 HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.I)
@@ -63,7 +63,13 @@ class WordPressSource(Source):
         resp = self.session.get(self._api("posts"), params=params, timeout=30)
         if resp.status_code == 400 and page > 1:
             return []  # past the last page
+        if resp.status_code in (429, 503):
+            ra = resp.headers.get("Retry-After", "")
+            raise RateLimited(float(ra) if ra.isdigit() else None)
         resp.raise_for_status()
+        tp = resp.headers.get("X-WP-TotalPages", "")
+        if tp.isdigit() and not query:
+            self.total_pages = int(tp)
         return [self._to_release(p) for p in resp.json()]
 
     def _to_release(self, p: dict) -> Release:

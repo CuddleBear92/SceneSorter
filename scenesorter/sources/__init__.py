@@ -1,7 +1,7 @@
 """Source registry. Add a new site by subclassing Source and registering it here."""
 from __future__ import annotations
 
-from .base import AuthRequired, Source, SourceConfig
+from .base import AuthRequired, RateLimited, Source, SourceConfig
 from .wordpress import WordPressSource
 
 SOURCE_TYPES: dict[str, type[Source]] = {
@@ -17,4 +17,4 @@ def build_source(cfg: SourceConfig) -> Source:
     return cls(cfg)
 
 
-__all__ = ["AuthRequired", "Source", "SourceConfig", "SOURCE_TYPES", "build_source"]
+__all__ = ["AuthRequired", "RateLimited", "Source", "SourceConfig", "SOURCE_TYPES", "build_source"]

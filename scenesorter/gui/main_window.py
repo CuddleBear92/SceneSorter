@@ -1,6 +1,7 @@
 """Main application window."""
 from __future__ import annotations
 
+import time
 import webbrowser
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from ..library import scan_library, sort_into_library
 from ..merge import merge_releases
 from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
-from ..sources import Source, build_source
+from ..sources import RateLimited, Source, build_source
 from .scene_grid import SceneDelegate, SceneFilter, SceneModel, SceneRole, fmt_duration
 from .settings_dialog import SettingsDialog
 from .workers import ThumbnailLoader, run_async
@@ -56,6 +57,12 @@ class MainWindow(QMainWindow):
         self.releases: dict[tuple[str, str], Release] = {}
         self.next_page: dict[str, int | None] = {}
         self.in_flight: set[str] = set()
+        self.backoff_until: dict[str, float] = {}
+        self.fail_count: dict[str, int] = {}
+        self._crawl_rr = 0
+        self._rebuild_running = False
+        self._rebuild_dirty = False
+        self._restoring = False
         self.sources: dict[str, Source] = {}
         self.owned: dict[str, list[Path]] = {}
         self.current: Scene | None = None
@@ -83,10 +90,12 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
         act_refresh = QAction("⟳ Refresh", self, triggered=self.refresh)
-        act_more = QAction("Load more", self, triggered=self.load_more)
+        self.act_crawl = QAction("Background caching", self, checkable=True, checked=self.settings.crawl_enabled)
+        self.act_crawl.setToolTip("Slowly fetch every page of each source so everything is cached locally")
+        self.act_crawl.toggled.connect(self._toggle_crawl)
         act_settings = QAction("Settings", self, triggered=self.open_settings)
         act_update = QAction("Check for updates", self, triggered=lambda: self.check_updates(False))
-        for a in (act_refresh, act_more):
+        for a in (act_refresh, self.act_crawl):
             tb.addAction(a)
         tb.addSeparator()
         self.search = QLineEdit(placeholderText="Search studio, performer, title…")
@@ -133,7 +142,6 @@ class MainWindow(QMainWindow):
         self.delegate.preferred_groups = self.settings.preferred_groups
         self.grid.setItemDelegate(self.delegate)
         self.grid.selectionModel().currentChanged.connect(lambda cur, _prev: self.show_scene(cur.data(SceneRole)))
-        self.grid.verticalScrollBar().valueChanged.connect(self._maybe_autoload)
 
         self.detail = QWidget()
         self.detail_layout = QVBoxLayout(self.detail)
@@ -171,8 +179,15 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel()
         self.quota_label = QLabel()
+        self.crawl_label = QLabel()
         self.statusBar().addWidget(self.status_label, 1)
+        self.statusBar().addPermanentWidget(self.crawl_label)
         self.statusBar().addPermanentWidget(self.quota_label)
+
+        self.crawl_timer = QTimer(self, timeout=self._crawl_tick)
+        self.refresh_timer = QTimer(self, timeout=self.refresh)
+        self._apply_timers()
+        self.rebuild_timer = QTimer(self, singleShot=True, interval=400, timeout=self._start_rebuild)
         self._render_empty_detail()
 
     def _render_empty_detail(self, msg: str = "Select a scene") -> None:
@@ -211,7 +226,7 @@ class MainWindow(QMainWindow):
         """Show everything already in the local DB without touching the network."""
         self.releases = {(r.source, r.post_id): r for r in self.db.load_releases(list(self.sources))}
         self._rebuild()
-        self.status_label.setText(f"{len(self.model.scenes)} scenes from {len(self.releases)} cached posts")
+        self.status_label.setText(f"{len(self.releases)} posts loaded from the local cache")
 
     def refresh(self) -> None:
         """Incremental refresh: fetch newest pages until a page has nothing new."""
@@ -219,55 +234,160 @@ class MainWindow(QMainWindow):
             self._render_empty_detail("No sources configured yet. Open Settings ▸ Sources to add one.")
             return
         for sid in self.sources:
-            self._fetch(sid, 1, incremental=True)
+            self._fetch(sid, 1, "refresh")
 
-    def load_more(self) -> None:
-        """Backfill: fetch the next older page of every source."""
-        for sid in self.sources:
-            page = self.next_page.get(sid) or int(self.db.get_meta(f"backfill_page:{sid}", "1")) + 1
-            self._fetch(sid, page, incremental=False)
-
-    def _fetch(self, sid: str, page: int, incremental: bool) -> None:
-        if sid in self.in_flight:
+    def _fetch(self, sid: str, page: int, mode: str) -> None:
+        """mode: 'refresh' (newest pages until nothing new) or 'crawl' (backfill one older page)."""
+        if sid in self.in_flight or time.time() < self.backoff_until.get(sid, 0):
             return
         src = self.sources[sid]
         self.in_flight.add(sid)
-        self.status_label.setText(f"Loading {src.display_name} page {page}…")
-        run_async(src.list_page, page,
-                  on_done=lambda rels: self._page_loaded(sid, page, rels, incremental),
+        if mode == "refresh":
+            self.status_label.setText(f"Checking {src.display_name} for new posts (page {page})…")
+
+        def job():
+            try:
+                return src.list_page(page)
+            except RateLimited as e:
+                return e
+
+        run_async(job, on_done=lambda res: self._page_loaded(sid, page, res, mode),
                   on_fail=lambda err: self._page_failed(sid, page, err))
 
-    def _maybe_autoload(self, value: int) -> None:
-        bar = self.grid.verticalScrollBar()
-        if bar.maximum() and value >= bar.maximum() - 50 and not self.search.text():
-            self.load_more()
+    # ------------------------------------------------------------ crawler
+    def _apply_timers(self) -> None:
+        self.crawl_timer.start(max(5, self.settings.crawl_interval_s) * 1000)
+        if self.settings.auto_refresh_minutes > 0:
+            self.refresh_timer.start(self.settings.auto_refresh_minutes * 60_000)
+        else:
+            self.refresh_timer.stop()
+        self._update_crawl_label()
 
-    def _page_loaded(self, sid: str, page: int, rels: list[Release], incremental: bool) -> None:
+    def _toggle_crawl(self, on: bool) -> None:
+        self.settings.crawl_enabled = on
+        self.settings.save()
+        self._update_crawl_label()
+
+    def _crawl_done(self, sid: str) -> bool:
+        return self.db.get_meta(f"crawl_done:{sid}") == "1"
+
+    def _crawl_tick(self) -> None:
+        """One page request per tick, round-robin over sources that aren't fully cached."""
+        if not self.settings.crawl_enabled:
+            self._update_crawl_label()
+            return
+        pending = [sid for sid in self.sources if not self._crawl_done(sid)]
+        for k in range(len(pending)):
+            sid = pending[(self._crawl_rr + k) % len(pending)]
+            if sid in self.in_flight or time.time() < self.backoff_until.get(sid, 0):
+                continue
+            self._crawl_rr = (self._crawl_rr + k + 1) % len(pending)
+            self._fetch(sid, int(self.db.get_meta(f"backfill_page:{sid}", "0")) + 1, "crawl")
+            break
+        self._update_crawl_label()
+
+    def _update_crawl_label(self) -> None:
+        parts = []
+        for sid, src in self.sources.items():
+            if self._crawl_done(sid):
+                parts.append(f"{src.display_name}: fully cached")
+                continue
+            done = int(self.db.get_meta(f"backfill_page:{sid}", "0"))
+            total = src.total_pages or self.db.get_meta(f"total_pages:{sid}")
+            wait = self.backoff_until.get(sid, 0) - time.time()
+            txt = f"{src.display_name}: {done}/{total or '?'} pages cached"
+            if wait > 0:
+                txt += f" (waiting {int(wait)}s)"
+            elif not self.settings.crawl_enabled:
+                txt += " (paused)"
+            parts.append(txt)
+        self.crawl_label.setText("  ·  ".join(parts))
+
+    def _backoff(self, sid: str, seconds: float | None) -> None:
+        n = self.fail_count.get(sid, 0) + 1
+        self.fail_count[sid] = n
+        delay = seconds or min(3600, self.settings.crawl_interval_s * (2 ** n))
+        self.backoff_until[sid] = time.time() + delay
+
+    def _page_loaded(self, sid: str, page: int, rels, mode: str) -> None:
         self.in_flight.discard(sid)
+        src = self.sources.get(sid)
+        if src is None:
+            return
+        if isinstance(rels, RateLimited):
+            self._backoff(sid, rels.retry_after)
+            self.status_label.setText(f"{src.display_name} asked us to slow down — pausing.")
+            self._update_crawl_label()
+            return
+        self.fail_count[sid] = 0
         new = self.db.upsert_releases(rels) if rels else 0
         for r in rels:
             self.releases[(r.source, r.post_id)] = r
-        self.next_page[sid] = page + 1 if rels else None
+        if src.total_pages:
+            self.db.set_meta(f"total_pages:{sid}", str(src.total_pages))
         backfill = int(self.db.get_meta(f"backfill_page:{sid}", "0"))
-        if rels and page > backfill:
-            self.db.set_meta(f"backfill_page:{sid}", str(page))
-        self._rebuild()
-        self.status_label.setText(f"{self.sources[sid].display_name} page {page}: {new} new · "
-                                  f"{len(self.model.scenes)} scenes from {len(self.releases)} posts")
-        if incremental and rels and new == len(rels) and page < self.settings.max_refresh_pages:
-            self._fetch(sid, page + 1, incremental=True)
+        if mode == "refresh" and rels and page == backfill + 1 and not self._crawl_done(sid):
+            self.db.set_meta(f"backfill_page:{sid}", str(page))  # refresh pages count as crawled too
+        if mode == "crawl":
+            if rels:
+                self.db.set_meta(f"backfill_page:{sid}", str(page))
+                self.status_label.setText(f"Cached {src.display_name} page {page} ({new} new) · "
+                                          f"{len(self.releases)} posts in local DB")
+            if not rels or (src.total_pages and page >= src.total_pages):
+                self.db.set_meta(f"crawl_done:{sid}", "1")
+                self.status_label.setText(f"{src.display_name}: every page is now cached.")
+        elif rels and new == len(rels) and page < self.settings.max_refresh_pages:
+            self.status_label.setText(f"{src.display_name}: {new} new post(s) on page {page}, checking further…")
+            self._fetch(sid, page + 1, "refresh")
+        else:
+            self.status_label.setText(f"{src.display_name}: up to date · {len(self.releases)} posts cached")
+        if new:
+            self._schedule_rebuild()
+        self._update_crawl_label()
 
     def _page_failed(self, sid: str, page: int, err: str) -> None:
         self.in_flight.discard(sid)
-        self.status_label.setText(f"{sid}: failed to load page {page}: {err.splitlines()[0]}")
+        self._backoff(sid, None)
+        self.status_label.setText(f"{sid}: page {page} failed ({err.splitlines()[0]}) — retrying later")
+        self._update_crawl_label()
+
+    # ------------------------------------------------------------ rebuild
+    def _schedule_rebuild(self) -> None:
+        if self._rebuild_running:
+            self._rebuild_dirty = True
+        elif not self.rebuild_timer.isActive():
+            self.rebuild_timer.start()
 
     def _rebuild(self) -> None:
-        current_key = self.current.key if self.current else None
-        scenes = merge_releases(self.releases.values())
-        self.model.set_scenes(scenes, set(self.owned))
-        self._update_group_box()
-        if current_key:
-            self.current = next((s for s in scenes if s.key == current_key), self.current)
+        self._schedule_rebuild()
+
+    def _start_rebuild(self) -> None:
+        """Merge off the UI thread; 40k+ posts take about a second."""
+        self._rebuild_running = True
+        self._rebuild_dirty = False
+        snapshot = list(self.releases.values())
+        run_async(merge_releases, snapshot, on_done=self._apply_rebuild,
+                  on_fail=lambda e: self._apply_rebuild(None, e))
+
+    def _apply_rebuild(self, scenes, err: str | None = None) -> None:
+        self._rebuild_running = False
+        if scenes is not None:
+            current_key = self.current.key if self.current else None
+            scroll = self.grid.verticalScrollBar().value()
+            self._restoring = True
+            self.model.set_scenes(scenes, set(self.owned))
+            if current_key:
+                row = self.model._row_by_key.get(current_key)
+                if row is not None:
+                    self.current = scenes[row]
+                    self.grid.setCurrentIndex(self.filter.mapFromSource(self.model.index(row)))
+            self.grid.verticalScrollBar().setValue(scroll)
+            self._restoring = False
+            self._update_group_box()
+        elif err:
+            self.status_label.setText(f"Merge failed: {err.splitlines()[0]}")
+        if self._rebuild_dirty:
+            self._schedule_rebuild()
 
     def _update_group_box(self) -> None:
         current = self.group_box.currentData() or ""
@@ -296,6 +416,8 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- detail
     def show_scene(self, scene: Scene | None) -> None:
+        if self._restoring:
+            return
         self.current = scene
         if scene is None:
             return self._render_empty_detail()
@@ -460,7 +582,9 @@ class MainWindow(QMainWindow):
             self.settings = dlg.result_settings()
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
+            self.act_crawl.setChecked(self.settings.crawl_enabled)
             self._load_sources()
+            self._apply_timers()
             self._load_cached()
             self.rescan_library()
             self.refresh()

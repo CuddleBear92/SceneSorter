@@ -33,6 +33,13 @@ your library.
   On start the app shows everything from the cache. A refresh fetches pages
   only until it reaches one with no new posts. Thumbnails are cached on disk,
   so each one is downloaded only once.
+- **Background caching.** A slow crawler walks every listing page of each
+  source until the whole site is in the local database. By default it sends
+  one request every 30 seconds, and you can change that in Settings. It
+  resumes where it stopped after a restart. On HTTP 429/503 it waits as long
+  as `Retry-After` says, and on other errors it backs off exponentially. Once a
+  source is fully cached, the app only checks for new posts, every 30 minutes by
+  default. Search and filters run on the local database, so they work offline.
 - **Release groups.** The group is detected from the release name, in forms
   like `…XXX.1080p.HEVC.x265.PRT`, `…MP4-GRP` and `[GRP]`, or from a
   `Group:` / `Filename:` line in the post. You can filter by group. Preferred

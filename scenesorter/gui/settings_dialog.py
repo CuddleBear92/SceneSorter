@@ -60,6 +60,15 @@ class SettingsDialog(QDialog):
         form.addRow("", self.refresh_start)
         self.max_pages = QSpinBox(minimum=1, maximum=100, value=settings.max_refresh_pages)
         form.addRow("Max pages per refresh", self.max_pages)
+        self.crawl = QCheckBox("Background caching: slowly fetch every page until the whole site is cached")
+        self.crawl.setChecked(settings.crawl_enabled)
+        form.addRow("", self.crawl)
+        self.crawl_interval = QSpinBox(minimum=5, maximum=3600, value=settings.crawl_interval_s, suffix=" s")
+        self.crawl_interval.setToolTip("Seconds between page requests while caching. Higher = gentler on the site.")
+        form.addRow("Seconds between page requests", self.crawl_interval)
+        self.auto_refresh = QSpinBox(minimum=0, maximum=1440, value=settings.auto_refresh_minutes, suffix=" min")
+        self.auto_refresh.setSpecialValueText("off")
+        form.addRow("Check for new posts every", self.auto_refresh)
         self.updates = QCheckBox("Check for updates on start")
         self.updates.setChecked(settings.check_updates_on_start)
         form.addRow("", self.updates)
@@ -133,6 +142,9 @@ class SettingsDialog(QDialog):
             check_updates_on_start=self.updates.isChecked(),
             refresh_on_start=self.refresh_start.isChecked(),
             max_refresh_pages=self.max_pages.value(),
+            crawl_enabled=self.crawl.isChecked(),
+            crawl_interval_s=self.crawl_interval.value(),
+            auto_refresh_minutes=self.auto_refresh.value(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
         )
