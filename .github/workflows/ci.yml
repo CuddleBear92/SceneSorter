@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  build-windows:
+    # Builds a test exe on every push so you can grab it from the run's artifacts.
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Stamp dev version
+        shell: bash
+        run: echo "__version__ = \"0.0.0-dev+${GITHUB_SHA::7}\"" > scenesorter/_version.py
+      - run: pyinstaller --noconfirm --onefile --windowed --name SceneSorter run.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SceneSorter-${{ github.sha }}
+          path: dist/SceneSorter.exe

@@ -1,0 +1,29 @@
+[project]
+name = "scenesorter"
+dynamic = ["version"]
+description = "Scene download manager and library sorter"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7",
+    "requests>=2.31",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyinstaller>=6.6"]
+
+[project.scripts]
+scenesorter = "scenesorter.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "scenesorter._version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["scenesorter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

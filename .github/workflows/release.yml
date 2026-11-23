@@ -1,0 +1,57 @@
+name: Release
+
+# Two ways to cut a release:
+#   * push a tag:      git tag v0.2.0 && git push origin v0.2.0
+#   * or Actions tab ▸ Release ▸ Run workflow, enter 0.2.0
+# Either way a GitHub Release is created with SceneSorter.exe attached,
+# which the in-app updater picks up.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME}"
+          fi
+          V="${V#v}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "__version__ = \"$V\"" > scenesorter/_version.py
+
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+      - run: pyinstaller --noconfirm --onefile --windowed --name SceneSorter run.py
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          gh release create "$TAG" dist/SceneSorter.exe \
+            --target "${{ github.sha }}" \
+            --title "SceneSorter $TAG" \
+            --generate-notes
