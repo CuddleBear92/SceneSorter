@@ -22,7 +22,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "7"
+PARSER_VERSION = "8"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -271,8 +271,13 @@ def parse_title(raw: str) -> dict:
         rest = _strip_tail(rest)
         title = rest  # performers can't be reliably separated from the title here
 
-    studio = re.sub(r"(?i)\.(com|net|xxx|tv)\s*$", "", studio.strip())
+    studio = studio.strip()
+    dom = re.search(r"(?i)\.(com|net|xxx|tv)\b", studio)
+    if dom:  # "18OnlyGirls.com Gina Gerson ..." -> "18OnlyGirls"
+        studio = studio[:dom.start()]
     studio = _title_case(_clean_spaces(re.sub(r"[._]", " ", studio)))
+    if not plausible_studio(studio):
+        studio = ""
     title = _clean_spaces(title)
     return {
         "studio": studio,
@@ -304,7 +309,38 @@ def _is_noise(inner: str) -> bool:
 
 def _split_performers(s: str) -> list[str]:
     parts = re.split(r"\s*(?:,|&|\band\b|\bwith\b|\bfeat\.?|\bft\.?)\s*", s, flags=re.I)
-    return [_clean_spaces(p) for p in parts if p and p.strip()]
+    return [p for p in (_clean_spaces(x) for x in parts if x and x.strip()) if plausible_performer(p)]
+
+
+_GENERIC_NAME_RE = re.compile(
+    r"(?i)^(?:scene|part|pt|episode|ep|vol|volume|chapter|chap|clip|cd|disc|disk|day|season|series|"
+    r"bonus|extra|bts|trailer|preview|compilation|interview|s\d+e\d+|e\d+|s\d+)\s*[#.\-]?\s*\d*$")
+
+
+def plausible_performer(name: str) -> bool:
+    """Reject things title parsing mistakes for performer names: "Scene 1", "Part 2",
+    "Episode 3", numbers, resolutions, domains, long phrases."""
+    n = name.strip()
+    if not n or not re.search(r"[A-Za-z]", n) or len(n) > 40 or len(n.split()) > 4:
+        return False
+    if _GENERIC_NAME_RE.match(n) or RESOLUTION_RE.search(n):
+        return False
+    if re.search(r"(?i)\.(com|net|xxx)\b|www\.|https?:", n):
+        return False
+    return sum(c.isdigit() for c in n) <= 2
+
+
+def plausible_studio(name: str) -> bool:
+    """Reject things title parsing mistakes for studios: bare numbers ("15", "174"), file or
+    catalogue codes ("080225-001-CARIB", "1903-Russia-1080p-H"), long phrases."""
+    n = name.strip()
+    if not n or not re.search(r"[A-Za-z]", n) or len(n) > 40 or len(n.split()) > 5:
+        return False
+    if RESOLUTION_RE.search(n) or re.search(r"[()\[\],]", n):
+        return False
+    if re.match(r"^\d{3,}(?![A-Za-z\d])", n):  # "080225-001-CARIB", "1903-…"; not "1000Facials"
+        return False
+    return True
 
 
 def tokens(s: str) -> list[str]:
@@ -344,13 +380,21 @@ def enrich(r: Release) -> Release:
     r.release_group = r.release_group or find_group(r.filename or "") or find_group(r.raw_title)
     if not r.resolution and r.filename:
         r.resolution = find_resolution(r.filename)
-    if r.filename and (not r.scene_date or not r.studio):
-        # Sites that post a plain title ("Compilation", "Veronika Lei") often carry the
-        # scene-style release name only as the file name. Its date matters a lot: without it,
-        # every "Compilation" from one studio looks like the same undated scene.
-        f = parse_title(VIDEO_EXT_RE.sub("", r.filename))
-        r.scene_date = r.scene_date or f["scene_date"]
-        r.studio = r.studio or f["studio"]
+    name_date = None
+    for name in (r.filename, r.raw_title):
+        if name and " - " not in name:
+            name_date, _span = find_date(VIDEO_EXT_RE.sub("", name))
+            if name_date:
+                break
+    if name_date and name_date != r.scene_date:
+        # The date in a scene-style release name ("Studio.26.11.23.Title...") is the release
+        # date and wins over a site's own date field, which can be off (and identical across a
+        # series) — otherwise posts attach to the wrong date or a whole series merges.
+        if r.scene_date:
+            before["scene_date"] = False   # now derived from the name, so re-parsable
+        r.scene_date = name_date
+    if r.filename and not r.studio:
+        r.studio = parse_title(VIDEO_EXT_RE.sub("", r.filename))["studio"]
     r.tags = clean_tags(r.tags, r.studio)
     filled = {f for f in TITLE_FIELDS if not before[f] and getattr(r, f)}
     r.parsed = sorted(set(r.parsed or []) | filled)

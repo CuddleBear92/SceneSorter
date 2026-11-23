@@ -188,6 +188,7 @@ class MainWindow(QMainWindow):
 
         self.thumbs = ThumbnailLoader(CACHE_DIR)
         QTimer.singleShot(5000, self.prune_image_cache)
+        QTimer.singleShot(3000, self._migrate_image_files)
         self._apply_image_headers()
         self.logos = LogoService(self.db, CACHE_DIR, self)
         self.logos.configure(settings.stashboxes)
@@ -444,6 +445,23 @@ class MainWindow(QMainWindow):
             if urls:
                 out[key] = urls
         return out
+
+    def _migrate_image_files(self) -> None:
+        """Once: give image files cached by older builds their real extension (.jpg/.png/.svg…)
+        instead of .img / none, and update the DB references to logos and photos."""
+        if self.db.get_meta("image_ext_migrated") == "1":
+            return
+        from .images import migrate_extensions
+        db = self.db
+
+        def job():
+            migrate_extensions(CACHE_DIR / "thumbs")
+            logos = migrate_extensions(CACHE_DIR / "logos")
+            photos = migrate_extensions(CACHE_DIR / "performers")
+            db.rename_image_files(logos, photos)
+            db.set_meta("image_ext_migrated", "1")
+            return len(logos) + len(photos)
+        run_async(job, on_done=lambda n: (self.logos.mem.__init__(300), self.perf_images.mem.__init__(200)))
 
     def prune_image_cache(self, max_mb: int | None = None) -> None:
         """Optional size limit for cached scene thumbnails (off by default: keep everything).

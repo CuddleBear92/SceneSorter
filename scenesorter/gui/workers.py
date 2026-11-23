@@ -116,10 +116,11 @@ class ThumbnailLoader(QObject):
         self.host_headers = headers
 
     def _cache_path(self, url: str) -> Path:
-        return self.cache_dir / (hashlib.sha1(url.encode()).hexdigest() + ".img")
+        """Base path (no extension); the file itself is saved with its real image extension."""
+        return self.cache_dir / hashlib.sha1(url.encode()).hexdigest()
 
     def get(self, key: str, urls: list[str]) -> QPixmap | None:
-        from .images import SCENE_SIZE, load_file, touch
+        from .images import SCENE_SIZE, find_cached, load_file, touch
 
         if key in self.mem:
             return self.mem.get(key)
@@ -128,8 +129,8 @@ class ThumbnailLoader(QObject):
         if key in self.pending or not urls:
             return None
         for url in urls:
-            p = self._cache_path(url)
-            if p.exists():
+            p = find_cached(self._cache_path(url))
+            if p is not None:
                 pm = load_file(p, SCENE_SIZE)
                 if pm is not None:
                     touch(p)
@@ -157,9 +158,9 @@ class ThumbnailLoader(QObject):
         data = bytes(reply.readAll())
         ok = reply.error() == QNetworkReply.NetworkError.NoError
         reply.deleteLater()
-        from .images import SCENE_SIZE, save_and_load
+        from .images import SCENE_SIZE, save_image
 
-        pm = save_and_load(self._cache_path(url), data, SCENE_SIZE) if ok and data else None
+        pm = save_image(self._cache_path(url), data, SCENE_SIZE)[0] if ok and data else None
         if pm is not None:
             self.mem.put(key, pm)
             self.pending.discard(key)

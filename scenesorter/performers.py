@@ -12,7 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from .models import Scene
-from .parsing import tokens
+from .parsing import plausible_performer, tokens
 
 
 def performer_key(name: str) -> str:
@@ -35,6 +35,8 @@ def collect(scenes: list[Scene], matches: dict[str, list[dict]]) -> tuple[dict[s
     def add(name: str, scene_key: str, source: str) -> None:
         k = performer_key(name)
         if not k or len(k) < 3:
+            return
+        if source != "stashbox" and not plausible_performer(name):  # "Scene 1", "Part 2", ...
             return
         e = perf.get(k)
         if e is None:

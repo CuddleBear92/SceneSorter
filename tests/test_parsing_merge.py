@@ -301,3 +301,46 @@ def test_compilation_series_across_two_sites():
                                        duration_s=3600 + (i % 5) * 20)))
     scenes = merge_releases(rels)
     assert len(scenes) == 60 and {len(s.releases) for s in scenes} == {4}
+
+
+def test_file_name_date_wins_over_site_date():
+    # The site's own date field said 11.09 for a file released 11.23.
+    r = enrich(Release("encodedfap", "x", "", "NebraskaCoeds.26.11.23.Veronika.Lei.XXX.1080p.HEVC.x265.PRT.mp4",
+                       studio="Nebraska Coeds", performers=["Veronika Lei"], scene_date=date(2026, 11, 9),
+                       filename="NebraskaCoeds.26.11.23.Veronika.Lei.XXX.1080p.HEVC.x265.PRT.mp4"))
+    assert r.scene_date == date(2026, 11, 23) and "scene_date" in r.parsed
+
+
+def test_site_dates_shared_by_a_series_do_not_merge_it():
+    rels = []
+    for i, d in enumerate(["25.09.04", "25.09.12", "26.11.23"]):
+        for res in ("1080p", "720p"):
+            n = f"ATKGirlfriends.{d}.Compilation.XXX.{res}.HEVC.x265.PRT"
+            rels.append(_blog(n, f"a{i}{res}"))
+            rels.append(enrich(Release("encodedfap", f"e{i}{res}", "", n + ".mp4", studio="ATK Girlfriends",
+                                       scene_date=date(2026, 1, 1), filename=n + ".mp4")))   # same site date for all
+    scenes = merge_releases(rels)
+    assert len(scenes) == 3 and {len(s.releases) for s in scenes} == {4}
+
+
+@pytest.mark.parametrize("raw", ["080225-001-CARIB", "1903-Russia-1080p-H", "15", "174",
+                                 "18OnlyGirls.com - Gina Gerson ( Good Vibrations ) 1080p"])
+def test_implausible_studios_rejected(raw):
+    st = parse_title(raw)["studio"]
+    assert st in ("", "18OnlyGirls")
+
+
+@pytest.mark.parametrize("name", ["1000Facials", "21Sextury", "18 Lust", "Tiny4K", "#Navarasa", "TeamSkeet Labs"])
+def test_real_studios_kept(name):
+    from scenesorter.parsing import plausible_studio
+    assert plausible_studio(name)
+
+
+def test_generic_performer_names_rejected():
+    from scenesorter.parsing import plausible_performer
+    for bad in ["Scene 1", "Part 2", "Episode 3", "Vol. 4", "S01E02", "1080p", "15", "www.site.com"]:
+        assert not plausible_performer(bad), bad
+    for good in ["Angela White", "Lily Lou", "Tyler D.", "Abigaiil Morris", "Alexis"]:
+        assert plausible_performer(good), good
+    p = parse_title("Studio - Jane Doe, Scene 2 - Some Title")
+    assert p["performers"] == ["Jane Doe"]

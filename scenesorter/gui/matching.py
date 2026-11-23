@@ -11,7 +11,7 @@ from PySide6.QtGui import QPixmap
 from ..db import Database
 from ..models import Scene
 from ..stashbox import StashBox, StashBoxConfig
-from .images import atomic_write, PORTRAIT_SIZE, PixmapLRU, load_file, shrink_for_disk
+from .images import atomic_write, ext_for, PORTRAIT_SIZE, PixmapLRU, load_file, shrink_for_disk
 from .workers import BackgroundQueue
 
 RECHECK_NOT_FOUND_S = 14 * 24 * 3600   # new scenes get added to stash-boxes; retry misses after 2 weeks
@@ -136,8 +136,9 @@ class PerformerImages(QObject):
             resp = b.session.get(row["image_url"], timeout=30)
             fname = None
             if resp.ok and resp.content:
-                fname = hashlib.sha1(row["image_url"].encode()).hexdigest()
-                atomic_write(self.dir / fname, shrink_for_disk(resp.content, PORTRAIT_SIZE))
+                out = shrink_for_disk(resp.content, PORTRAIT_SIZE)
+                fname = hashlib.sha1(row["image_url"].encode()).hexdigest() + ext_for(out)
+                atomic_write(self.dir / fname, out)
             return row["name"], row["endpoint"], row["stash_id"], row["image_url"], fname
         for b in self.boxes:
             p = b.find_performer(name)
@@ -147,8 +148,9 @@ class PerformerImages(QObject):
             if p["image_url"]:
                 resp = b.session.get(p["image_url"], timeout=30)
                 if resp.ok and resp.content:
-                    fname = hashlib.sha1(p["image_url"].encode()).hexdigest()
-                    atomic_write(self.dir / fname, shrink_for_disk(resp.content, PORTRAIT_SIZE))
+                    out = shrink_for_disk(resp.content, PORTRAIT_SIZE)
+                    fname = hashlib.sha1(p["image_url"].encode()).hexdigest() + ext_for(out)
+                    atomic_write(self.dir / fname, out)
             return p["name"], b.cfg.endpoint, p["id"], p["image_url"], fname
         return name, None, None, None, None
 

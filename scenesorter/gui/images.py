@@ -173,3 +173,70 @@ def shrink_for_disk(data: bytes, box: QSize) -> bytes:
         return data
     img = decode_scaled(data, box)
     return encode(img) if img is not None else data
+
+
+# ------------------------------------------------------------- file extensions
+IMAGE_EXTS = (".jpg", ".png", ".webp", ".gif", ".svg")
+LEGACY_EXTS = (".img", "")  # older builds: scene thumbnails as .img, logos/photos without extension
+
+
+def ext_for(data: bytes) -> str:
+    """Real file extension from the first bytes (so cached images open normally in Explorer)."""
+    head = data[:32]
+    if head.startswith(b"\xff\xd8"):
+        return ".jpg"
+    if head.startswith(b"\x89PNG"):
+        return ".png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head.startswith(b"GIF8"):
+        return ".gif"
+    if is_svg(data):
+        return ".svg"
+    return ".jpg"
+
+
+def find_cached(base: Path) -> Path | None:
+    """The cached file for ``base`` (a path without extension), whatever its extension."""
+    for ext in IMAGE_EXTS + LEGACY_EXTS:
+        p = base.with_name(base.name + ext)
+        if p.is_file():
+            return p
+    return None
+
+
+def save_image(base: Path, data: bytes, box: QSize) -> tuple[QPixmap | None, Path | None]:
+    """Downscale, store as ``base`` + real extension, return (pixmap, path)."""
+    img = decode_scaled(data, box)
+    if img is None:
+        return None, None
+    out = data if is_svg(data) else encode(img)
+    path = base.with_name(base.name + ext_for(out))
+    try:
+        atomic_write(path, out)
+    except OSError:
+        return QPixmap.fromImage(img), None
+    return QPixmap.fromImage(img), path
+
+
+def migrate_extensions(folder: Path) -> dict[str, str]:
+    """Rename files cached by older builds (.img / no extension) to their real extension.
+    Returns {old name: new name}."""
+    renamed: dict[str, str] = {}
+    if not folder.is_dir():
+        return renamed
+    for f in folder.iterdir():
+        if not f.is_file() or f.suffix.lower() in IMAGE_EXTS or f.name.endswith(".tmp"):
+            continue
+        try:
+            with open(f, "rb") as fh:
+                head = fh.read(300)
+            new = f.with_name(f.stem + ext_for(head)) if f.suffix else f.with_name(f.name + ext_for(head))
+            if new.exists():
+                f.unlink()
+            else:
+                os.replace(f, new)
+            renamed[f.name] = new.name
+        except OSError:
+            continue
+    return renamed

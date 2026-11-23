@@ -520,6 +520,14 @@ class Database:
             self.conn.execute("DELETE FROM scene_groups")
             self.conn.execute("DELETE FROM meta WHERE key='scene_cache_version'")
 
+    def rename_image_files(self, logos: dict[str, str], photos: dict[str, str]) -> None:
+        """Point studio/performer rows at renamed cache files ({old name: new name})."""
+        with self._lock:
+            self.conn.executemany("UPDATE studios SET logo_file=? WHERE logo_file=?",
+                                  [(new, old) for old, new in logos.items()])
+            self.conn.executemany("UPDATE performers SET image_file=? WHERE image_file=?",
+                                  [(new, old) for old, new in photos.items()])
+
     def studio_logo_files(self) -> dict[str, str]:
         with self._lock:
             return {r[0]: r[1] for r in self.conn.execute(

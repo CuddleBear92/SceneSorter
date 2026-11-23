@@ -62,3 +62,29 @@ def test_prune_oldest_first(tmp_path):
     left = sorted(int(p.stem) for p in tmp_path.iterdir())
     assert left == list(range(10 - len(left), 10))       # newest kept
     assert prune_cache([tmp_path], 0)[1] == 0             # "Clear image cache"
+
+
+def test_real_extensions_and_lookup(tmp_path):
+    from scenesorter.gui.images import ext_for, find_cached, save_image
+    assert ext_for(jpeg(10, 10)) == ".jpg"
+    assert ext_for(b"<svg xmlns='http://www.w3.org/2000/svg'/>") == ".svg"
+    pm, path = save_image(tmp_path / "abc", jpeg(1920, 1080), QSize(640, 360))
+    assert path.name == "abc.jpg" and pm.width() == 640
+    assert find_cached(tmp_path / "abc") == path
+    (tmp_path / "old.img").write_bytes(jpeg(10, 10))           # cached by an older build
+    assert find_cached(tmp_path / "old") == tmp_path / "old.img"
+
+
+def test_migrate_old_cache_files(tmp_path):
+    from scenesorter.db import Database
+    from scenesorter.gui.images import migrate_extensions
+    (tmp_path / "t1.img").write_bytes(jpeg(10, 10))
+    (tmp_path / "logo1").write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>")
+    (tmp_path / "ok.png").write_bytes(b"\x89PNG....")
+    renamed = migrate_extensions(tmp_path)
+    assert renamed == {"t1.img": "t1.jpg", "logo1": "logo1.svg"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["logo1.svg", "ok.png", "t1.jpg"]
+    db = Database(tmp_path / "s.db")
+    db.save_studio("brazzers", "Brazzers", "ep", "id", "http://x/logo", "logo1")
+    db.rename_image_files({"logo1": "logo1.svg"}, {})
+    assert db.studio("brazzers")["logo_file"] == "logo1.svg"

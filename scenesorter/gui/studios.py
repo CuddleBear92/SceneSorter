@@ -21,7 +21,7 @@ from ..db import Database
 from ..models import Scene
 from ..parsing import normalise_studio
 from ..stashbox import StashBox, StashBoxConfig
-from .images import atomic_write, LOGO_SIZE, PixmapLRU, load_file, shrink_for_disk
+from .images import atomic_write, ext_for, LOGO_SIZE, PixmapLRU, load_file, shrink_for_disk
 from .workers import run_async
 
 RETRY_NOT_FOUND_S = 30 * 24 * 3600
@@ -125,8 +125,9 @@ class LogoService(QObject):
             resp = box.session.get(row["logo_url"], timeout=30)
             fname = None
             if resp.ok and resp.content:
-                fname = hashlib.sha1(row["logo_url"].encode()).hexdigest()
-                atomic_write(self.dir / fname, shrink_for_disk(resp.content, LOGO_SIZE))
+                out = shrink_for_disk(resp.content, LOGO_SIZE)
+                fname = hashlib.sha1(row["logo_url"].encode()).hexdigest() + ext_for(out)
+                atomic_write(self.dir / fname, out)
             return key, row["name"], row["endpoint"], row["stash_id"], row["logo_url"], fname
         for box in self.boxes:
             m = box.find_studio(name)
@@ -136,8 +137,9 @@ class LogoService(QObject):
             if m.logo_url:
                 resp = box.session.get(m.logo_url, timeout=30)  # same session -> same ApiKey header
                 if resp.ok and resp.content:
-                    fname = hashlib.sha1(m.logo_url.encode()).hexdigest()
-                    atomic_write(self.dir / fname, shrink_for_disk(resp.content, LOGO_SIZE))
+                    out = shrink_for_disk(resp.content, LOGO_SIZE)
+                    fname = hashlib.sha1(m.logo_url.encode()).hexdigest() + ext_for(out)
+                    atomic_write(self.dir / fname, out)
             return key, m.name, m.endpoint, m.stash_id, m.logo_url, fname
         return key, name, None, None, None, None
 
