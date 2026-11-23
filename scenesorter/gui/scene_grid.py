@@ -113,6 +113,12 @@ class SceneListModel(QAbstractListModel):
         self._row = {s.key: i for i, s in enumerate(rows)}
         self.endResetModel()
 
+    def replace_rows(self, rows: list[Scene]) -> None:
+        """Same keys in the same order, newer objects: swap without a model reset."""
+        self.rows = rows
+        if rows:
+            self.dataChanged.emit(self.index(0), self.index(len(rows) - 1))
+
     def row_of(self, key: str) -> int | None:
         return self._row.get(key)
 

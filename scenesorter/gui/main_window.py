@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
-    QFileDialog, QMainWindow, QMessageBox, QPushButton, QTableWidget,
+    QFileDialog, QMainWindow, QMessageBox, QProgressBar, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -19,7 +19,10 @@ from ..config import CACHE_DIR, DATA_DIR, Settings
 from ..db import Database
 from ..downloader import DownloadManager, Job, State
 from ..library import scan_library, sort_into_library
-from ..merge import merge_releases
+from ..merge import (
+    MERGE_VERSION, cache_from_groups, group_rows, merge_incremental, merge_releases, studio_key,
+)
+from ..parsing import PARSER_VERSION
 from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
 from ..sources import RateLimited, Source, build_source
@@ -80,9 +83,14 @@ def compute_hidden(scenes: list[Scene], hidden_keys: set, hidden_posts: set, hid
             or any((r.source, r.post_id) in hidden_posts for r in s.releases)}
 
 
-def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tuple) -> dict:
-    """Everything a rebuild needs, computed on a worker thread."""
-    scenes = merge_releases(releases)
+SCENE_CACHE_VERSION = f"{PARSER_VERSION}:{MERGE_VERSION}"
+
+
+def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tuple,
+                   cache: dict | None = None, dirty: set | None = None, progress=None) -> dict:
+    """Everything a rebuild needs, computed on a worker thread. Only studios in ``dirty``
+    (or missing from ``cache``) are merged again; the rest reuse their cached scenes."""
+    scenes, new_cache, merged = merge_incremental(releases, cache, dirty, progress)
     groups: dict[str, int] = {}
     for r in releases:
         if r.release_group:
@@ -92,7 +100,44 @@ def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tupl
         for c in s.codecs:
             codecs[c] = codecs.get(c, 0) + 1
     return {"scenes": scenes, "status": compute_status(scenes, flags, pref),
-            "hidden": compute_hidden(scenes, *hidden), "groups": groups, "codecs": codecs}
+            "hidden": compute_hidden(scenes, *hidden), "groups": groups, "codecs": codecs,
+            "cache": new_cache, "merged": merged, "rows": group_rows(new_cache, merged)}
+
+
+class Progress(QObject):
+    """Thread-safe progress for long steps (loading, merging, filtering, performers).
+    ``report``/``done`` may be called from worker threads; the bar updates on the UI thread."""
+
+    _changed = Signal(str, str, int, int, bool)
+
+    def __init__(self, bar, label, parent=None):
+        super().__init__(parent)
+        self.bar, self.label = bar, label
+        self.phases: dict[str, tuple[str, int, int]] = {}
+        self._changed.connect(self._apply)
+
+    def report(self, key: str, text: str, done: int = 0, total: int = 0) -> None:
+        self._changed.emit(key, text, done, total, False)
+
+    def done(self, key: str) -> None:
+        self._changed.emit(key, "", 0, 0, True)
+
+    def _apply(self, key: str, text: str, done: int, total: int, finished: bool) -> None:
+        if finished:
+            self.phases.pop(key, None)
+        else:
+            self.phases[key] = (text, done, total)
+        if not self.phases:
+            self.bar.hide()
+            self.label.hide()
+            return
+        text, done, total = list(self.phases.values())[-1]   # most recently started step
+        self.bar.setRange(0, total if total else 0)           # 0..0 = busy indicator
+        if total:
+            self.bar.setValue(done)
+        self.label.setText(text)
+        self.bar.show()
+        self.label.show()
 
 
 class _JobBridge(QObject):
@@ -117,6 +162,8 @@ class MainWindow(QMainWindow):
         self._import_running = False
         self.draining = False          # closing/updating: start nothing new, let running work finish
         self.cache_loaded = False      # nothing is fetched until the cached posts are in memory
+        self._scene_cache: dict = {}   # studio key -> merged scenes (see merge.merge_incremental)
+        self._dirty_studios: set | None = None  # studios to re-merge; None = all
         self._close_ok = False
         self._refresh_page1_after: set[str] = set()
         self.fav = {"studio": self.db.favorites("studio"), "performer": self.db.favorites("performer")}
@@ -255,6 +302,8 @@ class MainWindow(QMainWindow):
         self.panes = [self.browse, self.have_pane]
         for pane in self.panes:
             pane.context_requested.connect(self._scene_menu)
+            pane.busy_changed.connect(lambda busy, p=pane: self.progress.report(
+                f"view{id(p)}", "Updating the scene list…") if busy else self.progress.done(f"view{id(p)}"))
         self.have_pane.count_changed.connect(lambda n: self.tabs.setTabText(1, f"Downloaded ({n})"))
         self.model.on_visible = self.matcher.visible
         self.model.fav_studios = set(self.fav["studio"])
@@ -293,6 +342,17 @@ class MainWindow(QMainWindow):
         self.QUEUE_TAB = 4
         self.setCentralWidget(self.tabs)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedWidth(160)
+        self.progress_bar.setMaximumHeight(14)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.hide()
+        self.progress_label = QLabel()
+        self.progress_label.setStyleSheet("color:#93c5fd")
+        self.progress_label.hide()
+        self.statusBar().addWidget(self.progress_bar)
+        self.statusBar().addWidget(self.progress_label)
+        self.progress = Progress(self.progress_bar, self.progress_label, self)
         self.status_label = QLabel()
         self.quota_label = QLabel()
         self.crawl_label = QLabel()
@@ -434,11 +494,14 @@ class MainWindow(QMainWindow):
         self._performers_running = True
         self._performers_dirty = False
         self._performers_at = time.time()
+        self.progress.report("performers", "Collecting performers…")
         run_async(collect_performers, list(self.scenes), dict(self.matches), on_done=self._performers_ready,
-                  on_fail=lambda _e: setattr(self, "_performers_running", False), pool="cpu")
+                  on_fail=lambda _e: (setattr(self, "_performers_running", False),
+                                      self.progress.done("performers")), pool="cpu")
 
     def _performers_ready(self, res) -> None:
         self._performers_running = False
+        self.progress.done("performers")
         if getattr(self, "_performers_dirty", False):
             self.perf_timer.start(60_000)
         perf, by_scene = res
@@ -602,13 +665,33 @@ class MainWindow(QMainWindow):
         sources = list(self.sources)
         db = self.db
 
-        def load():
-            db.reparse_if_needed(title_only)   # only after a parser upgrade; never touches source data
-            return db.load_releases(sources)
-        run_async(load, on_done=self._cache_ready, pool="cpu",
-                  on_fail=lambda e: self.status_label.setText(f"Couldn't load the cache: {e.splitlines()[0]}"))
+        progress = self.progress
 
-    def _cache_ready(self, rels) -> None:
+        def load():
+            progress.report("load", "Checking cached posts…", 0, 0)
+            db.reparse_if_needed(title_only)   # only after a parser upgrade; never touches source data
+            progress.report("load", "Loading posts from the local cache…", 0, 0)
+            rels = db.load_releases(sources)
+            progress.report("load", "Loading the scene cache…", 0, 0)
+            groups, stale = db.load_scene_groups(SCENE_CACHE_VERSION)
+            cache, dirty = cache_from_groups(rels, groups, stale) if groups else ({}, None)
+            return rels, cache, dirty
+        self.progress.report("load", "Loading posts from the local cache…", 0, 0)
+        run_async(load, on_done=self._cache_ready, pool="cpu",
+                  on_fail=lambda e: (self.progress.done("load"),
+                                     self.status_label.setText(f"Couldn't load the cache: {e.splitlines()[0]}")))
+
+    def reset_scene_cache(self) -> None:
+        """Settings ▸ Rebuild scene cache: forget the saved grouping and merge everything again."""
+        self.db.clear_scene_groups()
+        self._scene_cache = {}
+        self._dirty_studios = None
+        self.status_label.setText("Rebuilding the scene cache — merging every studio again…")
+        self._schedule_rebuild()
+
+    def _cache_ready(self, res) -> None:
+        rels, self._scene_cache, self._dirty_studios = res
+        self.progress.done("load")
         self.releases = {(r.source, r.post_id): r for r in rels}
         # The cached posts live as long as the app: move them out of the garbage collector's
         # way once (a full pass over them stalls every thread). Only done here, right after a
@@ -814,6 +897,8 @@ class MainWindow(QMainWindow):
             return
         self.fail_count[sid] = 0
         rels, new = rels
+        if self._dirty_studios is not None:
+            self._dirty_studios.update(studio_key(r) for r in rels)
         for r in rels:
             self.releases[(r.source, r.post_id)] = r
         if src.total_pages:
@@ -913,15 +998,35 @@ class MainWindow(QMainWindow):
         self._rebuild_started = time.time()
         snapshot = list(self.releases.values())
         hidden = (set(self.hidden_keys), set(self.hidden_posts), dict(self.hidden_studios))
+        dirty = None if self._dirty_studios is None else set(self._dirty_studios)
+        self._rebuilding_dirty = dirty
+        self._dirty_studios = set()          # changes from now on are picked up by the next rebuild
+        progress = self.progress
+
+        def prog(done, total):
+            progress.report("merge", f"Merging scenes: {done}/{total} studios", done, total)
+        progress.report("merge", "Merging scenes…", 0, 0)
         run_async(rebuild_bundle, snapshot, dict(self.flags), self.settings.preferred_resolution, hidden,
+                  dict(self._scene_cache), dirty, prog,
                   on_done=self._apply_rebuild, on_fail=lambda e: self._apply_rebuild(None, e), pool="cpu")
 
     def _apply_rebuild(self, bundle, err: str | None = None) -> None:
         self._rebuild_running = False
+        self.progress.done("merge")
         self._last_rebuild_s = time.time() - getattr(self, "_rebuild_started", time.time())
+        if bundle is None:
+            # failed: put back what this rebuild was supposed to merge
+            if self._rebuilding_dirty is None or self._dirty_studios is None:
+                self._dirty_studios = None
+            else:
+                self._dirty_studios |= self._rebuilding_dirty
         if bundle is not None:
             scenes = bundle["scenes"]
             self.scenes = scenes
+            self._scene_cache = bundle["cache"]
+            if bundle["merged"]:  # save the new grouping for next start (off the UI thread)
+                db, rows, merged = self.db, bundle["rows"], bundle["merged"]
+                run_async(db.save_scene_groups, rows, merged, SCENE_CACHE_VERSION)
             self.model.studio_names = self.db.studio_names()
             self.model.covers = self._covers()
             self.model.status, self.model.hidden = bundle["status"], bundle["hidden"]

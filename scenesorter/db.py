@@ -121,6 +121,17 @@ CREATE TABLE IF NOT EXISTS performers (
 -- Favourite studios / performers (kind = 'studio' | 'performer', key = normalised name)
 CREATE TABLE IF NOT EXISTS favorites (kind TEXT, key TEXT, name TEXT, added_at REAL, PRIMARY KEY (kind, key));
 
+-- Scene cache: which scene each post was merged into (rebuilt per studio as posts change).
+CREATE TABLE IF NOT EXISTS scene_groups (
+    source     TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    scene_key  TEXT NOT NULL,
+    studio_key TEXT NOT NULL,
+    cached_at  REAL,
+    PRIMARY KEY (source, post_id)
+);
+CREATE INDEX IF NOT EXISTS scene_groups_studio ON scene_groups(studio_key);
+
 -- Studio metadata/logos looked up on stash-box instances (cached forever).
 CREATE TABLE IF NOT EXISTS studios (
     key         TEXT PRIMARY KEY,   -- normalised studio name
@@ -469,6 +480,45 @@ class Database:
         with self._lock:
             rows = self.conn.execute("SELECT key, name FROM studios WHERE endpoint IS NOT NULL").fetchall()
         return {r["key"]: r["name"] for r in rows}
+
+    # ------------------------------------------------------------ scene cache
+    def load_scene_groups(self, version: str) -> tuple[dict[tuple[str, str], str], set[tuple[str, str]]]:
+        """(post -> scene key, posts changed since they were grouped). Empty if the cache
+        was made by a different parser/merge version."""
+        if self.get_meta("scene_cache_version") != version:
+            return {}, set()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT g.source, g.post_id, g.scene_key, p.last_seen > g.cached_at AS stale "
+                "FROM scene_groups g JOIN posts p ON p.source = g.source AND p.post_id = g.post_id").fetchall()
+        groups = {(r[0], r[1]): r[2] for r in rows}
+        stale = {(r[0], r[1]) for r in rows if r[3]}
+        return groups, stale
+
+    def save_scene_groups(self, rows: list[tuple[str, str, str, str]], studios: set[str], version: str) -> None:
+        """Replace the saved grouping for ``studios`` with ``rows``."""
+        now = time.time()
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                if self.get_meta("scene_cache_version") != version:
+                    self.conn.execute("DELETE FROM scene_groups")
+                else:
+                    self.conn.executemany("DELETE FROM scene_groups WHERE studio_key=?", [(s,) for s in studios])
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO scene_groups(source, post_id, scene_key, studio_key, cached_at) "
+                    "VALUES (?,?,?,?,?)", [(*r, now) for r in rows])
+                self.conn.execute("INSERT INTO meta(key, value) VALUES('scene_cache_version', ?) "
+                                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (version,))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    def clear_scene_groups(self) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM scene_groups")
+            self.conn.execute("DELETE FROM meta WHERE key='scene_cache_version'")
 
     def studio_keys_checked(self, max_age_s: float) -> set[str]:
         """Studios already looked up (matched, or not found within max_age_s)."""

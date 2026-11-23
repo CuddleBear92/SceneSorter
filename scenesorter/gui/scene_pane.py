@@ -6,6 +6,7 @@ view where it was (no jumping to the selected scene when new posts arrive).
 """
 from __future__ import annotations
 
+import time
 from typing import Callable
 
 from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, Qt, QTimer, Signal
@@ -65,6 +66,8 @@ class ScenePane(QSplitter):
     context_requested = Signal(list, QPoint)
     #: number of visible scenes after each update
     count_changed = Signal(int)
+    #: True while a background filter/sort pass is running (for the progress bar)
+    busy_changed = Signal(bool)
 
     def __init__(self, model: SceneModel, delegate: SceneDelegate,
                  render_detail: Callable[["ScenePane", Scene], None], have: str = "",
@@ -130,6 +133,7 @@ class ScenePane(QSplitter):
             self._again = True
             return
         self._running = True
+        self.busy_changed.emit(True)
         self._generation += 1
         gen = self._generation
         run_async(compute_view, self.model.scenes, self.filter.copy(), self.model.view_state(),
@@ -141,6 +145,8 @@ class ScenePane(QSplitter):
         if self._again:
             self._again = False
             self._compute()
+        else:
+            self.busy_changed.emit(False)
 
     def _apply(self, gen: int, rows: list[Scene]) -> None:
         if gen == self._generation:
@@ -149,14 +155,27 @@ class ScenePane(QSplitter):
 
     def _set_rows(self, rows: list[Scene]) -> None:
         """Swap in new rows without moving what the user is looking at."""
+        old = self.list.rows
+        if len(old) == len(rows) and all(a.key == b.key for a, b in zip(old, rows)):
+            # Same scenes in the same order (status/name/favourite updates): no reset at all,
+            # so the scroll position and selection can't move.
+            self.list.replace_rows(rows)
+            if self.current is not None:
+                self.current = self.list.rows[self.list.row_of(self.current.key)] \
+                    if self.list.row_of(self.current.key) is not None else self.current
+            self.count_changed.emit(len(rows))
+            return
+
         bar = self.grid.verticalScrollBar()
         at_top = bar.value() == 0
-        anchor_key, anchor_offset = None, 0
-        if not at_top:
+        anchor_key = anchor_offset = None
+        geo = None
+        if not at_top and old:
             top = self.grid.indexAt(QPoint(20, 20))
             if top.isValid():
                 anchor_key = top.data(SceneRole).key
                 anchor_offset = self.grid.visualRect(top).top()
+            geo = self._grid_geometry()
         selected = {i.data(SceneRole).key for i in self.grid.selectionModel().selectedIndexes()}
         current_key = self.current.key if self.current else None
 
@@ -173,17 +192,53 @@ class ScenePane(QSplitter):
             if row is not None:
                 self.current = rows[row]
                 sm.setCurrentIndex(self.list.index(row), QItemSelectionModel.SelectionFlag.NoUpdate)
-        if not at_top and anchor_key:
-            row = self.list.row_of(anchor_key)
-            if row is not None:
-                self.grid.doItemsLayout()  # positions are needed now, not on the next paint
-                idx = self.list.index(row)
-                self.grid.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtTop)
-                # put the anchor card back exactly where it was on screen
-                bar.setValue(bar.value() + self.grid.visualRect(idx).top() - anchor_offset)
         self.grid.setAutoScroll(True)
         self._restoring = False
+
+        if not at_top and anchor_key and geo:
+            row = self.list.row_of(anchor_key)
+            if row is not None:
+                # Cards are laid out in batches, so the anchor card may not have a position yet.
+                # Work out where it will be from the grid geometry and keep applying that until
+                # the layout has grown far enough (or the user scrolls themselves).
+                first_top, per_row, cell_h = geo
+                self._scroll_target = first_top + (row // per_row) * cell_h - anchor_offset
+                self._apply_scroll_target()
         self.count_changed.emit(len(rows))
+
+    def _grid_geometry(self) -> tuple[int, int, int] | None:
+        """(content y of the first card, cards per row, row height) of the current layout."""
+        if self.list.rowCount() < 2:
+            return None
+        bar = self.grid.verticalScrollBar()
+        r0 = self.grid.visualRect(self.list.index(0))
+        if not r0.isValid():
+            return None
+        per_row = 1
+        while per_row < min(self.list.rowCount(), 200) and \
+                self.grid.visualRect(self.list.index(per_row)).top() == r0.top():
+            per_row += 1
+        nxt = self.grid.visualRect(self.list.index(per_row)) if per_row < self.list.rowCount() else None
+        cell_h = (nxt.top() - r0.top()) if nxt is not None and nxt.isValid() else r0.height()
+        return r0.top() + bar.value(), per_row, max(1, cell_h)
+
+    def _apply_scroll_target(self) -> None:
+        """Keep putting the view where it belongs while batched layout catches up (max 3 s);
+        stops as soon as it's reached or the user scrolls themselves."""
+        t = getattr(self, "_scroll_target", None)
+        if t is None:
+            return
+        target, deadline, last = t if isinstance(t, tuple) else (t, time.time() + 3, None)
+        bar = self.grid.verticalScrollBar()
+        if last is not None and bar.value() != last:  # the user scrolled meanwhile: leave it
+            self._scroll_target = None
+            return
+        bar.setValue(target)
+        if bar.value() >= target or time.time() > deadline:
+            self._scroll_target = None
+        else:
+            self._scroll_target = (target, deadline, bar.value())
+            QTimer.singleShot(50, self._apply_scroll_target)
 
     # ------------------------------------------------------------ selection
     def _current_changed(self, cur: QModelIndex, _prev) -> None:

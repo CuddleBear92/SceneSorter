@@ -153,6 +153,17 @@ class SettingsDialog(QDialog):
         gl.addLayout(speed)
         v.addWidget(gaps)
         self._update_rescan_rows()
+
+        cache_box = QGroupBox("Scene cache")
+        cl = QHBoxLayout(cache_box)
+        cl.addWidget(QLabel("How posts were merged into scenes is cached, so starting up and new pages only "
+                            "re-merge the studios that changed. If scenes look wrongly merged or split, rebuild it."), 1)
+        rebuild = QPushButton("Rebuild scene cache")
+        rebuild.setEnabled(rescan is not None)
+        rebuild.clicked.connect(lambda: (self.rescan.reset_scene_cache(), rebuild.setText("Rebuilding…"),
+                                         rebuild.setEnabled(False)))
+        cl.addWidget(rebuild)
+        v.addWidget(cache_box)
         tabs.addTab(src, "Sources")
 
         # --- import folders + matching

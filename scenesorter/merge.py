@@ -236,3 +236,78 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
     scenes.sort(key=lambda s: (s.posted or s.scene_date or date.min), reverse=True)
     return scenes
 
+
+
+# ---------------------------------------------------------------- incremental
+# Every merge rule works within one studio (keys and fuzzy passes are per studio), so
+# merging each studio on its own gives exactly the same result as merging everything at
+# once. That lets a rebuild re-merge only the studios that got new/changed posts, and lets
+# the grouping be cached on disk between runs.
+
+#: Bump when merge rules change: cached groupings are then discarded and rebuilt.
+MERGE_VERSION = "1"
+
+
+def studio_key(r: Release) -> str:
+    return normalise_studio(r.studio) if r.studio else ""
+
+
+def _newest(s: Scene) -> date:
+    return s.posted or s.scene_date or date.min
+
+
+def merge_incremental(releases: Iterable[Release], cache: dict[str, list[Scene]] | None,
+                      dirty: set[str] | None, progress=None) -> tuple[list[Scene], dict[str, list[Scene]], set[str]]:
+    """Merge, reusing ``cache`` (studio key -> scenes) for studios not in ``dirty``.
+
+    ``dirty=None`` or ``cache=None`` means everything is merged. Returns
+    (all scenes newest first, new cache, studios that were merged).
+    ``progress(done, total)`` is called while merging.
+    """
+    by_studio: dict[str, list[Release]] = defaultdict(list)
+    for r in releases:
+        by_studio[studio_key(r)].append(r)
+    cache = cache or {}
+    todo = [k for k in by_studio if dirty is None or k in dirty or k not in cache]
+    todo_set = set(todo)
+    new_cache: dict[str, list[Scene]] = {}
+    for i, k in enumerate(todo):
+        new_cache[k] = merge_releases(by_studio[k])
+        if progress and (i % 200 == 0 or i == len(todo) - 1):
+            progress(i + 1, len(todo))
+    for k in by_studio:
+        if k not in todo_set:
+            new_cache[k] = cache[k]
+    scenes = [s for group in new_cache.values() for s in group]
+    scenes.sort(key=_newest, reverse=True)
+    return scenes, new_cache, todo_set
+
+
+def cache_from_groups(releases: Iterable[Release], groups: dict[tuple[str, str], str],
+                      stale: set[tuple[str, str]]) -> tuple[dict[str, list[Scene]], set[str]]:
+    """Rebuild the per-studio scene cache from a saved grouping (post -> scene key).
+
+    Studios with a post that has no saved group, or whose post changed since it was
+    grouped (``stale``), are returned as dirty and left out of the cache."""
+    by_studio: dict[str, list[Release]] = defaultdict(list)
+    for r in releases:
+        by_studio[studio_key(r)].append(r)
+    cache: dict[str, list[Scene]] = {}
+    dirty: set[str] = set()
+    for k, rels in by_studio.items():
+        scenes: dict[str, list[Release]] = {}
+        for r in rels:
+            ident = (r.source, r.post_id)
+            g = groups.get(ident)
+            if g is None or ident in stale:
+                dirty.add(k)
+                break
+            scenes.setdefault(g, []).append(r)
+        else:
+            cache[k] = [Scene(key=key, releases=rs) for key, rs in scenes.items()]
+    return cache, dirty
+
+
+def group_rows(cache: dict[str, list[Scene]], studios: Iterable[str]) -> list[tuple[str, str, str, str]]:
+    """(source, post_id, scene_key, studio_key) rows to save for the given studios."""
+    return [(r.source, r.post_id, s.key, k) for k in studios for s in cache.get(k, []) for r in s.releases]
