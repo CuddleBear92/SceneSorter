@@ -32,6 +32,16 @@ def _dark_palette(app: QApplication) -> None:
         "QCheckBox::indicator:hover { border-color: #9ca3af; }")
 
 
+def _flush_streams() -> None:
+    """Flush stdout/stderr if there are any — the windowed exe has no console, so both are None."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+
 def _setup_logging() -> None:
     """data/scenesorter.log (rotating, ~3 MB max): background failures and warnings, so a
     problem that only shows up on real data can be diagnosed instead of failing silently."""
@@ -53,7 +63,8 @@ def _setup_logging() -> None:
 
     def excepthook(et, ev, tb):  # exceptions in Qt slots end up here
         log.error("unhandled exception", exc_info=(et, ev, tb))
-        sys.__excepthook__(et, ev, tb)
+        if sys.stderr is not None:  # no console in the windowed exe
+            sys.__excepthook__(et, ev, tb)
     sys.excepthook = excepthook
     from . import __version__
     log.info("SceneSorter build %s starting", __version__)
@@ -107,6 +118,5 @@ def main(argv: list[str] | None = None) -> int:
 
     for p in [QThreadPool.globalInstance(), *_pools.values()]:
         p.waitForDone(1500)
-    sys.stdout.flush()
-    sys.stderr.flush()
+    _flush_streams()
     os._exit(rc)

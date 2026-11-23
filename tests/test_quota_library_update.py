@@ -131,3 +131,12 @@ def test_network_error_classification():
     assert is_network_error("Traceback ...\nrequests.exceptions.ConnectionError: ('Connection aborted.')")
     assert is_network_error("HTTPSConnectionPool(host='x'): Read timed out. (read timeout=30)")
     assert not is_network_error("500 Server Error: Internal Server Error for url: https://x/wp-json")
+
+
+def test_exit_flush_without_console(monkeypatch):
+    # The windowed exe has no console: sys.stdout / sys.stderr are None.
+    import sys
+    from scenesorter.app import _flush_streams
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    _flush_streams()  # must not raise
