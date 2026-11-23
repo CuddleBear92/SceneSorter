@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from functools import lru_cache
 from collections.abc import Iterable
 from datetime import date
 
 from .models import Release, Scene
-from .parsing import match_key, normalise_studio, tokens
+from .parsing import VIDEO_EXT_RE, match_key, normalise_studio, parse_title, tokens
 from .stashbox import duration_check
 
 FUZZY_THRESHOLD = 0.75
@@ -40,6 +41,33 @@ def same_scene_other_date(a: frozenset[str], b: frozenset[str], dur: str) -> boo
     return a == b and len(a) >= 6
 
 
+def titles_match(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Title words only (performer lists differ between sites). Used when the
+    runtime already agrees, so a looser bar is fine."""
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    return inter / len(a | b) >= 0.75 or (min(len(a), len(b)) >= 2 and inter == min(len(a), len(b)))
+
+
+def release_name_key(r: Release) -> str:
+    """Key from the scene-style release name alone (file name, else post title),
+    ignoring performers/titles a site supplies separately. '' if the name isn't
+    specific enough (needs studio, date and 2+ words)."""
+    return _name_key(r.filename or r.raw_title)
+
+
+@lru_cache(maxsize=200_000)
+def _name_key(name: str) -> str:
+    if not name or " - " in name:  # only scene-style dotted names are reliable for this
+        return ""
+    p = parse_title(VIDEO_EXT_RE.sub("", name))
+    words = tokens(" ".join(p["performers"]) + " " + p["title"])
+    if not (p["studio"] and p["scene_date"] and len(set(words)) >= 2):
+        return ""
+    return f"{normalise_studio(p['studio'])}|{p['scene_date'].isoformat()}|{' '.join(sorted(set(words)))}"
+
+
 def similar(a: frozenset[str], b: frozenset[str], strict: bool = False) -> bool:
     if not a or not b:
         return False
@@ -68,6 +96,7 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
         exact[match_key(r)].append(r)
 
     groups = list(exact.values())
+    keys = list(exact.keys())
     parent = list(range(len(groups)))
 
     def find(i: int) -> int:
@@ -75,6 +104,24 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             parent[i] = parent[parent[i]]
             i = parent[i]
         return i
+
+    # Release-name pass: the same release name (e.g. "SisLovesMe.26.11.21.Luna.
+    # Princess.XXX.1080p.HEVC.x265.PRT") on two sites is the same scene, even when
+    # one site adds performers or a different title the other doesn't have.
+    by_name: dict[str, int] = {}
+    for i, g in enumerate(groups):
+        for r in g:
+            # Plain scene-style post titles already produced exactly this key when
+            # grouping; only separate file names need parsing (cached across rebuilds).
+            if not r.filename:
+                k = keys[i] if (r.scene_date and r.studio and " - " not in r.raw_title) else ""
+            else:
+                k = release_name_key(r)
+            if not k:
+                continue
+            j = by_name.setdefault(k, i)
+            if find(i) != find(j):
+                parent[find(i)] = find(j)
 
     # Fuzzy pass, per studio:
     #   same date        -> normal word threshold
@@ -91,6 +138,7 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
         toks = {i: _body_tokens(groups[i][0]) for i in idxs}
         dates = {i: groups[i][0].scene_date for i in idxs}
         durs = {i: _duration(groups[i]) for i in idxs}
+        title_toks = {i: frozenset(t for r in groups[i] for t in tokens(r.title)) for i in idxs}
         by_date: dict[date, list[int]] = defaultdict(list)
         undated: list[int] = []
         for i in idxs:
@@ -100,8 +148,12 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             parent[find(j)] = find(i)
 
         def try_union(i: int, j: int, strict: bool) -> None:
-            if find(i) != find(j) and duration_check(durs[i], durs[j]) != "far" \
-                    and similar(toks[i], toks[j], strict):
+            if find(i) == find(j):
+                return
+            dur = duration_check(durs[i], durs[j])
+            if dur == "far":
+                return
+            if similar(toks[i], toks[j], strict) or (dur == "close" and titles_match(title_toks[i], title_toks[j])):
                 union(i, j)
 
         # Same date: buckets are tiny, compare all pairs.

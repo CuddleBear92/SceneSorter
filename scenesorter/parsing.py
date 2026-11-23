@@ -21,7 +21,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "4"
+PARSER_VERSION = "5"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -318,7 +318,10 @@ def clean_tags(tags: list[str], studio: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for t in tags:
-        key = "".join(tokens(t)) or t.lower()
+        words = tokens(t)
+        if not words:  # pure resolution/format tags like "1080p", "720p", "HEVC"
+            continue
+        key = "".join(words)
         if not t.strip() or key in seen or (st and normalise_studio(t) == st):
             continue
         seen.add(key)

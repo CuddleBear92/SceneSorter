@@ -171,3 +171,33 @@ def test_file_and_stashbox_match_either_date():
     cand = {"id": "x", "title": "Sensual Sex With Blue Haired Babe", "date": "2023-07-07", "studio": "Mr Lucky POV",
             "parent": "", "performers": [{"id": "e", "name": "Eve Marlowe"}], "image_url": None, "duration": 1770}
     assert pick_scene(s, [cand])["id"] == "x"
+
+
+def test_same_release_name_on_both_sites_merges():
+    from datetime import date
+    name = "SisLovesMe.26.11.21.Luna.Princess.XXX.{res}.HEVC.x265.PRT"
+    blog = [_r(name.format(res=res), "pornrips", f"p{res}", dur) for res, dur in (("1080p", 2957), ("720p", 2957))]
+    # the premium site supplies its own structured fields + a file name
+    prem = [enrich(Release("encodedfap", f"e{res}", "", "Luna Princess", studio="Sis Loves Me",
+                           scene_date=date(2026, 11, 21), performers=["Luna Lovehard", "Rion King"],
+                           title="Luna Princess", filename=name.format(res=res) + ".mp4", duration_s=2956))
+            for res in ("1080p", "720p")]
+    scenes = merge_releases(blog + prem)
+    assert len(scenes) == 1
+    assert scenes[0].sources == ["encodedfap", "pornrips"] and len(scenes[0].releases) == 4
+
+
+def test_same_day_matching_runtime_uses_title_words_only():
+    from datetime import date
+    a = _r("SisLovesMe.26.11.21.Luna.Princess.XXX.1080p.HEVC.x265.PRT", "a", "1", 2957)
+    b = enrich(Release("b", "2", "", "Luna Princess", studio="Sis Loves Me", scene_date=date(2026, 11, 21),
+                       performers=["Luna Lovehard", "Rion King"], title="Luna Princess", duration_s=2956))
+    assert len(merge_releases([a, b])) == 1
+    c = enrich(Release("b", "3", "", "Other Thing", studio="Sis Loves Me", scene_date=date(2026, 11, 21),
+                       performers=["Luna Lovehard"], title="Other Thing", duration_s=2956))
+    assert len(merge_releases([a, c])) == 2      # same day + runtime but a different title
+
+
+def test_resolution_tags_dropped():
+    r = enrich(Release("b", "1", "", "Studio.24.01.15.Jane.XXX.1080p.MP4-PRT", tags=["1080p", "720p", "HEVC", "POV"]))
+    assert r.tags == ["POV"]
