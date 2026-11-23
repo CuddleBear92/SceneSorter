@@ -15,6 +15,7 @@ Supported shapes (case-insensitive, mixed separators are fine):
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 import unicodedata
 from datetime import date
 
@@ -58,6 +59,8 @@ DATE_PATTERNS = [
 
 
 def strip_accents(s: str) -> str:
+    if s.isascii():  # nearly every release name: skip the (slow) per-character Unicode pass
+        return s
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
@@ -168,6 +171,29 @@ def extract_post_metadata(text: str) -> dict:
     if grp:
         out["release_group"] = canon_group(grp.split()[0])
     return out
+
+
+CODEC_PATTERNS = [
+    ("HEVC", re.compile(r"(?<![a-z0-9])(hevc|x\.?265|h\.?265)(?![a-z0-9])", re.I)),
+    ("AV1", re.compile(r"(?<![a-z0-9])av1(?![a-z0-9])", re.I)),
+    ("AVC", re.compile(r"(?<![a-z0-9])(avc|x\.?264|h\.?264)(?![a-z0-9])", re.I)),
+    ("VP9", re.compile(r"(?<![a-z0-9])vp9(?![a-z0-9])", re.I)),
+    ("MPEG-2", re.compile(r"(?<![a-z0-9])(mpeg-?2|mpg2)(?![a-z0-9])", re.I)),
+    ("VC-1", re.compile(r"(?<![a-z0-9])(vc-?1|wmv)(?![a-z0-9])", re.I)),
+    ("XviD", re.compile(r"(?<![a-z0-9])(xvid|divx)(?![a-z0-9])", re.I)),
+]
+
+
+def find_codec(*texts: str) -> str:
+    """Video codec named in a release name / file name / tag, normalised:
+    HEVC (x265/h265), AVC (x264/h264), AV1, VP9, MPEG-2, VC-1 (WMV), XviD. '' if none."""
+    for text in texts:
+        if not text:
+            continue
+        for name, rx in CODEC_PATTERNS:
+            if rx.search(text):
+                return name
+    return ""
 
 
 def find_date(text: str) -> tuple[date | None, tuple[int, int] | None]:
@@ -283,6 +309,7 @@ def tokens(s: str) -> list[str]:
     return [t for t in toks if t and t not in NOISE_TOKENS and t not in JOINERS and not RESOLUTION_RE.fullmatch(t)]
 
 
+@lru_cache(maxsize=200_000)
 def normalise_studio(s: str) -> str:
     s = re.sub(r"(?i)[ .](com|net|xxx|tv)$", "", s.strip())
     return "".join(tokens(s))

@@ -130,6 +130,15 @@ your library.
   Browse.
 - **Torrent black hole.** Set a folder and `.torrent` files are saved there for
   your client's watch folder. Magnets can optionally be saved as `.magnet` files.
+- **Smooth with large libraries.** Merging, filtering, sorting, status and
+  studio counts all run on worker threads, and the window only swaps in
+  finished lists. New posts no longer move what you're looking at: the card at
+  the top of the view stays put. Click empty space, click the selected card
+  again, or press Esc to deselect.
+- **Sorting and codec filter.** Sort by newest posted (the default), scene
+  date, studio A–Z (newest first within each studio), title or length. Filter
+  by video codec (HEVC, AVC, AV1, VP9, …), read from the release name, file
+  name or tags.
 - **Bounded memory.** Images are decoded straight to display size, so a
   4000 px portrait never sits in memory at full size. Only the most recently
   used few hundred of each kind are kept in memory. The disk cache stores

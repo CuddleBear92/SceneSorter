@@ -9,12 +9,12 @@ from PySide6.QtWidgets import (
 
 from ..performers import PerformerEntry
 from .matching import PerformerImages
-from .studios import StudioEntry, StudioFilter, StudioRole, paint_star
+from .studios import FilteredList, StudioEntry, StudioRole, paint_star
 
 CARD_W, PHOTO_H, TEXT_H = 160, 210, 46
 
 
-class PerformerModel(QAbstractListModel):
+class PerformerModel(FilteredList, QAbstractListModel):
     def __init__(self, images: PerformerImages, parent=None):
         super().__init__(parent)
         self.images = images
@@ -25,12 +25,9 @@ class PerformerModel(QAbstractListModel):
         images.ready.connect(self._ready)
 
     def set_performers(self, perf: dict[str, PerformerEntry], has) -> None:
-        self.beginResetModel()
-        self.items = sorted((StudioEntry(e.key, e.name, len(e.scenes), sum(1 for k in e.scenes if has(k)))
-                             for e in perf.values()), key=lambda e: e.name.lower())
         self.sources = {e.key: e.sources for e in perf.values()}
-        self._row = {e.key: i for i, e in enumerate(self.items)}
-        self.endResetModel()
+        self.set_items([StudioEntry(e.key, e.name, len(e.scenes), sum(1 for k in e.scenes if has(k)))
+                        for e in perf.values()])
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.items)
@@ -90,7 +87,7 @@ class PerformerDelegate(QStyledItemDelegate):
             p.setPen(QColor("#374151"))
             p.drawText(photo, Qt.AlignmentFlag.AlignCenter, initials)
         p.setClipping(False)
-        paint_star(p, r, e.key in index.model().sourceModel().favorites)
+        paint_star(p, r, e.key in index.model().favorites)
         text = QRect(r.left() + 8, photo.bottom() + 4, r.width() - 16, TEXT_H)
         f = QFont(opt.font)
         f.setBold(True)
@@ -114,8 +111,7 @@ class PerformersTab(QWidget):
         super().__init__(parent)
         self.images = images
         self.model = PerformerModel(images)
-        self.proxy = StudioFilter()
-        self.proxy.setSourceModel(self.model)
+        self.proxy = self.model  # filtering/sorting lives in the model (FilteredList)
         top = QHBoxLayout()
         self.search = QLineEdit(placeholderText="Filter performers…")
         self.search.setClearButtonEnabled(True)

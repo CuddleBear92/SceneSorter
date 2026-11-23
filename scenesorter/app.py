@@ -32,6 +32,14 @@ def _dark_palette(app: QApplication) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Heavy work (merging, filtering, matching) runs on worker threads. With Python's
+    # default 5 ms GIL switch interval, every small Qt->Python callback on the UI thread
+    # can wait that long for the lock, and thousands of them add up to visible stutter.
+    sys.setswitchinterval(0.0005)
+    # Fewer, cheaper collections: the app holds a lot of long-lived data (see gc.freeze() in
+    # MainWindow), and young-generation passes are what keep the UI responsive.
+    import gc
+    gc.set_threshold(50_000, 50, 100)
     from .gui.main_window import MainWindow
 
     app = QApplication(argv if argv is not None else sys.argv)

@@ -1,6 +1,7 @@
 """Main application window."""
 from __future__ import annotations
 
+import gc
 import time
 import webbrowser
 from pathlib import Path
@@ -34,6 +35,7 @@ from ..importer import scan as scan_files
 from ..performers import collect as collect_performers
 from ..status import VERIFIED
 from ..stashbox import duration_check
+from ..views import SORTS
 from .workers import ThumbnailLoader, run_async
 from .encodedfap_login import EncodedFapLoginDialog
 
@@ -48,6 +50,36 @@ def fmt_bytes(n: float | None) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+def compute_status(scenes: list[Scene], flags: dict, preferred_resolution: str) -> dict[str, str]:
+    out = {}
+    for s in scenes:
+        st = scene_status(s, flags, preferred_resolution)
+        if st != "none":
+            out[s.key] = st
+    return out
+
+
+def compute_hidden(scenes: list[Scene], hidden_keys: set, hidden_posts: set, hidden_studios) -> set[str]:
+    return {s.key for s in scenes
+            if s.key in hidden_keys or normalise_studio(s.studio) in hidden_studios
+            or any((r.source, r.post_id) in hidden_posts for r in s.releases)}
+
+
+def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tuple) -> dict:
+    """Everything a rebuild needs, computed on a worker thread."""
+    scenes = merge_releases(releases)
+    groups: dict[str, int] = {}
+    for r in releases:
+        if r.release_group:
+            groups[r.release_group] = groups.get(r.release_group, 0) + 1
+    codecs: dict[str, int] = {}
+    for s in scenes:
+        for c in s.codecs:
+            codecs[c] = codecs.get(c, 0) + 1
+    return {"scenes": scenes, "status": compute_status(scenes, flags, pref),
+            "hidden": compute_hidden(scenes, *hidden), "groups": groups, "codecs": codecs}
 
 
 class _JobBridge(QObject):
@@ -147,6 +179,17 @@ class MainWindow(QMainWindow):
         self.group_box.currentIndexChanged.connect(
             lambda _i: self._set_filter(group=self.group_box.currentData() or ""))
         tb.addWidget(self.group_box)
+        self.codec_box = QComboBox()
+        self.codec_box.addItem("All codecs", "")
+        self.codec_box.setToolTip("Video codec, from the release name, file name or tags")
+        self.codec_box.currentIndexChanged.connect(
+            lambda _i: self._set_filter(codec=self.codec_box.currentData() or ""))
+        tb.addWidget(self.codec_box)
+        self.sort_box = QComboBox()
+        for key, label in SORTS.items():
+            self.sort_box.addItem(f"Sort: {label}", key)
+        self.sort_box.currentIndexChanged.connect(lambda _i: self._set_filter(sort=self.sort_box.currentData()))
+        tb.addWidget(self.sort_box)
         self.have_box = QComboBox()
         for label, mode in (("Downloaded or not", ""), ("Still wanted", "missing"),
                             ("Grabbed / partial", "partial"), ("Downloaded", "have")):
@@ -195,7 +238,7 @@ class MainWindow(QMainWindow):
         self.panes = [self.browse, self.have_pane]
         for pane in self.panes:
             pane.context_requested.connect(self._scene_menu)
-        self.model.status_changed.connect(self._update_tab_counts)
+        self.have_pane.count_changed.connect(lambda n: self.tabs.setTabText(1, f"Downloaded ({n})"))
         self.model.on_visible = self.matcher.visible
         self.model.fav_studios = set(self.fav["studio"])
         self.model.fav_performers = set(self.fav["performer"])
@@ -288,7 +331,7 @@ class MainWindow(QMainWindow):
         self.model.fav_performers = set(self.fav["performer"])
         self.studios.set_favorites(set(self.fav["studio"]))
         self.performers_tab.set_favorites(set(self.fav["performer"]))
-        self.model.set_status()  # repaint + refilter
+        self.model.names_changed()  # repaint + refilter
         for pane in self.panes:
             pane.refresh_detail()
         self.status_label.setText(f"{'★ Added' if on else 'Removed'} {name} {'to' if on else 'from'} favorites")
@@ -354,6 +397,7 @@ class MainWindow(QMainWindow):
         perf, by_scene = res
         self.model.scene_performers = by_scene
         self.model.performer_names = {k: e.name for k, e in perf.items()}
+        self.model.names_changed()
         self.performers_tab.set_performers(perf, self.model.has, bool(self.perf_images.boxes))
         if self.performer_filter[0]:
             self._set_filter(performer=self.performer_filter[0])
@@ -458,11 +502,6 @@ class MainWindow(QMainWindow):
         if key == self.studio_filter[0]:
             self._update_studio_chip()
 
-    def _update_tab_counts(self) -> None:
-        n = sum(1 for s in self.scenes if self.model.state(s.key) != "none" and s.key not in self.model.hidden)
-        self.tabs.setTabText(1, f"Downloaded ({n})")
-
-    # -------------------------------------------------------------- sources
     def _load_sources(self) -> None:
         self.sources.clear()
         for cfg in self.settings.sources:
@@ -510,6 +549,7 @@ class MainWindow(QMainWindow):
     def _load_cached(self) -> None:
         """Show everything already in the local DB without touching the network."""
         self.releases = {(r.source, r.post_id): r for r in self.db.load_releases(list(self.sources))}
+        gc.freeze()
         self._rebuild()
         self.status_label.setText(f"{len(self.releases)} posts loaded from the local cache")
 
@@ -530,11 +570,14 @@ class MainWindow(QMainWindow):
         if mode == "refresh":
             self.status_label.setText(f"Checking {src.display_name} for new posts (page {page})…")
 
-        def job():
+        db = self.db
+
+        def job():  # network + DB write both off the UI thread
             try:
-                return src.list_page(page)
+                rels = src.list_page(page)
             except RateLimited as e:
                 return e
+            return rels, (db.upsert_releases(rels) if rels else 0)
 
         run_async(job, on_done=lambda res: self._page_loaded(sid, page, res, mode),
                   on_fail=lambda err: self._page_failed(sid, page, err))
@@ -667,7 +710,7 @@ class MainWindow(QMainWindow):
             self._update_crawl_label()
             return
         self.fail_count[sid] = 0
-        new = self.db.upsert_releases(rels) if rels else 0
+        rels, new = rels
         for r in rels:
             self.releases[(r.source, r.post_id)] = r
         if src.total_pages:
@@ -750,24 +793,30 @@ class MainWindow(QMainWindow):
         self._rebuild_dirty = False
         self._rebuild_started = time.time()
         snapshot = list(self.releases.values())
-        run_async(merge_releases, snapshot, on_done=self._apply_rebuild,
-                  on_fail=lambda e: self._apply_rebuild(None, e))
+        hidden = (set(self.hidden_keys), set(self.hidden_posts), dict(self.hidden_studios))
+        run_async(rebuild_bundle, snapshot, dict(self.flags), self.settings.preferred_resolution, hidden,
+                  on_done=self._apply_rebuild, on_fail=lambda e: self._apply_rebuild(None, e))
 
-    def _apply_rebuild(self, scenes, err: str | None = None) -> None:
+    def _apply_rebuild(self, bundle, err: str | None = None) -> None:
         self._rebuild_running = False
         self._last_rebuild_s = time.time() - getattr(self, "_rebuild_started", time.time())
-        if scenes is not None:
+        if bundle is not None:
+            scenes = bundle["scenes"]
             self.scenes = scenes
             self.model.studio_names = self.db.studio_names()
             self.model.covers = self._covers()
-            self.model.status, self.model.hidden = self._scene_status(), self._hidden_scene_keys()
+            self.model.status, self.model.hidden = bundle["status"], bundle["hidden"]
             self.model.set_scenes(scenes, set(self.owned))
-            self._update_group_box()
-            self._update_tab_counts()
+            self._update_group_box(bundle["groups"])
+            self._update_codec_box(bundle["codecs"])
             self.studios.set_scenes(scenes, self.model.has, bool(self.logos.boxes))
             self.studios.set_hidden(set(self.hidden_studios))
             self._drop_bad_matches()
             self.matcher.prefetch(scenes)
+            # Long-lived data: keep the garbage collector from re-walking it (a full pass over
+            # millions of objects stops every thread, UI included, for seconds). It has no
+            # reference cycles, so it's still freed normally when replaced.
+            gc.freeze()
             self.perf_timer.start()
         elif err:
             self.status_label.setText(f"Merge failed: {err.splitlines()[0]}")
@@ -775,38 +824,28 @@ class MainWindow(QMainWindow):
             self._schedule_rebuild()
 
     # ------------------------------------------------------- status/hidden
-    def _scene_status(self) -> dict[str, str]:
-        pref = self.settings.preferred_resolution
-        out = {}
-        for s in self.scenes:
-            st = scene_status(s, self.flags, pref)
-            if st != "none":
-                out[s.key] = st
-        return out
-
-    def _hidden_scene_keys(self) -> set[str]:
-        hs = self.hidden_studios
-        return {s.key for s in self.scenes
-                if s.key in self.hidden_keys or normalise_studio(s.studio) in hs
-                or any((r.source, r.post_id) in self.hidden_posts for r in s.releases)}
 
     def _scene_hidden(self, s: Scene) -> bool:
         """Hidden as a scene (not just because its studio is hidden)."""
         return s.key in self.hidden_keys or any((r.source, r.post_id) in self.hidden_posts for r in s.releases)
 
     def _flags_changed(self) -> None:
+        """Download flags changed: recompute every scene's status off the UI thread."""
         self.flags = self.db.flags()
-        self.model.set_status(status=self._scene_status())
-        for pane in self.panes:
-            pane.refresh_detail()
-        self._update_tab_counts()
-        self.studios.set_scenes(self.scenes, self.model.has, bool(self.logos.boxes))
+
+        def apply(status):
+            self.model.set_status(status=status)
+            for pane in self.panes:
+                pane.refresh_detail()
+            self.studios.set_scenes(self.scenes, self.model.has, bool(self.logos.boxes))
+        run_async(compute_status, self.scenes, dict(self.flags), self.settings.preferred_resolution,
+                  on_done=apply)
 
     def _hidden_changed(self) -> None:
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
-        self.model.set_status(hidden=self._hidden_scene_keys())
         self.studios.set_hidden(set(self.hidden_studios))
-        self._update_tab_counts()
+        run_async(compute_hidden, self.scenes, set(self.hidden_keys), set(self.hidden_posts),
+                  dict(self.hidden_studios), on_done=lambda h: self.model.set_status(hidden=h))
 
     def mark_downloaded(self, releases: list[Release], on: bool) -> None:
         """User action: flag releases as done, or clear their flags (= wanted again)."""
@@ -874,12 +913,18 @@ class MainWindow(QMainWindow):
             menu.addAction("Open post in browser", lambda: webbrowser.open(one.primary.post_url))
         menu.exec(pos)
 
-    def _update_group_box(self) -> None:
+    def _update_codec_box(self, counts: dict[str, int]) -> None:
+        current = self.codec_box.currentData() or ""
+        self.codec_box.blockSignals(True)
+        self.codec_box.clear()
+        self.codec_box.addItem("All codecs", "")
+        for c in sorted(counts, key=lambda c: -counts[c]):
+            self.codec_box.addItem(f"{c} ({counts[c]})", c)
+        self.codec_box.setCurrentIndex(max(self.codec_box.findData(current), 0))
+        self.codec_box.blockSignals(False)
+
+    def _update_group_box(self, counts: dict[str, int]) -> None:
         current = self.group_box.currentData() or ""
-        counts: dict[str, int] = {}
-        for r in self.releases.values():
-            if r.release_group:
-                counts[r.release_group] = counts.get(r.release_group, 0) + 1
         prefs = [g for g in self.settings.preferred_groups if g in counts]
         others = sorted((g for g in counts if g not in prefs), key=lambda g: -counts[g])
         self.group_box.blockSignals(True)
@@ -1067,7 +1112,8 @@ class MainWindow(QMainWindow):
         grp = rel.release_group or "?"
         grp_html = (f"<span style='color:#f59e0b'><b>{grp}</b></span>"
                     if grp in self.settings.preferred_groups else grp)
-        lbl = QLabel(f"<b>{rel.resolution or '?'}</b> · {grp_html} — {name}"
+        codec = f" · {rel.codec}" if rel.codec else ""
+        lbl = QLabel(f"<b>{rel.resolution or '?'}</b> · {grp_html}{codec} — {name}"
                      f"{' · ' + fmt_bytes(rel.size_bytes) if rel.size_bytes else ''}{quota_txt}")
         lbl.setToolTip(rel.raw_title)
         h.addWidget(lbl, 1)

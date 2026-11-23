@@ -1,12 +1,13 @@
 """Grid of scene cards: model, filter proxy and painting delegate."""
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from ..models import Scene
 from ..parsing import normalise_studio as studio_key
+from ..views import ViewState
 from .workers import ThumbnailLoader
 
 SceneRole = Qt.ItemDataRole.UserRole + 1
@@ -15,12 +16,19 @@ CARD_W, THUMB_H, TEXT_H = 260, 146, 74
 SOURCE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6"]
 
 
-class SceneModel(QAbstractListModel):
-    status_changed = Signal()
+class SceneModel(QObject):
+    """Shared scene store for every pane: the full scene list plus everything the
+    cards need to know (download state, hidden, names, favourites). Panes keep
+    their own filtered/sorted list (see SceneListModel) computed off the UI thread."""
+
+    scenes_changed = Signal()   # new scene list -> panes recompute
+    status_changed = Signal()   # state/hidden/names changed -> panes refilter + repaint
+    repaint = Signal(str)       # one scene key ("" = all) needs repainting
 
     def __init__(self, thumbs: ThumbnailLoader, parent=None):
         super().__init__(parent)
         self.scenes: list[Scene] = []
+        self.by_key: dict[str, Scene] = {}
         self.owned: set[str] = set()          # scene keys found in the library on disk
         self.status: dict[str, str] = {}      # scene key -> grabbed / partial / complete (see status.py)
         self.hidden: set[str] = set()         # scene keys hidden by the user (scene or studio blacklist)
@@ -32,32 +40,40 @@ class SceneModel(QAbstractListModel):
         self.fav_performers: set[str] = set()
         self.on_visible = None  # callback(scene) when a card is painted (drives on-screen-first matching)
         self.thumbs = thumbs
-        self._row_by_key: dict[str, int] = {}
-        thumbs.loaded.connect(self._thumb_ready)
 
     def set_scenes(self, scenes: list[Scene], owned: set[str] | None = None) -> None:
-        self.beginResetModel()
         self.scenes = scenes
+        self.by_key = {s.key: s for s in scenes}
         if owned is not None:
             self.owned = owned
-        self._row_by_key = {s.key: i for i, s in enumerate(scenes)}
-        self.endResetModel()
+        self.scenes_changed.emit()
 
     def set_status(self, owned: set[str] | None = None, status: dict[str, str] | None = None,
                    hidden: set[str] | None = None) -> None:
-        """Update marks without resetting the view."""
+        """Update marks (panes refilter in the background and repaint)."""
         if owned is not None:
             self.owned = owned
         if status is not None:
             self.status = status
         if hidden is not None:
             self.hidden = hidden
-        self.repaint_all()
         self.status_changed.emit()
+        self.repaint.emit("")
+
+    def names_changed(self) -> None:
+        """Studio/performer names or favourites changed: refilter (search/filters use them)."""
+        self.status_changed.emit()
+        self.repaint.emit("")
 
     def repaint_all(self) -> None:
-        if self.scenes:
-            self.dataChanged.emit(self.index(0), self.index(len(self.scenes) - 1))
+        self.repaint.emit("")
+
+    def refresh_row(self, key: str) -> None:
+        self.repaint.emit(key)
+
+    def view_state(self) -> ViewState:
+        return ViewState(self.owned, self.status, self.hidden, self.studio_names, self.scene_performers,
+                         self.performer_names, self.fav_studios, self.fav_performers)
 
     def state(self, key: str) -> str:
         """'complete' (incl. found in library), 'partial', 'grabbed' or 'none'."""
@@ -72,12 +88,6 @@ class SceneModel(QAbstractListModel):
         """The post's own thumbnails first, then stash-box covers as a fallback."""
         return s.thumbnail_urls + [u for u in self.covers.get(s.key, []) if u not in s.thumbnail_urls]
 
-    def refresh_row(self, key: str) -> None:
-        row = self._row_by_key.get(key)
-        if row is not None:
-            idx = self.index(row)
-            self.dataChanged.emit(idx, idx)
-
     def is_favorite(self, s: Scene) -> bool:
         return (bool(s.studio) and studio_key(s.studio) in self.fav_studios) or \
             any(k in self.fav_performers for k in self.scene_performers.get(s.key, ()))
@@ -85,87 +95,54 @@ class SceneModel(QAbstractListModel):
     def display_studio(self, s: Scene) -> str:
         return self.studio_names.get(studio_key(s.studio), s.studio) if s.studio else ""
 
+
+class SceneListModel(QAbstractListModel):
+    """One pane's visible scenes (already filtered and sorted)."""
+
+    def __init__(self, store: SceneModel, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.rows: list[Scene] = []
+        self._row: dict[str, int] = {}
+        store.repaint.connect(self._repaint)
+        store.thumbs.loaded.connect(lambda key, _pm: self._repaint(key))
+
+    def set_rows(self, rows: list[Scene]) -> None:
+        self.beginResetModel()
+        self.rows = rows
+        self._row = {s.key: i for i, s in enumerate(rows)}
+        self.endResetModel()
+
+    def row_of(self, key: str) -> int | None:
+        return self._row.get(key)
+
+    def _repaint(self, key: str) -> None:
+        if not self.rows:
+            return
+        if not key:
+            self.dataChanged.emit(self.index(0), self.index(len(self.rows) - 1))
+        elif (row := self._row.get(key)) is not None:
+            idx = self.index(row)
+            self.dataChanged.emit(idx, idx)
+
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
-        return 0 if parent.isValid() else len(self.scenes)
+        return 0 if parent.isValid() else len(self.rows)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
+        if not index.isValid() or index.row() >= len(self.rows):
             return None
-        s = self.scenes[index.row()]
+        s = self.rows[index.row()]
         if role == SceneRole:
             return s
         if role == Qt.ItemDataRole.DisplayRole:
             return s.title
         if role == Qt.ItemDataRole.DecorationRole:
-            if self.on_visible:
-                self.on_visible(s)
-            return self.thumbs.get(s.key, self.thumb_urls(s))
+            if self.store.on_visible:
+                self.store.on_visible(s)
+            return self.store.thumbs.get(s.key, self.store.thumb_urls(s))
         if role == Qt.ItemDataRole.ToolTipRole:
             return "\n".join(sorted({r.raw_title for r in s.releases}))
         return None
-
-    def _thumb_ready(self, key: str, _pm) -> None:
-        row = self._row_by_key.get(key)
-        if row is not None:
-            idx = self.index(row)
-            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
-
-
-class SceneFilter(QSortFilterProxyModel):
-    def __init__(self, parent=None, have: str = ""):
-        super().__init__(parent)
-        self.text = ""
-        self.resolution = ""
-        self.source = ""
-        self.group = ""
-        self.studio = ""        # normalised studio key
-        self.performer = ""     # performer key
-        self.fav_only = False   # only scenes with a favourite studio or performer
-        # "" = all, "missing" = still wanted (none/grabbed/partial), "partial" = grabbed or partial,
-        # "have" = complete, "any" = anything grabbed/partial/complete (the Downloaded tab)
-        self.have = have
-        self.locked_have = bool(have)
-        self.show_hidden = False
-
-    def set(self, **kw) -> None:
-        if self.locked_have:
-            kw.pop("have", None)
-        for k, v in kw.items():
-            setattr(self, k, v)
-        self.invalidateFilter()
-
-    def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
-        model: SceneModel = self.sourceModel()
-        s = model.scenes[row]
-        if s.key in model.hidden and not self.show_hidden:
-            return False
-        st = model.state(s.key)
-        if self.have == "have" and st != "complete":
-            return False
-        if self.have == "missing" and st == "complete":
-            return False
-        if self.have == "partial" and st not in ("partial", "grabbed"):
-            return False
-        if self.have == "any" and st == "none":
-            return False
-        if self.studio and studio_key(s.studio) != self.studio:
-            return False
-        if self.performer and self.performer not in model.scene_performers.get(s.key, ()):
-            return False
-        if self.fav_only and not model.is_favorite(s):
-            return False
-        if self.resolution and self.resolution not in s.resolutions:
-            return False
-        if self.source and self.source not in s.sources:
-            return False
-        if self.group and self.group not in s.release_groups:
-            return False
-        if self.text:
-            hay = " ".join([s.studio, model.display_studio(s), s.title,
-                            *(model.performer_names.get(k, "") for k in model.scene_performers.get(s.key, ())), *s.performers, *s.tags, *s.release_groups,
-                            *(r.raw_title for r in s.releases), *(r.filename for r in s.releases)]).lower()
-            return all(w in hay for w in self.text.lower().split())
-        return True
 
 
 def fmt_duration(sec: int | None) -> str:
@@ -190,7 +167,7 @@ class SceneDelegate(QStyledItemDelegate):
 
     def paint(self, p: QPainter, opt: QStyleOptionViewItem, index) -> None:
         s: Scene = index.data(SceneRole)
-        model = index.model().sourceModel() if hasattr(index.model(), "sourceModel") else index.model()
+        model = index.model().store
         owned = s.key in model.owned
         state = model.state(s.key)
         hidden = s.key in model.hidden

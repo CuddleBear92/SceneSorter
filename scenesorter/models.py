@@ -47,6 +47,13 @@ class Release:
     details_loaded: bool = False
 
     @property
+    def codec(self) -> str:
+        """HEVC / AVC / AV1 / ... from the file name, release name or tags ('' = unknown)."""
+        from .parsing import find_codec
+
+        return find_codec(self.filename, self.raw_title, *self.tags)
+
+    @property
     def resolution_rank(self) -> int:
         try:
             return int(self.resolution.rstrip("p"))
@@ -81,6 +88,10 @@ class Scene:
     @property
     def scene_date(self) -> date | None:
         return next((r.scene_date for r in self.releases if r.scene_date), None)
+
+    @property
+    def codecs(self) -> list[str]:
+        return sorted({c for c in (r.codec for r in self.releases) if c})
 
     @property
     def scene_dates(self) -> list[date]:

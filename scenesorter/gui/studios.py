@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractListModel, QByteArray, QModelIndex, QObject, QRect, QSize, QSortFilterProxyModel, Qt,
+    QAbstractListModel, QByteArray, QModelIndex, QObject, QRect, QSize, Qt,
     QTimer, Signal,
 )
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
@@ -137,7 +137,65 @@ class LogoService(QObject):
         self.queued.discard(key)  # network hiccup: try again next time it's shown
 
 
-class StudioModel(QAbstractListModel):
+class FilteredList:
+    """Mixin for the Studios/Performers list models: filter + sort a plain Python
+    list in one pass (no QSortFilterProxyModel calling back into Python thousands
+    of times, which stalls the UI while worker threads hold the GIL).
+
+    Keeps the old proxy API: ``set(...)``, ``sort(0)``, ``invalidate()``.
+    """
+
+    text = ""
+    sort_mode = "name"
+    fav_only = False
+
+    def set_items(self, items: list) -> None:
+        self.all_items = items
+        self.invalidate()
+
+    def set(self, **kw) -> None:
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self.invalidate()
+
+    def sort(self, *_a) -> None:
+        self.invalidate()
+
+    def invalidate(self) -> None:
+        favs = self.favorites
+        text = self.text.lower()
+        items = [e for e in getattr(self, "all_items", [])
+                 if (not self.fav_only or e.key in favs) and (not text or text in e.name.lower())]
+        if self.sort_mode == "scenes":
+            key = lambda e: (e.key not in favs, -e.scenes, e.name.lower())  # noqa: E731
+        elif self.sort_mode == "have":
+            key = lambda e: (e.key not in favs, -e.have, e.name.lower())  # noqa: E731
+        else:
+            key = lambda e: (e.key not in favs, e.name.lower())  # noqa: E731
+        self.beginResetModel()
+        self.items = sorted(items, key=key)
+        self._row = {e.key: i for i, e in enumerate(self.items)}
+        self.endResetModel()
+
+
+def aggregate_studios(scenes: list[Scene], has, official: dict[str, str]) -> list[StudioEntry]:
+    """Plain Python (runs on a worker thread): one entry per studio with counts,
+    named with the official stash-box spelling when known."""
+    agg: dict[str, StudioEntry] = {}
+    for s in scenes:
+        if not s.studio:
+            continue
+        k = normalise_studio(s.studio)
+        e = agg.get(k)
+        if e is None:
+            e = agg[k] = StudioEntry(k, official.get(k, s.studio), 0, 0)
+        e.scenes += 1
+        if has(s.key):
+            e.have += 1
+    return sorted(agg.values(), key=lambda e: e.name.lower())
+
+
+class StudioModel(FilteredList, QAbstractListModel):
     def __init__(self, logos: LogoService, parent=None):
         super().__init__(parent)
         self.logos = logos
@@ -146,24 +204,6 @@ class StudioModel(QAbstractListModel):
         self.items: list[StudioEntry] = []
         self._row: dict[str, int] = {}
         logos.ready.connect(self._logo_ready)
-
-    def set_scenes(self, scenes: list[Scene], has) -> None:
-        agg: dict[str, StudioEntry] = {}
-        for s in scenes:
-            if not s.studio:
-                continue
-            k = normalise_studio(s.studio)
-            e = agg.get(k) or agg.setdefault(k, StudioEntry(k, s.studio, 0, 0))
-            e.scenes += 1
-            e.have += 1 if has(s.key) else 0
-        self.beginResetModel()
-        self.items = sorted(agg.values(), key=lambda e: e.name.lower())
-        for e in self.items:  # prefer the official stash-box spelling once known
-            row = self.logos.db.studio(e.key)
-            if row is not None and row["endpoint"]:
-                e.name = row["name"]
-        self._row = {e.key: i for i, e in enumerate(self.items)}
-        self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self.items)
@@ -207,47 +247,13 @@ def paint_star(p: QPainter, rect: QRect, on: bool) -> None:
     p.drawText(badge, Qt.AlignmentFlag.AlignCenter, "★")
 
 
-class StudioFilter(QSortFilterProxyModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.text = ""
-        self.sort_mode = "name"
-        self.fav_only = False
-        self.sort(0)
-
-    def set(self, **kw) -> None:
-        for k, v in kw.items():
-            setattr(self, k, v)
-        self.invalidate()
-        self.sort(0)
-
-    def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
-        m = self.sourceModel()
-        e = m.items[row]
-        if self.fav_only and e.key not in m.favorites:
-            return False
-        return not self.text or self.text.lower() in e.name.lower()
-
-    def lessThan(self, a, b) -> bool:  # noqa: N802
-        ea, eb = a.data(StudioRole), b.data(StudioRole)
-        favs = self.sourceModel().favorites
-        fa, fb = ea.key in favs, eb.key in favs
-        if fa != fb:  # favourites always first
-            return fa
-        if self.sort_mode == "scenes":
-            return (eb.scenes, ea.name.lower()) < (ea.scenes, eb.name.lower())
-        if self.sort_mode == "have":
-            return (eb.have, ea.name.lower()) < (ea.have, eb.name.lower())
-        return ea.name.lower() < eb.name.lower()
-
-
 class StudioDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index) -> QSize:  # noqa: N802
         return QSize(CARD_W + 12, LOGO_H + TEXT_H + 12)
 
     def paint(self, p: QPainter, opt, index) -> None:
         e: StudioEntry = index.data(StudioRole)
-        model = index.model().sourceModel()
+        model = index.model()
         hidden = e.key in model.hidden
         r = opt.rect.adjusted(6, 6, -6, -6)
         p.save()
@@ -302,8 +308,7 @@ class StudiosTab(QWidget):
     def __init__(self, logos: LogoService, parent=None):
         super().__init__(parent)
         self.model = StudioModel(logos)
-        self.proxy = StudioFilter()
-        self.proxy.setSourceModel(self.model)
+        self.proxy = self.model  # filtering/sorting lives in the model (FilteredList)
         top = QHBoxLayout()
         self.search = QLineEdit(placeholderText="Filter studios…")
         self.search.setClearButtonEnabled(True)
@@ -367,7 +372,16 @@ class StudiosTab(QWidget):
             self.model.dataChanged.emit(self.model.index(0), self.model.index(len(self.model.items) - 1))
 
     def set_scenes(self, scenes: list[Scene], has, logos_enabled: bool) -> None:
-        self.model.set_scenes(scenes, has)
-        self.model.logos.prefetch([(e.key, e.name) for e in self.model.items])
-        self.hint.setText(f"{len(self.model.items)} studios · click one to browse its scenes" +
-                          ("" if logos_enabled else " · add a StashDB API key in Settings to load logos"))
+        """Counts are worked out on a worker thread; only the finished list touches the UI."""
+        self._gen = getattr(self, "_gen", 0) + 1
+        gen = self._gen
+
+        def apply(items):
+            if gen != self._gen:
+                return
+            self.model.set_items(items)
+            self.proxy.sort(0)
+            self.model.logos.prefetch([(e.key, e.name) for e in items])
+            self.hint.setText(f"{len(items)} studios · click one to browse its scenes" +
+                              ("" if logos_enabled else " · add a StashDB API key in Settings to load logos"))
+        run_async(aggregate_studios, scenes, has, self.model.logos.db.studio_names(), on_done=apply)
