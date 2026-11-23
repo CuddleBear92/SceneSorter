@@ -620,8 +620,31 @@ class MainWindow(QMainWindow):
     def _page_failed(self, sid: str, page: int, err: str) -> None:
         self.in_flight.discard(sid)
         self._backoff(sid, None)
-        self.status_label.setText(f"{sid}: page {page} failed ({err.splitlines()[0]}) — retrying later")
+        first = err.splitlines()[0] if err else "unknown error"
+        self.status_label.setText(f"{sid}: page {page} failed ({first}) — retrying later")
         self._update_crawl_label()
+
+        # If this is an EncodedFapFiles source that needs login, open the dialog
+        src = self.sources.get(sid)
+        if src and hasattr(src, "request_otp") and hasattr(src, "verify_otp"):
+            if "login" in first.lower() or "not logged in" in first.lower() or "auth" in first.lower():
+                QTimer.singleShot(100, lambda: self._open_source_login_for(src))
+
+    def _open_source_login_for(self, src) -> None:
+        """Open the Telegram OTP dialog for a specific source and persist the result."""
+        dlg = EncodedFapLoginDialog(src, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            for cfg in self.settings.sources:
+                if cfg.id == src.id:
+                    cfg.options = dict(src.options)
+                    break
+            self.settings.save()
+            if hasattr(src, "refresh_quota"):
+                src.refresh_quota()
+            self._update_quota_label()
+            self.status_label.setText(f"Logged in to {src.display_name}")
+            # Optionally kick a refresh so the user immediately sees results
+            QTimer.singleShot(300, lambda: self._fetch(src.id, 1, "refresh"))
 
     # ------------------------------------------------------------ rebuild
     def _schedule_rebuild(self) -> None:
