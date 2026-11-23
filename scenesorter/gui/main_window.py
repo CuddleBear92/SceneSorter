@@ -180,6 +180,9 @@ class MainWindow(QMainWindow):
         tb.addAction(act_import)
         tb.addAction(act_settings)
         tb.addAction(act_update)
+        self.act_login = QAction("Login…", self, triggered=self._open_source_login)
+        self.act_login.setToolTip("Log in or re-login to EncodedFapFiles via Telegram OTP")
+        tb.addAction(self.act_login)
 
         # --- scene panes (Browse + Downloaded share model, delegate and detail rendering)
         self.model = SceneModel(self.thumbs)
@@ -464,6 +467,32 @@ class MainWindow(QMainWindow):
             self.src_box.addItem(src.display_name, sid)
         self.src_box.blockSignals(False)
         self._update_quota_label()
+        # Kick off a background quota refresh for sources that support it
+        QTimer.singleShot(500, self._refresh_all_quotas)
+
+    def _refresh_all_quotas(self) -> None:
+        for src in self.sources.values():
+            if hasattr(src, "refresh_quota") and src.is_logged_in():
+                run_async(src.refresh_quota, on_done=lambda _=None: self._update_quota_label())
+
+    def _open_source_login(self) -> None:
+        """Open the Telegram OTP login dialog for EncodedFapFiles (even if already logged in)."""
+        for src in self.sources.values():
+            if hasattr(src, "request_otp") and hasattr(src, "verify_otp"):
+                dlg = EncodedFapLoginDialog(src, self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    # Persist token
+                    for cfg in self.settings.sources:
+                        if cfg.id == src.id:
+                            cfg.options = dict(src.options)
+                            break
+                    self.settings.save()
+                    if hasattr(src, "refresh_quota"):
+                        src.refresh_quota()
+                    self._update_quota_label()
+                    self.status_label.setText(f"Logged in to {src.display_name}")
+                return
+        QMessageBox.information(self, "No login source", "No EncodedFapFiles source found. Add it in Settings first.")
 
     def _load_cached(self) -> None:
         """Show everything already in the local DB without touching the network."""
