@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from .base import AuthRequired, RateLimited, Source, SourceConfig
+from .encodedfapfiles import EncodedFapFilesSource
 from .wordpress import WordPressSource
 
 SOURCE_TYPES: dict[str, type[Source]] = {
     "wordpress": WordPressSource,
+    "encodedfapfiles": EncodedFapFilesSource,
 }
 
 
