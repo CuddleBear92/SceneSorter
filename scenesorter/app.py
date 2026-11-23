@@ -1,6 +1,7 @@
 """Application entry point."""
 from __future__ import annotations
 
+import os
 import sys
 
 from PySide6.QtGui import QColor, QPalette
@@ -67,4 +68,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
     win = MainWindow(settings)
     win.show()
-    return app.exec()
+    rc = app.exec()
+    # The window has already finished/saved its work (closeEvent drains, closes the DB).
+    # Don't let a background job that's still running (e.g. a long merge on a busy, swapping
+    # machine) keep the process alive: Qt's thread pool would wait for it on exit, which also
+    # blocks the self-updater from replacing the exe. Give threads a moment, then leave.
+    from PySide6.QtCore import QThreadPool
+
+    QThreadPool.globalInstance().waitForDone(3000)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
