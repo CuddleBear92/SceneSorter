@@ -14,8 +14,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Qt runtime libraries (image tests use QtGui offscreen)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1
       - run: pip install -e ".[dev]"
       - run: pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
 
   build-windows:
     # Builds a test exe on every push so you can grab it from the run's artifacts.
