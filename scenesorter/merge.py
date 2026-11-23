@@ -22,6 +22,11 @@ def _duration(group: list[Release]) -> int | None:
     return max((r.duration_s for r in group if r.duration_s), default=None)
 
 
+def _near(a: set, b: set) -> bool:
+    """Dates within a day of each other (timezones / posting around midnight)."""
+    return any(abs((x - y).days) <= 1 for x in a for y in b)
+
+
 def same_scene_other_date(a: frozenset[str], b: frozenset[str], dur: str) -> bool:
     """Same studio, but the sites list different dates (one uses the shoot date,
     the other the release date, or a re-post). Only merge on strong evidence:
@@ -108,6 +113,35 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
     # Release-name pass: the same release name (e.g. "SisLovesMe.26.11.21.Luna.
     # Princess.XXX.1080p.HEVC.x265.PRT") on two sites is the same scene, even when
     # one site adds performers or a different title the other doesn't have.
+    # (source, date) pairs per group root. Two groups where the *same site* lists *different*
+    # dates are different scenes (a site doesn't post one scene twice on different days, but
+    # a series like "Cum Compilation" posts many alike-named ones) — never merge those.
+    seen_dates: dict[int, dict[str, set]] = {}
+    for i, g in enumerate(groups):
+        d: dict[str, set] = {}
+        for r in g:
+            if r.scene_date:
+                d.setdefault(r.source, set()).add(r.scene_date)
+        seen_dates[i] = d
+
+    def conflict(i: int, j: int) -> bool:
+        a, b = seen_dates[find(i)], seen_dates[find(j)]
+        for src, ds in a.items():
+            other = b.get(src)
+            if other and other != ds and not (_near(ds, other)):
+                return True
+        return False
+
+    def join(i: int, j: int) -> bool:
+        ri, rj = find(i), find(j)
+        if ri == rj or conflict(ri, rj):
+            return False
+        parent[rj] = ri
+        merged_dates = seen_dates[ri]
+        for src, ds in seen_dates.pop(rj).items():
+            merged_dates.setdefault(src, set()).update(ds)
+        return True
+
     by_name: dict[str, int] = {}
     for i, g in enumerate(groups):
         for r in g:
@@ -120,8 +154,7 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             if not k:
                 continue
             j = by_name.setdefault(k, i)
-            if find(i) != find(j):
-                parent[find(i)] = find(j)
+            join(j, i)
 
     # Fuzzy pass, per studio:
     #   same date        -> normal word threshold
@@ -144,17 +177,15 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
         for i in idxs:
             (by_date[dates[i]] if dates[i] else undated).append(i)
 
-        def union(i: int, j: int) -> None:
-            parent[find(j)] = find(i)
-
-        def try_union(i: int, j: int, strict: bool) -> None:
+        def try_union(i: int, j: int, strict: bool) -> bool:
             if find(i) == find(j):
-                return
+                return False
             dur = duration_check(durs[i], durs[j])
             if dur == "far":
-                return
+                return False
             if similar(toks[i], toks[j], strict) or (dur == "close" and titles_match(title_toks[i], title_toks[j])):
-                union(i, j)
+                return join(i, j)
+            return False
 
         # Same date: buckets are tiny, compare all pairs.
         for same in by_date.values():
@@ -173,18 +204,29 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             rare = sorted(toks[i], key=lambda t: len(index[t]))[:2]
             return {j for t in rare for j in index[t] if j != i}
 
+        # Undated posts: may join undated look-alikes, but a *dated* scene only if exactly one
+        # dated scene fits — otherwise a generic title would chain a whole series together.
         for i in undated:
+            dated_hits: set[int] = set()
             for j in candidates(i):
-                try_union(j, i, strict=dates[j] is not None)
+                if dates[j] is None:
+                    try_union(j, i, strict=False)
+                elif len(toks[i]) >= 3 and duration_check(durs[i], durs[j]) != "far" \
+                        and similar(toks[i], toks[j], strict=True):
+                    dated_hits.add(find(j))
+            if len(dated_hits) == 1:
+                join(dated_hits.pop(), i)
 
+        # Same scene, sites disagree on the date: needs a specific title (4+ words) and exactly
+        # one candidate.
         for i in idxs:
-            if not dates[i]:
+            if not dates[i] or len(toks[i]) < 4:
                 continue
-            for j in candidates(i):
-                if j < i or not dates[j] or abs((dates[i] - dates[j]).days) <= 1 or find(i) == find(j):
-                    continue
-                if same_scene_other_date(toks[i], toks[j], duration_check(durs[i], durs[j])):
-                    union(i, j)
+            hits = {find(j) for j in candidates(i)
+                    if dates[j] and abs((dates[i] - dates[j]).days) > 1 and find(j) != find(i)
+                    and same_scene_other_date(toks[i], toks[j], duration_check(durs[i], durs[j]))}
+            if len(hits) == 1:
+                join(hits.pop(), i)
 
     merged: dict[int, list[Release]] = defaultdict(list)
     for i, g in enumerate(groups):

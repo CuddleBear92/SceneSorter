@@ -22,7 +22,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "5"
+PARSER_VERSION = "6"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -196,11 +196,16 @@ def find_codec(*texts: str) -> str:
     return ""
 
 
+# Same patterns wrapped in a lookahead so candidates may overlap: in "Studio12.26.12.25" the
+# invalid "12.26.12" (the 12 belongs to the studio) must not hide the real "26.12.25".
+_DATE_SCAN = [(re.compile(f"(?=({rx.pattern}))"), kind) for rx, kind in DATE_PATTERNS]
+
+
 def find_date(text: str) -> tuple[date | None, tuple[int, int] | None]:
     """Return (date, (start, end) span) of the first plausible date in text."""
-    for rx, kind in DATE_PATTERNS:
+    for rx, kind in _DATE_SCAN:
         for m in rx.finditer(text):
-            a, b, c = (int(x) for x in m.groups())
+            a, b, c = (int(x) for x in m.groups()[1:4])
             try:
                 if kind == "ymd4":
                     d = date(a, b, c)
@@ -210,7 +215,7 @@ def find_date(text: str) -> tuple[date | None, tuple[int, int] | None]:
                     d = date(c, b, a)
             except ValueError:
                 continue
-            return d, m.span()
+            return d, m.span(1)
     return None, None
 
 

@@ -201,3 +201,55 @@ def test_same_day_matching_runtime_uses_title_words_only():
 def test_resolution_tags_dropped():
     r = enrich(Release("b", "1", "", "Studio.24.01.15.Jane.XXX.1080p.MP4-PRT", tags=["1080p", "720p", "HEVC", "POV"]))
     assert r.tags == ["POV"]
+
+
+def _series(n_dates=6, dur=1800):
+    days = ["24.11.29", "24.12.06", "24.12.13", "25.01.03", "25.01.10", "25.02.14", "25.03.07"][:n_dates]
+    return [_r(f"StoryHotWives.{d}.Cum.Compilation.XXX.{res}.HEVC.x265.PRT", "pornrips", f"{d}{res}", dur)
+            for d in days for res in ("1080p", "720p")]
+
+
+def test_generic_title_series_is_not_chained_together():
+    # Same studio, same two-word title, same runtime, different dates: different scenes.
+    assert len(merge_releases(_series())) == 6
+
+
+def test_undated_post_with_generic_title_does_not_chain_a_series():
+    from datetime import date  # noqa: F401
+    und = enrich(Release("encodedfap", "u1", "", "Cum Compilation", studio="Story Hot Wives",
+                         title="Cum Compilation", duration_s=1800))
+    scenes = merge_releases(_series() + [und])
+    assert len(scenes) == 7                                  # ambiguous -> stays on its own
+    assert max(len(s.releases) for s in scenes) == 2         # nothing got glued together
+
+
+def test_same_site_different_dates_never_merge():
+    a = _r("Studio.24.01.01.Jane.Doe.Long.Specific.Scene.Title.XXX.1080p.MP4-PRT", "pornrips", "1", 1800)
+    b = _r("Studio.24.03.01.Jane.Doe.Long.Specific.Scene.Title.XXX.1080p.MP4-PRT", "pornrips", "2", 1800)
+    assert len(merge_releases([a, b])) == 2                  # same site, two dates = two posts/scenes
+    c = _r("[Studio] Jane Doe - Long Specific Scene Title (2024-02-01) [720p]", "premium", "3", 1800)
+    # the other site's copy may join one of them (unambiguous? no: it fits both) -> stays separate
+    assert len(merge_releases([a, b, c])) == 3
+
+
+def test_date_not_hidden_by_digits_in_studio_name():
+    from scenesorter.parsing import parse_title
+    p = parse_title("Studio12.26.12.25.Jane.Doe.Some.Title.XXX.1080p.HEVC.x265.PRT")
+    assert p["scene_date"] == date(2026, 12, 25) and p["studio"] == "Studio12"
+
+
+def test_compilation_series_across_two_sites():
+    # 60 weekly "Compilation" posts from one studio on both sites: 60 scenes, each with
+    # 1080p + 720p from both sites — not one giant scene.
+    from datetime import timedelta
+    rels, d = [], date(2025, 10, 20)
+    for i in range(60):
+        dd = d + timedelta(days=7 * i)
+        for res in ("1080p", "720p"):
+            name = f"ATKGirlfriends.{dd:%y.%m.%d}.Compilation.XXX.{res}.HEVC.x265.PRT"
+            rels.append(_r(name, "pornrips", f"p{i}{res}", 3600 + (i % 5) * 20))
+            rels.append(enrich(Release("encodedfap", f"e{i}{res}", "", "Compilation", studio="ATK Girlfriends",
+                                       title="Compilation", scene_date=dd, filename=name + ".mp4",
+                                       duration_s=3600 + (i % 5) * 20)))
+    scenes = merge_releases(rels)
+    assert len(scenes) == 60 and {len(s.releases) for s in scenes} == {4}
