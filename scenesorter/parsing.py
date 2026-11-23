@@ -323,8 +323,13 @@ def match_key(r: Release) -> str:
     return f"{studio}|{d}|{' '.join(sorted(set(body)))}"
 
 
+TITLE_FIELDS = ("studio", "performers", "title", "scene_date", "resolution", "release_group")
+
+
 def enrich(r: Release) -> Release:
-    """Fill parsed fields on a Release that the source didn't supply."""
+    """Fill parsed fields on a Release that the source didn't supply, and remember which
+    ones came from parsing (so a later parser upgrade never overwrites source data)."""
+    before = {f: bool(getattr(r, f)) for f in TITLE_FIELDS}
     p = parse_title(r.raw_title)
     r.studio = r.studio or p["studio"]
     r.performers = r.performers or p["performers"]
@@ -335,6 +340,8 @@ def enrich(r: Release) -> Release:
     if not r.resolution and r.filename:
         r.resolution = find_resolution(r.filename)
     r.tags = clean_tags(r.tags, r.studio)
+    filled = {f for f in TITLE_FIELDS if not before[f] and getattr(r, f)}
+    r.parsed = sorted(set(r.parsed or []) | filled)
     return r
 
 
@@ -356,9 +363,20 @@ def clean_tags(tags: list[str], studio: str) -> list[str]:
     return out
 
 
-def reparse(r: Release) -> Release:
-    """Recompute title-derived fields from scratch (after a parser upgrade)."""
-    r.studio, r.performers, r.title, r.scene_date = "", [], "", None
-    r.resolution = r.resolution if r.resolution and not find_resolution(r.raw_title) else ""
-    r.release_group = ""
+def reparse(r: Release, title_only_source: bool = False) -> Release:
+    """Recompute *title-derived* fields after a parser upgrade. Fields the source supplied
+    (e.g. a site's own studio/performer/title fields) are never touched.
+
+    Posts cached before field provenance was recorded (``parsed is None``) are only
+    re-parsed for sources whose posts are nothing but a title (``title_only_source``)."""
+    if r.parsed is None:
+        if not title_only_source:
+            return r
+        r.parsed = list(TITLE_FIELDS)
+    empty = {"studio": "", "performers": [], "title": "", "scene_date": None, "resolution": "", "release_group": ""}
+    for f in r.parsed:
+        if f in empty:
+            setattr(r, f, empty[f])
+    keep = [f for f in r.parsed if f not in empty]
+    r.parsed = keep
     return enrich(r)

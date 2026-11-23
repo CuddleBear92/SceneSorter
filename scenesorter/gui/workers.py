@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 import traceback
 from pathlib import Path
@@ -30,6 +31,8 @@ class Task(QRunnable):
             res = self.fn(*self.args, **self.kwargs)
         except Exception as e:  # noqa: BLE001
             msg = f"{e}\n{traceback.format_exc(limit=3)}"
+            logging.getLogger("scenesorter").error("background job %s failed:\n%s",
+                                                   getattr(self.fn, "__name__", self.fn), traceback.format_exc())
             self.fn = self.args = self.kwargs = None  # don't keep (possibly huge) inputs alive
             self.signals.failed.emit(msg)
         else:
@@ -39,8 +42,26 @@ class Task(QRunnable):
 
 _live: set[Task] = set()  # keep Python wrappers alive until the task reports back
 
+_pools: dict[str, QThreadPool] = {}
 
-def run_async(fn: Callable, *args, on_done=None, on_fail=None, **kwargs) -> Task:
+
+def pool(kind: str) -> QThreadPool:
+    """'io' (default): network/disk jobs — many threads, they mostly wait.
+    'cpu': heavy Python work (merging, filtering, performer lists). Python runs one thread at
+    a time anyway, so a small separate pool keeps these from hogging every slot and leaving
+    logo/match/page jobs queued behind them."""
+    if kind not in _pools:
+        if kind == "io":
+            p = QThreadPool.globalInstance()
+            p.setMaxThreadCount(max(8, p.maxThreadCount()))
+        else:
+            p = QThreadPool()
+            p.setMaxThreadCount(2)
+        _pools[kind] = p
+    return _pools[kind]
+
+
+def run_async(fn: Callable, *args, on_done=None, on_fail=None, pool: str = "io", **kwargs) -> Task:
     """Run ``fn`` on the thread pool; ``on_done(result)`` / ``on_fail(error)`` run on the UI thread.
 
     Memory note: a task's signals hold Python callbacks inside Qt (C++), where Python's
@@ -69,7 +90,7 @@ def run_async(fn: Callable, *args, on_done=None, on_fail=None, **kwargs) -> Task
 
     t.signals.done.connect(finish)
     t.signals.failed.connect(finish)
-    QThreadPool.globalInstance().start(t)
+    globals()["pool"](pool).start(t)
     return t
 
 

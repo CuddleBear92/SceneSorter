@@ -45,13 +45,31 @@ class Release:
     duration_s: int | None = None
     tags: list[str] = field(default_factory=list)
     details_loaded: bool = False
+    #: Fields filled in by parsing the title (vs supplied by the source). Only these may be
+    #: recomputed after a parser upgrade. None = unknown (posts cached before this existed).
+    parsed: list[str] | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        # Sources (and old cache rows) may leave fields as None or put non-strings in lists;
+        # everything downstream (parsing, search, performers) expects clean strings.
+        for name in ("post_url", "raw_title", "studio", "title", "resolution", "release_group", "filename"):
+            v = getattr(self, name)
+            if not isinstance(v, str):
+                setattr(self, name, "" if v is None else str(v))
+        self.tags = [str(t).strip() for t in (self.tags or []) if t is not None and str(t).strip()]
+        self.performers = [str(p).strip() for p in (self.performers or []) if p is not None and str(p).strip()]
+        self.links = [l for l in (self.links or []) if l is not None]
 
     @property
     def codec(self) -> str:
-        """HEVC / AVC / AV1 / ... from the file name, release name or tags ('' = unknown)."""
-        from .parsing import find_codec
+        """HEVC / AVC / AV1 / ... from the file name, release name or tags ('' = unknown).
+        Cached: it's asked for on every rebuild/search and the inputs don't change."""
+        c = self.__dict__.get("_codec")
+        if c is None:
+            from .parsing import find_codec
 
-        return find_codec(self.filename, self.raw_title, *self.tags)
+            c = self.__dict__["_codec"] = find_codec(self.filename, self.raw_title, *self.tags)
+        return c
 
     @property
     def resolution_rank(self) -> int:

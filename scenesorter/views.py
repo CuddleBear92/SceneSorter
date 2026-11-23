@@ -64,12 +64,12 @@ class ViewState:
 
 
 def haystack(s: Scene, st: ViewState) -> str:
-    return " ".join([
-        s.studio, st.display_studio(s), s.title,
-        *(st.performer_names.get(k, "") for k in st.scene_performers.get(s.key, ())),
-        *s.tags, *s.release_groups, *s.codecs,
-        *(r.raw_title for r in s.releases), *(r.filename for r in s.releases),
-    ]).lower()
+    """Searchable text of a scene, without performer names (those change often and are
+    looked up separately, so new stash-box matches don't force a full index rebuild)."""
+    parts = [s.studio, st.display_studio(s)]
+    for r in s.releases:
+        parts += (r.title, r.raw_title, r.filename, r.release_group, r.codec, *r.performers, *r.tags)
+    return " ".join(parts).lower()
 
 
 class _Index:
@@ -91,9 +91,9 @@ _lock = threading.Lock()
 
 
 def _index(scenes: list[Scene], st: ViewState) -> _Index:
-    # Rebuilt only when the scene list or the name maps are replaced (they're swapped, not
+    # Rebuilt only when the scene list or studio names are replaced (they're swapped, not
     # mutated). Locked so two panes filtering at once don't both build it.
-    sig = (id(scenes), len(scenes), id(st.studio_names), id(st.performer_names), id(st.scene_performers))
+    sig = (id(scenes), len(scenes), id(st.studio_names))
     with _lock:
         if _cache.get("sig") != sig:
             _cache["index"] = _Index(scenes, st)
@@ -136,7 +136,12 @@ def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Sce
         if words:
             hay = ix.hay[i]
             if not all(w in hay for w in words):
-                continue
+                pk = st.scene_performers.get(s.key)
+                if not pk:
+                    continue
+                hay = hay + " " + " ".join(st.performer_names.get(k, "") for k in pk).lower()
+                if not all(w in hay for w in words):
+                    continue
         out.append(s)
     return sort_scenes(out, spec.sort, st, ix, scenes)
 

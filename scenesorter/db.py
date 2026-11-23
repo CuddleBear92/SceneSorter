@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .models import DownloadLink, LinkKind, Release
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -147,6 +147,9 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(posts)")}
+        if "parsed_fields" not in cols:  # which fields came from title parsing (JSON list), v6
+            self.conn.execute("ALTER TABLE posts ADD COLUMN parsed_fields TEXT")
         old = int(self.get_meta("schema_version") or SCHEMA_VERSION)
         if old < 2:
             # carry over downloads started by build 1-2 as flags
@@ -191,15 +194,31 @@ class Database:
                     if exists is None:
                         new += 1
                     elif exists["details_loaded"] and not r.details_loaded:
-                        # don't clobber richer data from a detail fetch with listing data
-                        self.conn.execute("UPDATE posts SET last_seen=?, thumbnail_url=COALESCE(thumbnail_url, ?)"
-                                          " WHERE source=? AND post_id=?", (now, r.thumbnail_url, r.source, r.post_id))
+                        # Listing data for a post we fetched in full before: keep the detail-only
+                        # fields (links, file name, size, duration, tags), but take the listing's
+                        # own studio/performers/title/date when it has them — this also restores
+                        # fields that an older parser upgrade wrongly reset.
+                        self.conn.execute(
+                            """UPDATE posts SET last_seen=?, thumbnail_url=COALESCE(thumbnail_url, ?),
+                                   raw_title=COALESCE(NULLIF(?, ''), raw_title),
+                                   studio=COALESCE(NULLIF(?, ''), studio),
+                                   performers=CASE WHEN ? != '[]' THEN ? ELSE performers END,
+                                   title=COALESCE(NULLIF(?, ''), title),
+                                   scene_date=COALESCE(?, scene_date),
+                                   resolution=COALESCE(NULLIF(?, ''), resolution),
+                                   release_group=COALESCE(NULLIF(?, ''), release_group),
+                                   parsed_fields=?
+                               WHERE source=? AND post_id=?""",
+                            (now, r.thumbnail_url, r.raw_title, r.studio, json.dumps(r.performers),
+                             json.dumps(r.performers), r.title, r.scene_date.isoformat() if r.scene_date else None,
+                             r.resolution, r.release_group, None if r.parsed is None else json.dumps(r.parsed),
+                             r.source, r.post_id))
                         continue
                     self.conn.execute(
                         """INSERT INTO posts (source, post_id, post_url, raw_title, studio, performers, title,
                                scene_date, resolution, release_group, filename, duration_s, size_bytes, tags,
-                               posted, thumbnail_url, links, details_loaded, first_seen, last_seen)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               posted, thumbnail_url, links, details_loaded, first_seen, last_seen, parsed_fields)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(source, post_id) DO UPDATE SET
                                post_url=excluded.post_url, raw_title=excluded.raw_title, studio=excluded.studio,
                                performers=excluded.performers, title=excluded.title, scene_date=excluded.scene_date,
@@ -207,12 +226,14 @@ class Database:
                                filename=excluded.filename, duration_s=excluded.duration_s,
                                size_bytes=excluded.size_bytes, tags=excluded.tags, posted=excluded.posted,
                                thumbnail_url=excluded.thumbnail_url, links=excluded.links,
-                               details_loaded=excluded.details_loaded, last_seen=excluded.last_seen""",
+                               details_loaded=excluded.details_loaded, last_seen=excluded.last_seen,
+                               parsed_fields=excluded.parsed_fields""",
                         (r.source, r.post_id, r.post_url, r.raw_title, r.studio, json.dumps(r.performers), r.title,
                          r.scene_date.isoformat() if r.scene_date else None, r.resolution, r.release_group,
                          r.filename, r.duration_s, r.size_bytes, json.dumps(r.tags),
                          r.posted.isoformat() if r.posted else None, r.thumbnail_url,
-                         json.dumps([_link_to_json(l) for l in r.links]), int(r.details_loaded), now, now),
+                         json.dumps([_link_to_json(l) for l in r.links]), int(r.details_loaded), now, now,
+                         None if r.parsed is None else json.dumps(r.parsed)),
                     )
                 self.conn.execute("COMMIT")
             except Exception:
@@ -236,21 +257,23 @@ class Database:
                 rows = self.conn.execute("SELECT * FROM posts").fetchall()
         return [_row_to_release(r) for r in rows]
 
-    def reparse_if_needed(self) -> int:
-        """Re-run the title parser on cached posts if the parser has changed."""
+    def reparse_if_needed(self, title_only_sources: set[str] = frozenset()) -> int:
+        """Re-run the title parser on cached posts if the parser has changed. Only fields
+        that came from title parsing are recomputed (see parsing.reparse)."""
         from .parsing import PARSER_VERSION, reparse
 
         if self.get_meta("parser_version") == PARSER_VERSION:
             return 0
-        rels = [reparse(r) for r in self.load_releases()]
+        rels = [reparse(r, r.source in title_only_sources) for r in self.load_releases()]
         with self._lock:
             self.conn.execute("BEGIN")
             for r in rels:
                 self.conn.execute(
-                    "UPDATE posts SET studio=?, performers=?, title=?, scene_date=?, resolution=?, release_group=?, tags=? "
-                    "WHERE source=? AND post_id=?",
+                    "UPDATE posts SET studio=?, performers=?, title=?, scene_date=?, resolution=?, release_group=?, "
+                    "tags=?, parsed_fields=? WHERE source=? AND post_id=?",
                     (r.studio, json.dumps(r.performers), r.title, r.scene_date.isoformat() if r.scene_date else None,
-                     r.resolution, r.release_group, json.dumps(r.tags), r.source, r.post_id))
+                     r.resolution, r.release_group, json.dumps(r.tags),
+                     None if r.parsed is None else json.dumps(r.parsed), r.source, r.post_id))
             self.conn.execute("COMMIT")
         self.set_meta("parser_version", PARSER_VERSION)
         return len(rels)
@@ -390,6 +413,17 @@ class Database:
             out.setdefault(r["key"], []).append(d)
         return out
 
+    def scene_matches_for(self, key: str) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM scene_matches WHERE key=? AND stash_id IS NOT NULL",
+                                     (key,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["performers"] = json.loads(d["performers"] or "[]")
+            out.append(d)
+        return out
+
     def scene_match_checked(self, max_age_s: float) -> set[tuple[str, str]]:
         with self._lock:
             rows = self.conn.execute("SELECT key, endpoint FROM scene_matches WHERE stash_id IS NOT NULL "
@@ -475,4 +509,5 @@ def _row_to_release(row: sqlite3.Row) -> Release:
         release_group=row["release_group"] or "", filename=row["filename"] or "",
         duration_s=row["duration_s"], tags=json.loads(row["tags"] or "[]"),
         details_loaded=bool(row["details_loaded"]),
+        parsed=json.loads(row["parsed_fields"]) if row["parsed_fields"] else None,
     )

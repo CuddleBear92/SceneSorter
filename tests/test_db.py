@@ -110,3 +110,59 @@ def test_interrupted_http_downloads_marked_failed(tmp_path):
     db.set_flag("blog", "3", "done")
     assert db.mark_interrupted_downloads() == 1
     assert db.flags() == {("blog", "1"): "failed", ("blog", "2"): "grabbed", ("blog", "3"): "done"}
+
+
+def _premium(**kw):
+    from datetime import date as _d
+    base = dict(studio="Sis Loves Me", title="Luna Princess", performers=["Luna Lovehard", "Rion King"],
+                scene_date=_d(2026, 11, 21), filename="SisLovesMe.26.11.21.Luna.Princess.XXX.1080p.HEVC.x265.PRT.mp4")
+    base.update(kw)
+    return enrich(Release("encodedfap", "e1", "", "Luna Princess", **base))
+
+
+def test_enrich_records_only_parsed_fields():
+    r = _premium()
+    assert "performers" not in r.parsed and "studio" not in r.parsed     # source-supplied
+    assert "resolution" in r.parsed and "release_group" in r.parsed      # filled by parsing
+
+
+def test_parser_upgrade_never_touches_source_fields(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.upsert_releases([_premium(), mk("1", "StudioName.24.01.15.Jane.Doe.Some.Title.XXX.1080p.HEVC.x265.PRT")])
+    db.set_meta("parser_version", "0")
+    db.reparse_if_needed({"blog"})
+    back = {r.post_id: r for r in db.load_releases()}
+    assert back["e1"].performers == ["Luna Lovehard", "Rion King"] and back["e1"].studio == "Sis Loves Me"
+    assert back["1"].studio == "StudioName"
+
+
+def test_legacy_rows_only_reparsed_for_title_only_sources(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.upsert_releases([_premium()])
+    db.conn.execute("UPDATE posts SET parsed_fields=NULL")          # cached before provenance existed
+    db.set_meta("parser_version", "0")
+    db.reparse_if_needed({"blog"})                                  # encodedfap is not title-only
+    assert db.load_releases()[0].performers == ["Luna Lovehard", "Rion King"]
+
+
+def test_listing_restores_fields_reset_by_old_reparse(tmp_path):
+    db = Database(tmp_path / "s.db")
+    full = _premium(details_loaded=True)
+    db.upsert_releases([full])
+    db.conn.execute("UPDATE posts SET performers='[]', studio='Luna', title='Princess'")  # damage
+    db.upsert_releases([_premium(details_loaded=False, filename="")])                     # a rescan's listing
+    r = db.load_releases()[0]
+    assert (r.studio, r.title, r.performers) == ("Sis Loves Me", "Luna Princess", ["Luna Lovehard", "Rion King"])
+    assert r.filename.endswith(".mp4")                               # detail-only field kept
+
+
+def test_parsed_fields_column_on_old_db(tmp_path):
+    p = tmp_path / "old.db"
+    db = Database(p)
+    db.upsert_releases([mk("1", "StudioName.24.01.15.Jane.Doe.Some.Title.XXX.1080p.HEVC.x265.PRT")])
+    db.conn.execute("ALTER TABLE posts DROP COLUMN parsed_fields")   # what a build-21 database looks like
+    db.set_meta("schema_version", "5")
+    db.close()
+    db = Database(p)
+    assert "parsed_fields" in {r[1] for r in db.conn.execute("PRAGMA table_info(posts)")}
+    assert db.load_releases()[0].parsed is None                       # unknown provenance for old rows

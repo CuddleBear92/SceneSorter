@@ -134,7 +134,7 @@ class ScenePane(QSplitter):
         gen = self._generation
         run_async(compute_view, self.model.scenes, self.filter.copy(), self.model.view_state(),
                   on_done=lambda rows: self._apply(gen, rows),
-                  on_fail=lambda _e: self._finish())
+                  on_fail=lambda _e: self._finish(), pool="cpu")
 
     def _finish(self) -> None:
         self._running = False

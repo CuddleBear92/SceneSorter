@@ -108,7 +108,6 @@ class MainWindow(QMainWindow):
 
         self.quota = QuotaTracker(DATA_DIR / "quota.json")
         self.db = Database(DATA_DIR / "scenesorter.db")
-        self.db.reparse_if_needed()
         self.db.mark_interrupted_downloads()
         self.flags: dict[tuple[str, str], str] = self.db.flags()
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
@@ -117,6 +116,7 @@ class MainWindow(QMainWindow):
         self.matches: dict[str, list[dict]] = self.db.scene_matches()
         self._import_running = False
         self.draining = False          # closing/updating: start nothing new, let running work finish
+        self.cache_loaded = False      # nothing is fetched until the cached posts are in memory
         self._close_ok = False
         self._refresh_page1_after: set[str] = set()
         self.fav = {"studio": self.db.favorites("studio"), "performer": self.db.favorites("performer")}
@@ -157,8 +157,7 @@ class MainWindow(QMainWindow):
         self._load_sources()
         self._load_cached()
         self.rescan_library()
-        if settings.refresh_on_start:
-            QTimer.singleShot(0, self.refresh)
+        # (refresh_on_start runs once the cache has loaded — see _cache_ready)
         if settings.check_updates_on_start:
             QTimer.singleShot(1500, lambda: self.check_updates(silent=True))
 
@@ -358,8 +357,11 @@ class MainWindow(QMainWindow):
         """Matches saved before the duration check existed: re-check them now that we
         know both durations; clearly wrong lengths are forgotten and looked up again."""
         bad = []
-        for s in self.scenes:
-            for m in self.matches.get(s.key, []):
+        for key, ms in self.matches.items():  # only scenes that have matches, not the whole library
+            s = self.model.by_key.get(key)
+            if s is None:
+                continue
+            for m in ms:
                 if duration_check(s.duration_s, m.get("duration")) == "far":
                     bad.append((s.key, m["endpoint"]))
         if bad:
@@ -369,12 +371,16 @@ class MainWindow(QMainWindow):
                                    self.settings.match_interval_s)
 
     # ------------------------------------------------- performers/matching
+    @staticmethod
+    def _cover_urls(ms: list[dict]) -> list[str]:
+        """ThePornDB first (its covers are the studio's own poster), then the rest."""
+        return [m["image_url"] for m in sorted(ms, key=lambda m: "theporndb" not in m["endpoint"])
+                if m.get("image_url")]
+
     def _covers(self) -> dict[str, list[str]]:
-        """Stash-box cover per scene, ThePornDB first (its covers are the studio's own poster)."""
         out: dict[str, list[str]] = {}
         for key, ms in self.matches.items():
-            urls = [m["image_url"] for m in sorted(ms, key=lambda m: "theporndb" not in m["endpoint"])
-                    if m.get("image_url")]
+            urls = self._cover_urls(ms)
             if urls:
                 out[key] = urls
         return out
@@ -400,18 +406,41 @@ class MainWindow(QMainWindow):
         self.thumbs.set_host_headers(hdr)
 
     def _scene_matched(self, key: str) -> None:
-        self.matches = self.db.scene_matches()
-        self.model.covers = self._covers()
+        # Update just this scene (re-reading every match from the DB each time was a UI stall
+        # with tens of thousands of matches).
+        ms = self.db.scene_matches_for(key)
+        self.matches[key] = ms
+        urls = self._cover_urls(ms)
+        if urls:
+            self.model.covers[key] = urls
         self.model.refresh_row(key)  # a post without a thumbnail can now show the cover
-        self.perf_timer.start()  # debounce: matches arrive every few seconds
+        self._performers_dirty = True
+        if not self.perf_timer.isActive():
+            self.perf_timer.start()
         for pane in self.panes:
             if pane.current and pane.current.key == key:
                 pane.refresh_detail()
 
     def _rebuild_performers(self) -> None:
-        run_async(collect_performers, list(self.scenes), dict(self.matches), on_done=self._performers_ready)
+        """Rebuild the performer list — at most once a minute and one at a time; new stash-box
+        matches arrive every few seconds and each rebuild walks the whole library."""
+        if getattr(self, "_performers_running", False):
+            self._performers_dirty = True
+            return
+        wait = 60 - (time.time() - getattr(self, "_performers_at", 0))
+        if wait > 0 and getattr(self, "_performers_at", 0):
+            self.perf_timer.start(int(wait * 1000))
+            return
+        self._performers_running = True
+        self._performers_dirty = False
+        self._performers_at = time.time()
+        run_async(collect_performers, list(self.scenes), dict(self.matches), on_done=self._performers_ready,
+                  on_fail=lambda _e: setattr(self, "_performers_running", False), pool="cpu")
 
     def _performers_ready(self, res) -> None:
+        self._performers_running = False
+        if getattr(self, "_performers_dirty", False):
+            self.perf_timer.start(60_000)
         perf, by_scene = res
         self.model.scene_performers = by_scene
         self.model.performer_names = {k: e.name for k, e in perf.items()}
@@ -464,7 +493,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Scanning files…")
         run_async(scan_files, paths, list(self.scenes), known, 60 if incremental else 0,
                   on_done=lambda r: self._import_done(r, interactive),
-                  on_fail=lambda e: self._import_failed(e, interactive))
+                  on_fail=lambda e: self._import_failed(e, interactive), pool="cpu")
 
     def _import_failed(self, err: str, interactive: bool) -> None:
         self._import_running = False
@@ -565,16 +594,34 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "No login source", "No EncodedFapFiles source found. Add it in Settings first.")
 
     def _load_cached(self) -> None:
-        """Show everything already in the local DB without touching the network."""
-        self.releases = {(r.source, r.post_id): r for r in self.db.load_releases(list(self.sources))}
+        """Load everything already in the local DB, on a worker thread (hundreds of thousands
+        of posts take a while; the window stays usable meanwhile). Fetching waits for it."""
+        self.cache_loaded = False
+        self.status_label.setText("Loading posts from the local cache…")
+        title_only = {c.id for c in self.settings.sources if c.type == "wordpress"}
+        sources = list(self.sources)
+        db = self.db
+
+        def load():
+            db.reparse_if_needed(title_only)   # only after a parser upgrade; never touches source data
+            return db.load_releases(sources)
+        run_async(load, on_done=self._cache_ready, pool="cpu",
+                  on_fail=lambda e: self.status_label.setText(f"Couldn't load the cache: {e.splitlines()[0]}"))
+
+    def _cache_ready(self, rels) -> None:
+        self.releases = {(r.source, r.post_id): r for r in rels}
         # The cached posts live as long as the app: move them out of the garbage collector's
         # way once (a full pass over them stalls every thread). Only done here, right after a
         # fresh load — freezing repeatedly would also make any garbage alive at that moment
         # permanent.
-        gc.collect()
         gc.freeze()
+        first = not getattr(self, "_started_once", False)
+        self._started_once = True
+        self.cache_loaded = True
         self._rebuild()
         self.status_label.setText(f"{len(self.releases)} posts loaded from the local cache")
+        if first and self.settings.refresh_on_start:
+            QTimer.singleShot(0, self.refresh)
 
     def refresh(self, manual: bool = False) -> None:
         """Incremental refresh: fetch newest pages until a page has nothing new.
@@ -598,7 +645,8 @@ class MainWindow(QMainWindow):
 
     def _fetch(self, sid: str, page: int, mode: str) -> None:
         """mode: 'refresh' (newest pages until nothing new) or 'crawl' (backfill one older page)."""
-        if self.draining or sid in self.in_flight or time.time() < self.backoff_until.get(sid, 0):
+        if self.draining or not self.cache_loaded or sid in self.in_flight \
+                or time.time() < self.backoff_until.get(sid, 0):
             return
         if mode != "refresh" or page > 1:
             manual = mode == "refresh" and sid in getattr(self, "_manual_chain", set())
@@ -866,7 +914,7 @@ class MainWindow(QMainWindow):
         snapshot = list(self.releases.values())
         hidden = (set(self.hidden_keys), set(self.hidden_posts), dict(self.hidden_studios))
         run_async(rebuild_bundle, snapshot, dict(self.flags), self.settings.preferred_resolution, hidden,
-                  on_done=self._apply_rebuild, on_fail=lambda e: self._apply_rebuild(None, e))
+                  on_done=self._apply_rebuild, on_fail=lambda e: self._apply_rebuild(None, e), pool="cpu")
 
     def _apply_rebuild(self, bundle, err: str | None = None) -> None:
         self._rebuild_running = False
@@ -906,13 +954,13 @@ class MainWindow(QMainWindow):
                 pane.refresh_detail()
             self.studios.set_scenes(self.scenes, self.model.has, bool(self.logos.boxes))
         run_async(compute_status, self.scenes, dict(self.flags), self.settings.preferred_resolution,
-                  on_done=apply)
+                  on_done=apply, pool="cpu")
 
     def _hidden_changed(self) -> None:
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
         self.studios.set_hidden(set(self.hidden_studios))
         run_async(compute_hidden, self.scenes, set(self.hidden_keys), set(self.hidden_posts),
-                  dict(self.hidden_studios), on_done=lambda h: self.model.set_status(hidden=h))
+                  dict(self.hidden_studios), on_done=lambda h: self.model.set_status(hidden=h), pool="cpu")
 
     def mark_downloaded(self, releases: list[Release], on: bool) -> None:
         """User action: flag releases as done, or clear their flags (= wanted again)."""
@@ -1005,7 +1053,7 @@ class MainWindow(QMainWindow):
 
     def rescan_library(self) -> None:
         lib = Settings.resolve(self.settings.library_dir)
-        run_async(scan_library, lib, on_done=self._library_scanned)
+        run_async(scan_library, lib, on_done=self._library_scanned, pool="cpu")
 
     def _library_scanned(self, owned: dict) -> None:
         self.owned = owned
@@ -1427,7 +1475,9 @@ class MainWindow(QMainWindow):
             return
         self.draining = True
         self.downloads.shutdown()
-        QThreadPool.globalInstance().waitForDone(5000)  # let any last DB write complete
+        from .workers import _pools
+        for p in [QThreadPool.globalInstance(), *_pools.values()]:
+            p.waitForDone(2500)  # let any last DB write complete
         self.db.close()
         super().closeEvent(ev)
 

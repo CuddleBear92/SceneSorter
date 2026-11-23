@@ -32,6 +32,33 @@ def _dark_palette(app: QApplication) -> None:
         "QCheckBox::indicator:hover { border-color: #9ca3af; }")
 
 
+def _setup_logging() -> None:
+    """data/scenesorter.log (rotating, ~3 MB max): background failures and warnings, so a
+    problem that only shows up on real data can be diagnosed instead of failing silently."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    from .config import DATA_DIR
+
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(DATA_DIR / "scenesorter.log", maxBytes=1_000_000, backupCount=2,
+                                      encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log = logging.getLogger("scenesorter")
+    log.setLevel(logging.INFO)
+    log.addHandler(handler)
+
+    def excepthook(et, ev, tb):  # exceptions in Qt slots end up here
+        log.error("unhandled exception", exc_info=(et, ev, tb))
+        sys.__excepthook__(et, ev, tb)
+    sys.excepthook = excepthook
+    from . import __version__
+    log.info("SceneSorter build %s starting", __version__)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Heavy work (merging, filtering, matching) runs on worker threads. With Python's
     # default 5 ms GIL switch interval, every small Qt->Python callback on the UI thread
@@ -41,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     # MainWindow), and young-generation passes are what keep the UI responsive.
     import gc
     gc.set_threshold(50_000, 50, 100)
+    _setup_logging()
     from .gui.main_window import MainWindow
 
     app = QApplication(argv if argv is not None else sys.argv)
@@ -75,7 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     # blocks the self-updater from replacing the exe. Give threads a moment, then leave.
     from PySide6.QtCore import QThreadPool
 
-    QThreadPool.globalInstance().waitForDone(3000)
+    from .gui.workers import _pools
+
+    for p in [QThreadPool.globalInstance(), *_pools.values()]:
+        p.waitForDone(1500)
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(rc)

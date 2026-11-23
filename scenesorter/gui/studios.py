@@ -384,4 +384,4 @@ class StudiosTab(QWidget):
             self.model.logos.prefetch([(e.key, e.name) for e in items])
             self.hint.setText(f"{len(items)} studios · click one to browse its scenes" +
                               ("" if logos_enabled else " · add a StashDB API key in Settings to load logos"))
-        run_async(aggregate_studios, scenes, has, self.model.logos.db.studio_names(), on_done=apply)
+        run_async(aggregate_studios, scenes, has, self.model.logos.db.studio_names(), on_done=apply, pool="cpu")
