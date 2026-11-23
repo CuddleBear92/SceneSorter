@@ -1,6 +1,7 @@
 """Merge releases from every source and resolution into one Scene per scene."""
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from functools import lru_cache
 from collections.abc import Iterable
@@ -16,6 +17,9 @@ STRICT_THRESHOLD = 0.85
 
 def _body_tokens(r: Release) -> frozenset[str]:
     return frozenset(tokens(" ".join(r.performers) + " " + r.title))
+
+
+_CODE_RE = re.compile(r"(?<![A-Z0-9])(?:[A-Z]{2,6}-\d{2,5}|FC2-PPV-\d{5,8}|\d{6}[-_]\d{2,3})(?![0-9])")
 
 
 def _duration(group: list[Release]) -> int | None:
@@ -171,6 +175,7 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
         toks = {i: _body_tokens(groups[i][0]) for i in idxs}
         dates = {i: groups[i][0].scene_date for i in idxs}
         durs = {i: _duration(groups[i]) for i in idxs}
+        codes = {i: {c for r in groups[i] for c in _CODE_RE.findall(f"{r.title} {r.raw_title}".upper())} for i in idxs}
         title_toks = {i: frozenset(t for r in groups[i] for t in tokens(r.title)) for i in idxs}
         by_date: dict[date, list[int]] = defaultdict(list)
         undated: list[int] = []
@@ -180,6 +185,8 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
         def try_union(i: int, j: int, strict: bool) -> bool:
             if find(i) == find(j):
                 return False
+            if codes[i] and codes[j] and codes[i].isdisjoint(codes[j]):
+                return False  # different catalogue codes (SONE-884 vs SONE-885) = different releases
             dur = duration_check(durs[i], durs[j])
             if dur == "far":
                 return False
@@ -245,7 +252,7 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
 # the grouping be cached on disk between runs.
 
 #: Bump when merge rules change: cached groupings are then discarded and rebuilt.
-MERGE_VERSION = "1"
+MERGE_VERSION = "2"
 
 
 def studio_key(r: Release) -> str:

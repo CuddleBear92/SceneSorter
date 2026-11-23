@@ -22,7 +22,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "8"
+PARSER_VERSION = "9"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -272,6 +272,13 @@ def parse_title(raw: str) -> dict:
         title = rest  # performers can't be reliably separated from the title here
 
     studio = studio.strip()
+    jav = jav_code(studio)
+    if jav:  # "SONE-884" -> studio SONE (the label), the code stays in the title
+        studio, code = jav
+        if code.lower() not in title.lower():
+            title = f"{code} {title}".strip()
+        return {"studio": studio, "performers": performers, "title": _clean_spaces(title),
+                "scene_date": scene_date, "resolution": resolution}
     dom = re.search(r"(?i)\.(com|net|xxx|tv)\b", studio)
     if dom:  # "18OnlyGirls.com Gina Gerson ..." -> "18OnlyGirls"
         studio = studio[:dom.start()]
@@ -328,6 +335,30 @@ def plausible_performer(name: str) -> bool:
     if re.search(r"(?i)\.(com|net|xxx)\b|www\.|https?:", n):
         return False
     return sum(c.isdigit() for c in n) <= 2
+
+
+_UNCENSORED = {"carib": "Caribbeancom", "caribpr": "Caribbeancom Premium", "1pon": "1Pondo",
+               "paco": "Pacopacomama", "10mu": "10musume"}
+
+
+def jav_code(token: str) -> tuple[str, str] | None:
+    """JAV catalogue code -> (studio label, code).
+
+    ``SONE-884`` / ``SSIS-013`` / ``SPRD-1484`` / ``SS-134`` -> ("SONE", "SONE-884") — the letters
+    are the label (studio), the number the release. Also ``FC2-PPV-1234567`` -> FC2 and
+    uncensored date codes like ``080625-002-CARIB`` -> Caribbeancom. Needs the dash + digits,
+    so names like Tiny4K or "Specs Appeal 2" are never mistaken for codes."""
+    t = token.strip().strip("[]()")
+    m = re.fullmatch(r"(?i)fc2[-_ ]?ppv[-_ ]?(\d{5,8})", t)
+    if m:
+        return "FC2", f"FC2-PPV-{m.group(1)}"
+    m = re.fullmatch(r"(\d{6})[-_](\d{2,3})[-_]([A-Za-z0-9]{3,7})", t)
+    if m and m.group(3).lower() in _UNCENSORED:
+        return _UNCENSORED[m.group(3).lower()], t.upper()
+    m = re.fullmatch(r"([A-Za-z]{2,6})-(\d{2,5})([A-Za-z]?)", t)
+    if m:
+        return m.group(1).upper(), t.upper()
+    return None
 
 
 def plausible_studio(name: str) -> bool:

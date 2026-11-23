@@ -323,7 +323,7 @@ def test_site_dates_shared_by_a_series_do_not_merge_it():
     assert len(scenes) == 3 and {len(s.releases) for s in scenes} == {4}
 
 
-@pytest.mark.parametrize("raw", ["080225-001-CARIB", "1903-Russia-1080p-H", "15", "174",
+@pytest.mark.parametrize("raw", ["080225", "1903-Russia-1080p-H", "15", "174",
                                  "18OnlyGirls.com - Gina Gerson ( Good Vibrations ) 1080p"])
 def test_implausible_studios_rejected(raw):
     st = parse_title(raw)["studio"]
@@ -344,3 +344,39 @@ def test_generic_performer_names_rejected():
         assert plausible_performer(good), good
     p = parse_title("Studio - Jane Doe, Scene 2 - Some Title")
     assert p["performers"] == ["Jane Doe"]
+
+
+@pytest.mark.parametrize("raw,studio,code", [
+    ("SONE-884 Some Title Here", "SONE", "SONE-884"),
+    ("[SSIS-013] Another Title", "SSIS", "SSIS-013"),
+    ("SPRD-1484", "SPRD", "SPRD-1484"),
+    ("SS-134 Title", "SS", "SS-134"),
+    ("sqte-386 lowercase title", "SQTE", "SQTE-386"),
+    ("FC2-PPV-1234567 Title", "FC2", "FC2-PPV-1234567"),
+    ("080625-002-CARIB Title", "Caribbeancom", "080625-002-CARIB"),
+])
+def test_jav_codes_become_label_studios(raw, studio, code):
+    p = parse_title(raw)
+    assert p["studio"] == studio and code in p["title"]
+
+
+@pytest.mark.parametrize("raw,studio", [
+    ("Tiny4K - Jane Doe - Title 1080p", "Tiny4K"),
+    ("Cum4K.24.01.15.Jane.Doe.Title.XXX.1080p.MP4-PRT", "Cum4K"),
+    ("Specs Appeal 2 - Title", "Specs Appeal 2"),
+])
+def test_western_studios_not_mistaken_for_codes(raw, studio):
+    assert parse_title(raw)["studio"] == studio
+
+
+def test_jav_releases_of_one_label_are_separate_scenes():
+    rels = [_blog(f"SONE-{n} Title Number {n} 1080p", f"j{n}") for n in (884, 885, 886)]
+    assert len(merge_releases(rels)) == 3
+
+
+def test_jav_series_with_near_identical_titles_stay_apart():
+    t = "Hot Office Lady Seduces Her Boss After Work Vol"
+    rels = [_blog(f"SONE-{n} {t} 1080p", f"j{n}") for n in (884, 885)]
+    rels += [_blog("SONE-884 " + t + " 720p", "j884b")]
+    scenes = merge_releases(rels)
+    assert len(scenes) == 2 and sorted(len(s.releases) for s in scenes) == [1, 2]
