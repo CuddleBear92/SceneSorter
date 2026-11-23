@@ -72,3 +72,44 @@ def test_different_dates_not_merged():
 def test_duplicate_posts_deduped():
     a = rel("StudioName.24.01.15.Jane.Doe.Some.Title.XXX.1080p.MP4-GRP", "blog", "1")
     assert len(merge_releases([a, a])[0].releases) == 1
+
+
+@pytest.mark.parametrize("raw,group", [
+    ("StudioName.24.01.15.Jane.Doe.Some.Title.XXX.1080p.HEVC.x265.PRT", "PRT"),
+    ("StudioName.24.01.15.Jane.Doe.Some.Title.XXX.720p.MP4-GUSH", "GUSH"),
+    ("[StudioName] Jane Doe - Some Title (2024-01-15) [1080p] [prt]", "PRT"),
+    ("StudioName - Jane Doe - Some Title 1080p PRT", "PRT"),
+    ("StudioName.24.01.15.Jane.Doe.XXX.2160p.HEVC.x265.SomeNewGrp", "SomeNewGrp"),
+    ("StudioName.24.01.15.Jane.Doe.XXX.2160p.MP4-x265", ""),
+    ("StudioName - Jane Doe - Some Title 1080p", ""),
+])
+def test_find_group(raw, group):
+    from scenesorter.parsing import find_group
+    assert find_group(raw) == group
+
+
+def test_group_not_in_match_key():
+    a = rel("StudioName.24.01.15.Jane.Doe.Some.Title.XXX.1080p.HEVC.x265.PRT")
+    b = rel("StudioName.24.01.15.Jane.Doe.Some.Title.XXX.720p.MP4-GUSH")
+    assert match_key(a) == match_key(b)
+    assert a.release_group == "PRT" and b.release_group == "GUSH"
+
+
+def test_undated_messy_title_merges_with_dated():
+    a = rel("StudioName.24.01.15.Jane.Doe.Some.Long.Title.XXX.1080p.HEVC.x265.PRT", "blog", "1")
+    b = rel("StudioName.com - Jane Doe - Some Long Title [720p]", "premium", "2")
+    assert len(merge_releases([a, b])) == 1
+
+
+def test_post_metadata():
+    from scenesorter.parsing import extract_post_metadata
+    m = extract_post_metadata("Filename: X.24.01.15.Jane.XXX.1080p.HEVC.x265.PRT.mkv\nDuration: 00:32:15\n"
+                              "Size: 1.25 GB\nTags: Blonde, POV")
+    assert m["duration_s"] == 32 * 60 + 15
+    assert m["size_bytes"] == int(1.25 * (1 << 30))
+    assert m["tags"] == ["Blonde", "POV"]
+    assert m["filename"].endswith("PRT.mkv")
+
+
+def test_studio_domain_suffix_stripped():
+    assert parse_title("StudioName.com - Jane Doe - Some Title [720p]")["studio"] == "StudioName"

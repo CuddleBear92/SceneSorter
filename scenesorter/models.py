@@ -19,6 +19,7 @@ class DownloadLink:
     kind: LinkKind = LinkKind.DIRECT
     label: str = ""
     size_bytes: int | None = None
+    filename: str = ""
 
 
 @dataclass
@@ -39,6 +40,10 @@ class Release:
     title: str = ""
     scene_date: date | None = None
     resolution: str = ""             # "2160p", "1080p", "720p", ...
+    release_group: str = ""          # "PRT", "GUSH", ... ("" = unknown)
+    filename: str = ""               # file name of the release, if the post lists it
+    duration_s: int | None = None
+    tags: list[str] = field(default_factory=list)
     details_loaded: bool = False
 
     @property
@@ -90,6 +95,21 @@ class Scene:
             if r.thumbnail_url and r.thumbnail_url not in seen:
                 seen.append(r.thumbnail_url)
         return seen
+
+    @property
+    def tags(self) -> list[str]:
+        out: list[str] = []
+        for r in self.releases:
+            out += [t for t in r.tags if t not in out]
+        return out
+
+    @property
+    def duration_s(self) -> int | None:
+        return next((r.duration_s for r in self.releases if r.duration_s), None)
+
+    @property
+    def release_groups(self) -> list[str]:
+        return sorted({r.release_group for r in self.releases if r.release_group})
 
     @property
     def resolutions(self) -> list[str]:

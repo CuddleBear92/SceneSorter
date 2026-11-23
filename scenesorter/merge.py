@@ -9,21 +9,22 @@ from .models import Release, Scene
 from .parsing import match_key, normalise_studio, tokens
 
 FUZZY_THRESHOLD = 0.75
+STRICT_THRESHOLD = 0.85
 
 
 def _body_tokens(r: Release) -> frozenset[str]:
     return frozenset(tokens(" ".join(r.performers) + " " + r.title))
 
 
-def similar(a: frozenset[str], b: frozenset[str]) -> bool:
+def similar(a: frozenset[str], b: frozenset[str], strict: bool = False) -> bool:
     if not a or not b:
         return False
     inter = len(a & b)
-    if inter / len(a | b) >= FUZZY_THRESHOLD:
+    if inter / len(a | b) >= (STRICT_THRESHOLD if strict else FUZZY_THRESHOLD):
         return True
     # One site often appends/omits a performer or tag: subset with enough overlap.
     small = min(len(a), len(b))
-    return small >= 3 and inter == small
+    return small >= (4 if strict else 3) and inter == small
 
 
 def merge_releases(releases: Iterable[Release]) -> list[Scene]:
@@ -51,20 +52,34 @@ def merge_releases(releases: Iterable[Release]) -> list[Scene]:
             i = parent[i]
         return i
 
-    buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    # Fuzzy pass, per studio. Same date -> normal threshold. One side undated
+    # (messy post titles often omit it) -> stricter threshold.
+    by_studio: dict[str, list[int]] = defaultdict(list)
     for i, g in enumerate(groups):
-        r = g[0]
-        buckets[(normalise_studio(r.studio), r.scene_date.isoformat() if r.scene_date else "")].append(i)
+        by_studio[normalise_studio(g[0].studio)].append(i)
 
-    for idxs in buckets.values():
+    for idxs in by_studio.values():
         if len(idxs) < 2:
             continue
         toks = {i: _body_tokens(groups[i][0]) for i in idxs}
-        for x in range(len(idxs)):
-            for y in range(x + 1, len(idxs)):
-                i, j = idxs[x], idxs[y]
-                if find(i) != find(j) and similar(toks[i], toks[j]):
-                    parent[find(j)] = find(i)
+        dates = {i: groups[i][0].scene_date for i in idxs}
+        by_date: dict[date, list[int]] = defaultdict(list)
+        undated: list[int] = []
+        for i in idxs:
+            (by_date[dates[i]] if dates[i] else undated).append(i)
+
+        def try_union(i: int, j: int, strict: bool) -> None:
+            if find(i) != find(j) and similar(toks[i], toks[j], strict):
+                parent[find(j)] = find(i)
+
+        for same in list(by_date.values()) + [undated]:
+            for x in range(len(same)):
+                for y in range(x + 1, len(same)):
+                    try_union(same[x], same[y], strict=False)
+        for i in undated:
+            for same in by_date.values():
+                for j in same:
+                    try_union(j, i, strict=True)
 
     merged: dict[int, list[Release]] = defaultdict(list)
     for i, g in enumerate(groups):

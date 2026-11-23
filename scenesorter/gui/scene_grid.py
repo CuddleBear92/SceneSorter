@@ -61,6 +61,7 @@ class SceneFilter(QSortFilterProxyModel):
         self.text = ""
         self.resolution = ""
         self.source = ""
+        self.group = ""
         self.hide_owned = False
 
     def set(self, **kw) -> None:
@@ -77,15 +78,27 @@ class SceneFilter(QSortFilterProxyModel):
             return False
         if self.source and self.source not in s.sources:
             return False
+        if self.group and self.group not in s.release_groups:
+            return False
         if self.text:
-            hay = " ".join([s.studio, s.title, *s.performers, *(r.raw_title for r in s.releases)]).lower()
+            hay = " ".join([s.studio, s.title, *s.performers, *s.tags, *s.release_groups,
+                            *(r.raw_title for r in s.releases), *(r.filename for r in s.releases)]).lower()
             return all(w in hay for w in self.text.lower().split())
         return True
+
+
+def fmt_duration(sec: int | None) -> str:
+    if not sec:
+        return ""
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 class SceneDelegate(QStyledItemDelegate):
     def __init__(self, source_ids: list[str], parent=None):
         super().__init__(parent)
+        self.preferred_groups: list[str] = []
         self.set_sources(source_ids)
 
     def set_sources(self, source_ids: list[str]) -> None:
@@ -145,6 +158,17 @@ class SceneDelegate(QStyledItemDelegate):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(self.colors.get(sid, QColor("#999")))
             p.drawEllipse(QRect(x, thumb_rect.top() + 9, 10, 10))
+        p.setFont(small)
+        x = thumb_rect.left() + 6
+        for grp in s.release_groups:
+            w = p.fontMetrics().horizontalAdvance(grp) + 10
+            chip = QRect(x, thumb_rect.bottom() - 24, w, 18)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#d97706") if grp in self.preferred_groups else QColor(0, 0, 0, 180))
+            p.drawRoundedRect(chip, 4, 4)
+            p.setPen(QColor("white"))
+            p.drawText(chip, Qt.AlignmentFlag.AlignCenter, grp)
+            x += w + 4
         if owned:
             badge = QRect(thumb_rect.right() - 70, thumb_rect.bottom() - 24, 64, 18)
             p.setBrush(QColor("#16a34a"))
@@ -164,7 +188,8 @@ class SceneDelegate(QStyledItemDelegate):
         p.setFont(opt.font)
         p.setPen(QColor("#9ca3af"))
         fm = p.fontMetrics()
-        line2 = " · ".join(x for x in [s.studio, s.scene_date.isoformat() if s.scene_date else ""] if x)
+        line2 = " · ".join(x for x in [s.studio, s.scene_date.isoformat() if s.scene_date else "",
+                                       fmt_duration(s.duration_s)] if x)
         line3 = ", ".join(s.performers)
         y = text_rect.top() + fm.height() + 4
         p.drawText(QRect(text_rect.left(), y, text_rect.width(), fm.height()), 0,

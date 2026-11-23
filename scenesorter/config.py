@@ -27,6 +27,11 @@ class Settings:
     max_parallel_downloads: int = 2
     auto_sort_completed: bool = True
     check_updates_on_start: bool = True
+    refresh_on_start: bool = True
+    # Incremental refresh stops at the first page with no new posts, or after this many pages.
+    max_refresh_pages: int = 10
+    # Release groups to prefer when picking which release to download (first = best).
+    preferred_groups: list[str] = field(default_factory=lambda: ["PRT"])
     update_repo: str = "CuddleBear92/SceneSorter"
     sources: list[SourceConfig] = field(default_factory=list)
 

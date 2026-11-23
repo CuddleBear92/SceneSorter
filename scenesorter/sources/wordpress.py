@@ -12,12 +12,19 @@ from datetime import datetime
 from urllib.parse import urljoin
 
 from ..models import DownloadLink, LinkKind, Release
-from ..parsing import enrich
+from ..parsing import enrich, extract_post_metadata
 from .base import Source
 
 IMG_RE = re.compile(r"<img[^>]+?(?:data-src|data-lazy-src|src)=[\"']([^\"']+)[\"']", re.I)
 HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.I)
 VIDEO_EXT = (".mp4", ".mkv", ".wmv", ".avi", ".mov", ".m4v")
+
+
+def html_to_text(content_html: str) -> str:
+    t = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</h\d>|</tr>", "\n", content_html)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = html.unescape(t)
+    return re.sub(r"[ \t]+", " ", t)
 
 
 def extract_links(content_html: str, base: str) -> list[DownloadLink]:
@@ -50,7 +57,7 @@ class WordPressSource(Source):
         return urljoin(self.cfg.base_url.rstrip("/") + "/", "wp-json/wp/v2/" + path)
 
     def list_page(self, page: int = 1, query: str = "") -> list[Release]:
-        params = {"page": page, "per_page": self.per_page, "_embed": "wp:featuredmedia"}
+        params = {"page": page, "per_page": self.per_page, "_embed": "wp:featuredmedia,wp:term"}
         if query:
             params["search"] = query
         resp = self.session.get(self._api("posts"), params=params, timeout=30)
@@ -74,6 +81,11 @@ class WordPressSource(Source):
                 posted = datetime.fromisoformat(p["date"]).date()
             except ValueError:
                 pass
+        embedded = p.get("_embedded") or {}
+        tags = [t.get("name") for grp in embedded.get("wp:term") or [] for t in grp
+                if isinstance(t, dict) and t.get("taxonomy") in ("post_tag", "category") and t.get("name")]
+        meta = extract_post_metadata(html_to_text(content))
+        tags += [t for t in meta.get("tags", []) if t not in tags]
         r = Release(
             source=self.id,
             post_id=str(p.get("id")),
@@ -82,6 +94,11 @@ class WordPressSource(Source):
             thumbnail_url=thumb,
             posted=posted,
             links=extract_links(content, self.cfg.base_url),
+            filename=meta.get("filename", ""),
+            duration_s=meta.get("duration_s"),
+            size_bytes=meta.get("size_bytes"),
+            tags=[html.unescape(t) for t in tags if t.lower() != "uncategorized"],
+            release_group=meta.get("release_group", ""),
             details_loaded=True,
         )
         return enrich(r)

@@ -14,13 +14,14 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, updater
 from ..config import CACHE_DIR, DATA_DIR, Settings
+from ..db import Database
 from ..downloader import DownloadManager, Job, State
 from ..library import scan_library, sort_into_library
 from ..merge import merge_releases
 from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
 from ..sources import Source, build_source
-from .scene_grid import SceneDelegate, SceneFilter, SceneModel, SceneRole
+from .scene_grid import SceneDelegate, SceneFilter, SceneModel, SceneRole, fmt_duration
 from .settings_dialog import SettingsDialog
 from .workers import ThumbnailLoader, run_async
 
@@ -49,11 +50,16 @@ class MainWindow(QMainWindow):
         self.resize(1400, 860)
 
         self.quota = QuotaTracker(DATA_DIR / "quota.json")
+        self.db = Database(DATA_DIR / "scenesorter.db")
+        self.db.reparse_if_needed()
+        self.downloaded = self.db.downloaded_posts()
         self.releases: dict[tuple[str, str], Release] = {}
-        self.next_page: dict[str, int] = {}
+        self.next_page: dict[str, int | None] = {}
+        self.in_flight: set[str] = set()
         self.sources: dict[str, Source] = {}
         self.owned: dict[str, list[Path]] = {}
         self.current: Scene | None = None
+        self.downloaded: set[tuple[str, str]] = set()
 
         self.bridge = _JobBridge()
         self.bridge.changed.connect(self._job_changed)
@@ -64,8 +70,10 @@ class MainWindow(QMainWindow):
         self.thumbs = ThumbnailLoader(CACHE_DIR)
         self._build_ui()
         self._load_sources()
+        self._load_cached()
         self.rescan_library()
-        QTimer.singleShot(0, self.refresh)
+        if settings.refresh_on_start:
+            QTimer.singleShot(0, self.refresh)
         if settings.check_updates_on_start:
             QTimer.singleShot(1500, lambda: self.check_updates(silent=True))
 
@@ -95,6 +103,11 @@ class MainWindow(QMainWindow):
         self.src_box.currentIndexChanged.connect(
             lambda _i: self.filter.set(source=self.src_box.currentData() or ""))
         tb.addWidget(self.src_box)
+        self.group_box = QComboBox()
+        self.group_box.setMinimumWidth(130)
+        self.group_box.currentIndexChanged.connect(
+            lambda _i: self.filter.set(group=self.group_box.currentData() or ""))
+        tb.addWidget(self.group_box)
         self.hide_owned = QCheckBox("Hide owned")
         self.hide_owned.toggled.connect(lambda v: self.filter.set(hide_owned=v))
         tb.addWidget(self.hide_owned)
@@ -117,6 +130,7 @@ class MainWindow(QMainWindow):
         self.grid.setSpacing(2)
         self.grid.setModel(self.filter)
         self.delegate = SceneDelegate([])
+        self.delegate.preferred_groups = self.settings.preferred_groups
         self.grid.setItemDelegate(self.delegate)
         self.grid.selectionModel().currentChanged.connect(lambda cur, _prev: self.show_scene(cur.data(SceneRole)))
         self.grid.verticalScrollBar().valueChanged.connect(self._maybe_autoload)
@@ -126,6 +140,7 @@ class MainWindow(QMainWindow):
         self.detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self.detail)
         scroll.setMinimumWidth(380)
 
@@ -192,47 +207,84 @@ class MainWindow(QMainWindow):
         self.src_box.blockSignals(False)
         self._update_quota_label()
 
+    def _load_cached(self) -> None:
+        """Show everything already in the local DB without touching the network."""
+        self.releases = {(r.source, r.post_id): r for r in self.db.load_releases(list(self.sources))}
+        self._rebuild()
+        self.status_label.setText(f"{len(self.model.scenes)} scenes from {len(self.releases)} cached posts")
+
     def refresh(self) -> None:
+        """Incremental refresh: fetch newest pages until a page has nothing new."""
         if not self.sources:
             self._render_empty_detail("No sources configured yet. Open Settings ▸ Sources to add one.")
             return
-        self.releases.clear()
-        self.next_page = {sid: 1 for sid in self.sources}
-        self.load_more()
+        for sid in self.sources:
+            self._fetch(sid, 1, incremental=True)
 
     def load_more(self) -> None:
-        for sid, src in self.sources.items():
-            page = self.next_page.get(sid, 1)
-            if page is None:
-                continue
-            self.next_page[sid] = None  # in flight; restored on completion
-            self.status_label.setText(f"Loading {src.display_name} page {page}…")
-            run_async(src.list_page, page,
-                      on_done=lambda rels, sid=sid, page=page: self._page_loaded(sid, page, rels),
-                      on_fail=lambda err, sid=sid, page=page: self._page_failed(sid, page, err))
+        """Backfill: fetch the next older page of every source."""
+        for sid in self.sources:
+            page = self.next_page.get(sid) or int(self.db.get_meta(f"backfill_page:{sid}", "1")) + 1
+            self._fetch(sid, page, incremental=False)
+
+    def _fetch(self, sid: str, page: int, incremental: bool) -> None:
+        if sid in self.in_flight:
+            return
+        src = self.sources[sid]
+        self.in_flight.add(sid)
+        self.status_label.setText(f"Loading {src.display_name} page {page}…")
+        run_async(src.list_page, page,
+                  on_done=lambda rels: self._page_loaded(sid, page, rels, incremental),
+                  on_fail=lambda err: self._page_failed(sid, page, err))
 
     def _maybe_autoload(self, value: int) -> None:
         bar = self.grid.verticalScrollBar()
         if bar.maximum() and value >= bar.maximum() - 50 and not self.search.text():
             self.load_more()
 
-    def _page_loaded(self, sid: str, page: int, rels: list[Release]) -> None:
+    def _page_loaded(self, sid: str, page: int, rels: list[Release], incremental: bool) -> None:
+        self.in_flight.discard(sid)
+        new = self.db.upsert_releases(rels) if rels else 0
         for r in rels:
             self.releases[(r.source, r.post_id)] = r
         self.next_page[sid] = page + 1 if rels else None
+        backfill = int(self.db.get_meta(f"backfill_page:{sid}", "0"))
+        if rels and page > backfill:
+            self.db.set_meta(f"backfill_page:{sid}", str(page))
         self._rebuild()
-        self.status_label.setText(f"{len(self.model.scenes)} scenes from {len(self.releases)} posts")
+        self.status_label.setText(f"{self.sources[sid].display_name} page {page}: {new} new · "
+                                  f"{len(self.model.scenes)} scenes from {len(self.releases)} posts")
+        if incremental and rels and new == len(rels) and page < self.settings.max_refresh_pages:
+            self._fetch(sid, page + 1, incremental=True)
 
     def _page_failed(self, sid: str, page: int, err: str) -> None:
-        self.next_page[sid] = page
+        self.in_flight.discard(sid)
         self.status_label.setText(f"{sid}: failed to load page {page}: {err.splitlines()[0]}")
 
     def _rebuild(self) -> None:
         current_key = self.current.key if self.current else None
         scenes = merge_releases(self.releases.values())
         self.model.set_scenes(scenes, set(self.owned))
+        self._update_group_box()
         if current_key:
             self.current = next((s for s in scenes if s.key == current_key), self.current)
+
+    def _update_group_box(self) -> None:
+        current = self.group_box.currentData() or ""
+        counts: dict[str, int] = {}
+        for r in self.releases.values():
+            if r.release_group:
+                counts[r.release_group] = counts.get(r.release_group, 0) + 1
+        prefs = [g for g in self.settings.preferred_groups if g in counts]
+        others = sorted((g for g in counts if g not in prefs), key=lambda g: -counts[g])
+        self.group_box.blockSignals(True)
+        self.group_box.clear()
+        self.group_box.addItem("All groups", "")
+        for g in prefs + others:
+            self.group_box.addItem(f"{'★ ' if g in prefs else ''}{g} ({counts[g]})", g)
+        idx = self.group_box.findData(current)
+        self.group_box.setCurrentIndex(max(idx, 0))
+        self.group_box.blockSignals(False)
 
     def rescan_library(self) -> None:
         lib = Path(self.settings.library_dir)
@@ -261,7 +313,11 @@ class MainWindow(QMainWindow):
         title.setWordWrap(True)
         self.detail_layout.addWidget(title)
         meta = [("Studio", scene.studio), ("Date", scene.scene_date.isoformat() if scene.scene_date else ""),
+                ("Posted", scene.posted.isoformat() if scene.posted else ""),
+                ("Duration", fmt_duration(scene.duration_s)),
                 ("Performers", ", ".join(scene.performers)),
+                ("Groups", ", ".join(scene.release_groups)),
+                ("Tags", ", ".join(scene.tags)),
                 ("Sources", ", ".join(self.sources[s].display_name if s in self.sources else s for s in scene.sources))]
         info = QLabel("<br>".join(f"<b>{k}:</b> {v}" for k, v in meta if v))
         info.setWordWrap(True)
@@ -280,21 +336,37 @@ class MainWindow(QMainWindow):
             for rel in sorted(scene.releases_for(res), key=self._source_priority):
                 self.detail_layout.addWidget(self._release_row(rel))
 
-    def _source_priority(self, r: Release) -> int:
-        # Sources listed first in settings are preferred (put premium first).
+    def _source_priority(self, r: Release) -> tuple[int, int]:
+        # Preferred release groups first, then sources in settings order (put premium first).
+        groups = self.settings.preferred_groups
         ids = [c.id for c in self.settings.sources]
-        return ids.index(r.source) if r.source in ids else 99
+        return (groups.index(r.release_group) if r.release_group in groups else 99,
+                ids.index(r.source) if r.source in ids else 99)
 
     def _release_row(self, rel: Release) -> QWidget:
+        outer = QWidget()
+        v = QVBoxLayout(outer)
+        v.setContentsMargins(0, 2, 0, 4)
+        v.setSpacing(0)
         w = QWidget()
         h = QHBoxLayout(w)
-        h.setContentsMargins(0, 2, 0, 2)
+        h.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(w)
+        # zero-width spaces let long dotted release names wrap instead of scrolling
+        fname = QLabel((rel.filename or rel.raw_title).replace(".", ".\u200b").replace("_", "_\u200b"))
+        fname.setStyleSheet("color:#8b95a5; font-size:11px")
+        fname.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        fname.setWordWrap(True)
+        v.addWidget(fname)
         src = self.sources.get(rel.source)
         name = src.display_name if src else rel.source
         quota_txt = ""
         if src and src.daily_quota:
             quota_txt = f" · {self.quota.remaining(src.id, src.daily_quota)} left today"
-        lbl = QLabel(f"<b>{rel.resolution or '?'}</b> — {name}"
+        grp = rel.release_group or "?"
+        grp_html = (f"<span style='color:#f59e0b'><b>{grp}</b></span>"
+                    if grp in self.settings.preferred_groups else grp)
+        lbl = QLabel(f"<b>{rel.resolution or '?'}</b> · {grp_html} — {name}"
                      f"{' · ' + fmt_bytes(rel.size_bytes) if rel.size_bytes else ''}{quota_txt}")
         lbl.setToolTip(rel.raw_title)
         h.addWidget(lbl, 1)
@@ -302,9 +374,12 @@ class MainWindow(QMainWindow):
         btn_dl.clicked.connect(lambda: self.start_download(rel))
         btn_open = QPushButton("Post")
         btn_open.clicked.connect(lambda: webbrowser.open(rel.post_url))
+        if (rel.source, rel.post_id) in self.downloaded:
+            btn_dl.setText("Again")
+            btn_dl.setToolTip("Already downloaded once")
         h.addWidget(btn_dl)
         h.addWidget(btn_open)
-        return w
+        return outer
 
     # ------------------------------------------------------------ downloads
     def start_download(self, rel: Release) -> None:
@@ -347,6 +422,9 @@ class MainWindow(QMainWindow):
                                                self.settings.rename_template)
 
     def _job_changed(self, job: Job) -> None:
+        self.db.log_download(job)
+        if job.state in (State.DONE, State.HANDED_OFF):
+            self.downloaded.add((job.release.source, job.release.post_id))
         row = self.job_rows.get(job.id)
         if row is None:
             row = self.table.rowCount()
@@ -358,7 +436,8 @@ class MainWindow(QMainWindow):
             prog += f"  {fmt_bytes(job.speed_bps)}/s"
         status = job.state.value + (f": {job.error}" if job.error else "")
         dest = str(job.final_path or job.path or job.dest_dir)
-        for col, val in enumerate([r.title or r.raw_title, r.resolution, r.source, status, prog, dest]):
+        res = f"{r.resolution} {r.release_group}".strip()
+        for col, val in enumerate([r.title or r.raw_title, res, r.source, status, prog, dest]):
             item = QTableWidgetItem(val)
             item.setData(Qt.ItemDataRole.UserRole, job.id)
             self.table.setItem(row, col, item)
@@ -380,7 +459,9 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.settings = dlg.result_settings()
             self.settings.save()
+            self.delegate.preferred_groups = self.settings.preferred_groups
             self._load_sources()
+            self._load_cached()
             self.rescan_library()
             self.refresh()
 
@@ -414,5 +495,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev) -> None:  # noqa: N802
         self.downloads.shutdown()
+        self.db.close()
         super().closeEvent(ev)
 

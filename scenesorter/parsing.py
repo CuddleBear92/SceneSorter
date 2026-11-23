@@ -20,18 +20,30 @@ from datetime import date
 
 from .models import Release
 
+# Bump whenever parsing changes; cached posts are re-parsed on next start.
+PARSER_VERSION = "3"
+
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
 
 # Tokens that describe the *file*, not the scene. Removed before matching.
-NOISE_TOKENS = {
+FORMAT_TOKENS = {
     "xxx", "mp4", "mkv", "wmv", "avi", "web", "webrip", "webdl", "web-dl", "dl", "hdtv",
     "hevc", "h264", "h265", "x264", "x265", "avc", "av1", "aac", "10bit", "8bit", "hdr",
-    "sdr", "60fps", "30fps", "fps", "uhd", "4k", "fhd", "hd", "sd", "prt", "repack",
+    "sdr", "60fps", "30fps", "fps", "uhd", "4k", "fhd", "hd", "sd", "repack",
     "proper", "internal", "encoded", "encode", "reencode", "re-encode", "split", "scenes",
-    "remastered", "full", "ktr", "gush", "xc", "p2p", "nbq", "tg", "nr", "rq", "wrb", "iak",
-    "vsex", "cpd", "vbq", "fsp", "sexors", "grp", "rarbg",
+    "remastered", "full", "rarbg",
 }
+# Known release groups, canonical spelling. Unknown groups are still detected
+# from position (trailing "-GRP", "[GRP]", last token after the encode info);
+# this list is only used to recognise a group in less standard positions and
+# to normalise its case. Extend freely.
+KNOWN_GROUPS = [
+    "PRT", "GUSH", "KTR", "XLeech", "NBQ", "P2P", "WRB", "iak", "VSEX", "CPD", "SEXORS",
+    "XC", "YAPG", "BTWA", "XVX", "VBQ", "FSP", "TBP", "WhiteHat", "GalaXXXy", "NoGrp",
+]
+_GROUP_CANON = {g.lower(): g for g in KNOWN_GROUPS}
+NOISE_TOKENS = FORMAT_TOKENS | set(_GROUP_CANON)
 # Words joining performer names; dropped from the match key.
 JOINERS = {"and", "with", "feat", "ft", "featuring", "vs", "x", "&", "aka"}
 
@@ -56,6 +68,106 @@ def find_resolution(text: str) -> str:
     if UHD_RE.search(text):
         return "2160p"
     return ""
+
+
+VIDEO_EXT_RE = re.compile(r"\.(mp4|mkv|wmv|avi|mov|m4v|webm)$", re.I)
+
+
+def _is_format_token(t: str) -> bool:
+    t = t.lower()
+    return t in FORMAT_TOKENS or bool(RESOLUTION_RE.fullmatch(t)) or bool(re.fullmatch(r"\d+(\.\d+)?\s*[gm]i?b", t))
+
+
+def canon_group(g: str) -> str:
+    g = g.strip(" -_.[]()")
+    return _GROUP_CANON.get(g.lower(), g)
+
+
+def find_group(raw: str) -> str:
+    """Best-effort release group from a release name / post title.
+
+    Handles ``...XXX.1080p.HEVC.x265.PRT``, ``...MP4-GRP``, ``... [GRP]``,
+    ``... (GRP)`` and known group names anywhere after the resolution.
+    """
+    text = VIDEO_EXT_RE.sub("", strip_accents(raw).strip())
+    # 1. trailing bracketed token that isn't format info: "[PRT]" / "(PRT)"
+    m = re.search(r"[\[(]\s*([A-Za-z0-9]{2,15})\s*[\])]\s*$", text)
+    if m and not _is_format_token(m.group(1)):
+        return canon_group(m.group(1))
+    # 2. scene-style trailing "-GRP" (directly attached to the previous token)
+    m = re.search(r"\S-([A-Za-z0-9]{2,15})\s*$", text)
+    if m and not _is_format_token(m.group(1)) and not m.group(1).isdigit():
+        return canon_group(m.group(1))
+    # 3. last token after the encode block: "XXX.1080p.HEVC.x265.PRT"
+    toks = [t for t in re.split(r"[\s._\[\]()\-]+", text) if t]
+    res_idx = max((i for i, t in enumerate(toks) if RESOLUTION_RE.fullmatch(t) or t.lower() == "xxx"), default=None)
+    if res_idx is not None:
+        tail = [t for t in toks[res_idx + 1:] if not _is_format_token(t)]
+        if len(tail) == 1 and not tail[0].isdigit():
+            return canon_group(tail[0])
+        for t in reversed(tail):
+            if t.lower() in _GROUP_CANON:
+                return _GROUP_CANON[t.lower()]
+    # 4. a known group name standing alone anywhere near the end
+    for t in reversed(toks[-4:]):
+        if t.lower() in _GROUP_CANON:
+            return _GROUP_CANON[t.lower()]
+    return ""
+
+
+def parse_duration(s: str) -> int | None:
+    """'1:02:03' / '32:15' / '32 min' / '1h 2m' -> seconds."""
+    s = s.strip().lower()
+    m = re.fullmatch(r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})", s)
+    if m:
+        h, mi, se = int(m.group(1) or 0), int(m.group(2)), int(m.group(3))
+        return h * 3600 + mi * 60 + se
+    m = re.fullmatch(r"(?:(\d+)\s*h(?:ours?|rs?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?|s)?)?)?\s*(?:(\d+)\s*s(?:ec(?:onds?|s)?)?)?", s)
+    if m and any(m.groups()):
+        return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0)
+    return None
+
+
+_SIZE_MULT = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40}
+
+
+def parse_size(num: str, unit: str) -> int | None:
+    try:
+        return int(float(num.replace(",", ".")) * _SIZE_MULT[unit[0].lower()])
+    except (ValueError, KeyError):
+        return None
+
+
+_FIELD = r"(?:^|\n|\|)\s*{name}\s*[:\-–]\s*([^\n|]+)"
+
+
+def extract_post_metadata(text: str) -> dict:
+    """Pull 'Label: value' style metadata out of a post body (plain text).
+
+    Returns any of: filename, duration_s, size_bytes, tags, release_group.
+    """
+    out: dict = {}
+
+    def grab(names: str) -> str | None:
+        m = re.search(_FIELD.format(name=f"(?:{names})"), text, re.I)
+        return m.group(1).strip() if m else None
+
+    fn = grab(r"file\s*name|filename|release(?:\s*name)?|file")
+    if fn:
+        out["filename"] = fn
+    dur = grab(r"duration|runtime|run\s*time|length|time")
+    if dur and (d := parse_duration(re.split(r"[,(]", dur)[0])):
+        out["duration_s"] = d
+    size = grab(r"file\s*size|size")
+    if size and (m := re.search(r"([\d.,]+)\s*([KMGT])i?B", size, re.I)):
+        out["size_bytes"] = parse_size(m.group(1), m.group(2))
+    tags = grab(r"tags|genres?|categories|niches?")
+    if tags:
+        out["tags"] = [t.strip() for t in re.split(r"[,;#]", tags) if t.strip()]
+    grp = grab(r"group|release\s*group|encoder|ripper")
+    if grp:
+        out["release_group"] = canon_group(grp.split()[0])
+    return out
 
 
 def find_date(text: str) -> tuple[date | None, tuple[int, int] | None]:
@@ -128,6 +240,7 @@ def parse_title(raw: str) -> dict:
         rest = _strip_tail(rest)
         title = rest  # performers can't be reliably separated from the title here
 
+    studio = re.sub(r"(?i)\.(com|net|xxx|tv)\s*$", "", studio.strip())
     studio = _title_case(_clean_spaces(re.sub(r"[._]", " ", studio)))
     title = _clean_spaces(title)
     return {
@@ -171,6 +284,7 @@ def tokens(s: str) -> list[str]:
 
 
 def normalise_studio(s: str) -> str:
+    s = re.sub(r"(?i)[ .](com|net|xxx|tv)$", "", s.strip())
     return "".join(tokens(s))
 
 
@@ -190,4 +304,15 @@ def enrich(r: Release) -> Release:
     r.title = r.title or p["title"]
     r.scene_date = r.scene_date or p["scene_date"]
     r.resolution = r.resolution or p["resolution"]
+    r.release_group = r.release_group or find_group(r.filename or "") or find_group(r.raw_title)
+    if not r.resolution and r.filename:
+        r.resolution = find_resolution(r.filename)
     return r
+
+
+def reparse(r: Release) -> Release:
+    """Recompute title-derived fields from scratch (after a parser upgrade)."""
+    r.studio, r.performers, r.title, r.scene_date = "", [], "", None
+    r.resolution = r.resolution if r.resolution and not find_resolution(r.raw_title) else ""
+    r.release_group = ""
+    return enrich(r)

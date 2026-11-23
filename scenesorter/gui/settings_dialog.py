@@ -51,6 +51,15 @@ class SettingsDialog(QDialog):
         self.auto_sort = QCheckBox("Rename && move finished downloads into the library")
         self.auto_sort.setChecked(settings.auto_sort_completed)
         form.addRow("", self.auto_sort)
+        self.groups = QLineEdit(", ".join(settings.preferred_groups))
+        self.groups.setPlaceholderText("PRT, GUSH, …")
+        form.addRow("Preferred release groups", self.groups)
+        form.addRow("", QLabel("Comma-separated, best first. Preferred groups are highlighted and picked first."))
+        self.refresh_start = QCheckBox("Check sources for new posts on start")
+        self.refresh_start.setChecked(settings.refresh_on_start)
+        form.addRow("", self.refresh_start)
+        self.max_pages = QSpinBox(minimum=1, maximum=100, value=settings.max_refresh_pages)
+        form.addRow("Max pages per refresh", self.max_pages)
         self.updates = QCheckBox("Check for updates on start")
         self.updates.setChecked(settings.check_updates_on_start)
         form.addRow("", self.updates)
@@ -122,6 +131,9 @@ class SettingsDialog(QDialog):
             max_parallel_downloads=self.parallel.value(),
             auto_sort_completed=self.auto_sort.isChecked(),
             check_updates_on_start=self.updates.isChecked(),
+            refresh_on_start=self.refresh_start.isChecked(),
+            max_refresh_pages=self.max_pages.value(),
+            preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
         )
         self.accept()

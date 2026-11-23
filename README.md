@@ -23,6 +23,20 @@ your library.
 - **Library awareness.** The app scans your library and marks scenes you
   already have, even when the file you have is a different resolution or came
   from another site.
+- **Local database and cache.** Every scraped post is stored in a local SQLite
+  file (`scenesorter.db`). The stored fields are:
+  - title fields: studio, performers, title, scene date and resolution
+  - release info: release group, file name, duration and size
+  - post info: tags, the date it was posted, thumbnail URL and links
+  - download history
+
+  On start the app shows everything from the cache. A refresh fetches pages
+  only until it reaches one with no new posts. Thumbnails are cached on disk,
+  so each one is downloaded only once.
+- **Release groups.** The group is detected from the release name, in forms
+  like `…XXX.1080p.HEVC.x265.PRT`, `…MP4-GRP` and `[GRP]`, or from a
+  `Group:` / `Filename:` line in the post. You can filter by group. Preferred
+  groups (PRT by default) are highlighted and offered first.
 - **Self-updating exe.** GitHub Actions builds `SceneSorter.exe`. The app checks
   GitHub Releases on start and can update itself in place.
 
@@ -36,6 +50,7 @@ scenesorter/
   sources/         Source plugin interface + adapters (wordpress.py = generic WP REST)
   downloader.py    Download queue (HTTP with progress; torrent hand-off)
   library.py       Rename templates, sort into library, scan owned files
+  db.py            SQLite cache: posts, per-resolution files, download history
   quota.py         Rolling 24h per-source action counter
   updater.py       GitHub Releases self-update
   gui/             PySide6 UI
@@ -71,3 +86,13 @@ The workflow runs the tests, builds `SceneSorter.exe` with PyInstaller and
 publishes a GitHub Release. Installed copies find the new release on their next
 start. Every push to `main` also builds a test exe, which you can download from
 that workflow run's artifacts.
+
+## Planned integrations
+
+- **ThePornDB / StashDB (stash-box GraphQL).** Match scenes to stash-box IDs
+  for clean metadata, performers, tags and covers. Use those IDs to name
+  files.
+- **Stash.** Check which scenes are already in Stash, trigger a scan after
+  sorting a file, and use the stash-box ID to link the two.
+- **Whisparr.** Sync what Whisparr wants and what it already has, and import
+  finished downloads.
