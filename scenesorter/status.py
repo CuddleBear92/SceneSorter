@@ -65,3 +65,18 @@ def target_release(scene: Scene, preferred_resolution: str, order_key) -> Releas
     target = target_rank(scene, preferred_resolution)
     candidates = [r for r in scene.releases if r.resolution_rank == target] or scene.releases
     return sorted(candidates, key=order_key)[0]
+
+
+def source_order(source_ids: list[str], preferred_source: str) -> list[str]:
+    """Settings order, with the preferred source moved to the front."""
+    return ([preferred_source] if preferred_source in source_ids else []) + \
+        [s for s in source_ids if s != preferred_source]
+
+
+def preferred_release(scene: Scene, preferred_resolution: str, groups: list[str], sources: list[str]) -> Release:
+    """What "Download preferred" grabs: wanted resolution (or the fallback that
+    counts as complete), then preferred release group, then preferred source."""
+    def key(r: Release) -> tuple[int, int]:
+        return (groups.index(r.release_group) if r.release_group in groups else len(groups),
+                sources.index(r.source) if r.source in sources else len(sources))
+    return target_release(scene, preferred_resolution, key)

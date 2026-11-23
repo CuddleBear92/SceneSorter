@@ -46,7 +46,7 @@ class SettingsDialog(QDialog):
         row.addWidget(self.template)
         row.addWidget(reset)
         form.addRow("Rename template", row)
-        form.addRow("", QLabel("Fields: {studio} {date} {year} {performers} {title} {resolution} {source}"
+        form.addRow("", QLabel("Fields: {studio} {date} {year} {performers} {title} {resolution} {group} {source}"
                                " — use / for sub-folders"))
         form.addRow("Preview", self.preview)
         self.parallel = QSpinBox(minimum=1, maximum=8, value=settings.max_parallel_downloads)
@@ -63,9 +63,22 @@ class SettingsDialog(QDialog):
         self.wanted_res.setToolTip("A scene counts as downloaded once this resolution (or higher) is done. "
                                    "If it isn't posted, the best posted one counts. Anything less = partial.")
         form.addRow("Wanted resolution", self.wanted_res)
-        self.auto_sort = QCheckBox("Rename && move finished downloads into the library")
+        self.pref_source = QComboBox()
+        self.pref_source.addItem("Sources list order", "")
+        for c in settings.sources:
+            self.pref_source.addItem(c.id, c.id)
+        self.pref_source.setCurrentIndex(max(0, self.pref_source.findData(settings.preferred_source)))
+        self.pref_source.setToolTip("“Download preferred” picks: wanted resolution → preferred release group → "
+                                    "this source → the rest in Sources order")
+        form.addRow("Preferred source", self.pref_source)
+        self.auto_sort = QCheckBox("Move finished downloads into the library")
         self.auto_sort.setChecked(settings.auto_sort_completed)
         form.addRow("", self.auto_sort)
+        self.rename = QCheckBox("Rename them with the template above (off = keep the original file name)")
+        self.rename.setChecked(settings.rename_files)
+        self.rename.setEnabled(settings.auto_sort_completed)
+        self.auto_sort.toggled.connect(self.rename.setEnabled)
+        form.addRow("", self.rename)
         self.groups = QLineEdit(", ".join(settings.preferred_groups))
         self.groups.setPlaceholderText("PRT, GUSH, …")
         form.addRow("Preferred release groups", self.groups)
@@ -96,7 +109,8 @@ class SettingsDialog(QDialog):
                            f"Available types: {', '.join(sorted(SOURCE_TYPES))}"))
         self.sources_edit = QPlainTextEdit(json.dumps([asdict(c) for c in settings.sources], indent=2))
         v.addWidget(self.sources_edit)
-        add = QPushButton("Add example source")
+        add = QPushButton("Add default sources")
+        add.setToolTip("Adds PornRips.to and EncodedFapFiles (skips any id already in the list)")
         add.clicked.connect(self._add_example)
         v.addWidget(add)
         tabs.addTab(src, "Sources")
@@ -209,13 +223,20 @@ class SettingsDialog(QDialog):
         except (KeyError, ValueError, IndexError) as e:
             self.preview.setText(f"<span style='color:#f87171'>Invalid template: {e}</span>")
 
+    DEFAULT_SOURCES = [
+        {"id": "PornRips.to", "type": "wordpress", "base_url": "https://pornrips.to/", "enabled": True,
+         "options": {"display_name": "PornRips.to", "per_page": 50}},
+        {"id": "encodedfap", "type": "encodedfapfiles", "base_url": "https://encodedfapfiles.pages.dev/",
+         "enabled": True, "options": {"session_token": "", "per_page": 48, "sort": "date_desc"}},
+    ]
+
     def _add_example(self) -> None:
         try:
             data = json.loads(self.sources_edit.toPlainText() or "[]")
         except ValueError:
             data = []
-        data.append({"id": f"blog{len(data) + 1}", "type": "wordpress", "base_url": "https://example.com/",
-                     "enabled": True, "options": {"display_name": "My blog", "per_page": 30}})
+        have = {d.get("id") for d in data if isinstance(d, dict)}
+        data += [json.loads(json.dumps(d)) for d in self.DEFAULT_SOURCES if d["id"] not in have]
         self.sources_edit.setPlainText(json.dumps(data, indent=2))
 
     def _accept(self) -> None:
@@ -241,6 +262,8 @@ class SettingsDialog(QDialog):
             magnets_to_blackhole=self.magnets_bh.isChecked(),
             preferred_resolution=self.wanted_res.currentData(),
             auto_sort_completed=self.auto_sort.isChecked(),
+            rename_files=self.rename.isChecked(),
+            preferred_source=self.pref_source.currentData(),
             check_updates_on_start=self.updates.isChecked(),
             refresh_on_start=self.refresh_start.isChecked(),
             max_refresh_pages=self.max_pages.value(),

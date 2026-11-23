@@ -46,3 +46,32 @@ def test_best_available_when_no_preference():
 def test_target_release():
     s = scene("2160p", "1080p", "720p")
     assert target_release(s, "1080p", lambda r: 0).resolution == "1080p"
+
+
+def test_preferred_release_order():
+    from scenesorter.status import preferred_release, source_order
+    rels = [enrich(Release(src, f"{src}{res}{grp}", "", f"Studio.24.01.15.Jane.Doe.Title.XXX.{res}.MP4-{grp}"))
+            for src, res, grp in [("blog", "1080p", "GUSH"), ("blog", "1080p", "PRT"), ("premium", "1080p", "PRT"),
+                                  ("premium", "2160p", "PRT"), ("blog", "720p", "PRT")]]
+    (s,) = merge_releases(rels)
+    order = source_order(["blog", "premium"], "premium")
+    assert order == ["premium", "blog"]
+    r = preferred_release(s, "1080p", ["PRT"], order)
+    assert (r.resolution, r.release_group, r.source) == ("1080p", "PRT", "premium")
+    r = preferred_release(s, "1080p", ["PRT"], ["blog", "premium"])
+    assert r.source == "blog" and r.release_group == "PRT"           # group beats source
+    r = preferred_release(s, "", ["PRT"], order)
+    assert r.resolution == "2160p"                                     # "best available"
+    r = preferred_release(s, "1080p", ["GUSH", "PRT"], order)
+    assert r.release_group == "GUSH"                                   # group list order matters
+
+
+def test_own_renamed_files_still_match():
+    from scenesorter.config import DEFAULT_TEMPLATE
+    from scenesorter.filematch import SceneIndex
+    from scenesorter.library import render_name
+    s = scene("1080p", "720p")
+    rel = next(r for r in s.releases if r.resolution == "1080p")
+    name = render_name(DEFAULT_TEMPLATE, rel, ".mp4").name
+    m = SceneIndex([s]).match(name)
+    assert m.scene is s and m.release.resolution == "1080p" and m.release.release_group == "PRT"

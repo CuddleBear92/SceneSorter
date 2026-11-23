@@ -28,6 +28,7 @@ def render_name(template: str, r: Release, ext: str) -> Path:
         "date": r.scene_date.isoformat() if r.scene_date else "",
         "year": str(r.scene_date.year) if r.scene_date else "",
         "resolution": r.resolution or "",
+        "group": r.release_group or "",
         "source": r.source,
     }
     rendered = template.format(**fields)
@@ -51,11 +52,14 @@ def pick_video(path: Path) -> Path | None:
     return max(vids, key=lambda p: p.stat().st_size) if vids else None
 
 
-def sort_into_library(src: Path, r: Release, library_dir: Path, template: str) -> Path:
+def sort_into_library(src: Path, r: Release, library_dir: Path, template: str, rename: bool = True) -> Path:
+    """Move a finished download into the library — renamed with the template, or
+    (rename=False) keeping its original file name."""
     video = pick_video(src)
     if video is None:
         raise FileNotFoundError(f"No video file found in {src}")
-    dest = Path(library_dir) / render_name(template, r, video.suffix)
+    name = render_name(template, r, video.suffix) if rename else Path(safe_component(video.name))
+    dest = Path(library_dir) / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         stem, n = dest.stem, 2

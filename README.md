@@ -17,9 +17,20 @@ your library.
 - **Daily quota tracking.** Sources can declare a daily action limit. Each
   started download counts as one action in a rolling 24-hour window. The UI
   shows how many are left and blocks downloads once the limit is reached.
-- **Auto-sort.** Finished downloads are renamed from a template and moved into
-  your library. The default template is
-  `{studio}/{studio} - {date} - {performers} - {title} [{resolution}]`.
+- **Auto-sort.** Finished downloads are moved into your library. Renaming is a
+  separate toggle: turn it off to keep the original file name. The default
+  template is
+  `{studio}/{studio} - {date} - {performers} - {title} [{resolution}] [{group}]`.
+  Available fields are `{studio} {date} {year} {performers} {title}
+  {resolution} {group} {source}`. Empty fields and their brackets are dropped.
+- **Download preferred.** One button in the scene panel and the right-click
+  menu, which also works on several selected scenes. It picks the release in
+  this order:
+  1. your wanted resolution
+  2. your preferred release group
+  3. your preferred source, then the rest in Sources order
+
+  With several scenes selected, ones already downloaded are skipped.
 - **Library awareness.** The app scans your library and marks scenes you
   already have, even when the file you have is a different resolution or came
   from another site.

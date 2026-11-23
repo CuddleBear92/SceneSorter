@@ -48,6 +48,31 @@ def test_render_name_sanitises():
     assert p == Path("StudioName", "StudioName - 2024-01-15 - Jane Doe - Some Title [1080p].mp4")
 
 
+def test_render_name_group_and_default():
+    from scenesorter.config import DEFAULT_TEMPLATE
+    r = enrich(Release("blog", "1", "", "StudioName.24.01.15.Jane.Doe.Some.Title.XXX.1080p.HEVC.x265.PRT"))
+    assert render_name(DEFAULT_TEMPLATE, r, ".mkv").name.endswith("[1080p] [PRT].mkv")
+    r.release_group = ""
+    assert render_name(DEFAULT_TEMPLATE, r, ".mkv").name.endswith("[1080p].mkv")  # empty [] removed
+
+
+def test_old_default_template_upgraded(tmp_path):
+    import json
+    from scenesorter.config import DEFAULT_TEMPLATE, Settings
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps({"rename_template": "{studio}/{studio} - {date} - {performers} - {title} [{resolution}]"}))
+    assert Settings.load(f).rename_template == DEFAULT_TEMPLATE
+    f.write_text(json.dumps({"rename_template": "{studio}/{title}"}))
+    assert Settings.load(f).rename_template == "{studio}/{title}"   # custom templates are left alone
+
+
+def test_sort_without_rename(tmp_path):
+    f = tmp_path / "Orig.Name.1080p.mp4"
+    f.write_bytes(b"x")
+    out = sort_into_library(f, sample(), tmp_path / "lib", "{studio}/{title}", rename=False)
+    assert out == tmp_path / "lib" / "Orig.Name.1080p.mp4"
+
+
 def test_render_name_empty_fields():
     r = enrich(Release("blog", "1", "", "StudioName - Just A Title"))
     p = render_name("{studio} - {date} - {title} [{resolution}]", r, ".mp4")

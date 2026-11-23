@@ -23,7 +23,7 @@ from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
 from ..sources import RateLimited, Source, build_source
 from ..parsing import normalise_studio
-from ..status import DONE, FINISHED, GRABBED, scene_status, target_release
+from ..status import DONE, FINISHED, GRABBED, preferred_release, scene_status, source_order, target_release
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
 from .scene_pane import ScenePane
 from .settings_dialog import SettingsDialog
@@ -755,6 +755,10 @@ class MainWindow(QMainWindow):
         what = "scene" if one else f"{len(scenes)} scenes"
         menu = QMenu(self)
         states = {self.model.state(s.key) for s in scenes}
+        if states != {"complete"} or one:
+            menu.addAction(f"⬇ Download preferred{'' if one else f' ({len(scenes)} scenes)'}",
+                           lambda: self.download_preferred(scenes))
+            menu.addSeparator()
         if states != {"complete"}:
             menu.addAction(f"Mark {what} as downloaded", lambda: self.mark_scenes(scenes, True))
         if states != {"none"}:
@@ -895,6 +899,16 @@ class MainWindow(QMainWindow):
             hid.setStyleSheet("color:#f87171")
             lay.addWidget(hid)
         complete = state == "complete"
+        best = self._preferred(scene)
+        src = self.sources.get(best.source)
+        bits = " · ".join(x for x in [best.resolution, best.release_group, src.display_name if src else best.source] if x)
+        dl = QPushButton(f"⬇  Download preferred  ({bits})")
+        dl.setStyleSheet("QPushButton { background:#2563eb; color:white; padding:6px; border-radius:4px; font-weight:bold }"
+                         "QPushButton:hover { background:#3b82f6 }")
+        dl.setToolTip("Picks your wanted resolution, then preferred release group, then preferred source "
+                      "(Settings ▸ General)." + ("\nAlready downloaded — this grabs it again." if complete else ""))
+        dl.clicked.connect(lambda: self.download_preferred([scene]))
+        lay.addWidget(dl)
         mark = QPushButton("Mark as not downloaded" if complete else "Mark as downloaded")
         mark.setToolTip("Clear every flag on this scene so it's wanted again" if complete else
                         f"Flag the {self.settings.preferred_resolution or 'best'} release as downloaded")
@@ -909,12 +923,36 @@ class MainWindow(QMainWindow):
             for rel in sorted(scene.releases_for(res), key=self._source_priority):
                 lay.addWidget(self._release_row(rel))
 
+    def _source_order(self) -> list[str]:
+        return source_order([c.id for c in self.settings.sources], self.settings.preferred_source)
+
     def _source_priority(self, r: Release) -> tuple[int, int]:
-        # Preferred release groups first, then sources in settings order (put premium first).
+        # Preferred release groups first, then the preferred source, then sources in settings order.
         groups = self.settings.preferred_groups
-        ids = [c.id for c in self.settings.sources]
+        ids = self._source_order()
         return (groups.index(r.release_group) if r.release_group in groups else 99,
                 ids.index(r.source) if r.source in ids else 99)
+
+    def _preferred(self, scene: Scene) -> Release:
+        return preferred_release(scene, self.settings.preferred_resolution, self.settings.preferred_groups,
+                                 self._source_order())
+
+    def download_preferred(self, scenes: list[Scene]) -> None:
+        """Grab the preferred release of each scene (wanted resolution -> group -> source).
+
+        For several scenes, ones already downloaded at the wanted resolution are skipped."""
+        if len(scenes) > 1:
+            scenes = [s for s in scenes if self.model.state(s.key) != "complete"]
+            if not scenes:
+                self.status_label.setText("All selected scenes are already downloaded.")
+                return
+            if len(scenes) > 10 and QMessageBox.question(
+                    self, "Download preferred", f"Start {len(scenes)} downloads?") != QMessageBox.StandardButton.Yes:
+                return
+        for sc in scenes:
+            self.start_download(self._preferred(sc))
+        if len(scenes) > 1:
+            self.status_label.setText(f"Started {len(scenes)} preferred downloads")
 
     def _release_row(self, rel: Release) -> QWidget:
         outer = QWidget()
@@ -1022,7 +1060,7 @@ class MainWindow(QMainWindow):
         """Runs on the download thread."""
         if self.settings.auto_sort_completed and job.path:
             job.final_path = sort_into_library(job.path, job.release, Settings.resolve(self.settings.library_dir),
-                                               self.settings.rename_template)
+                                               self.settings.rename_template, rename=self.settings.rename_files)
 
     def _job_changed(self, job: Job) -> None:
         self.db.log_download(job)

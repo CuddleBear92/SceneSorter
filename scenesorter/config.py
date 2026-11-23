@@ -28,7 +28,8 @@ CONFIG_DIR = DATA_DIR
 CACHE_DIR = DATA_DIR / "cache"
 CONFIG_FILE = DATA_DIR / "settings.json"
 
-DEFAULT_TEMPLATE = "{studio}/{studio} - {date} - {performers} - {title} [{resolution}]"
+DEFAULT_TEMPLATE = "{studio}/{studio} - {date} - {performers} - {title} [{resolution}] [{group}]"
+OLD_DEFAULT_TEMPLATES = {"{studio}/{studio} - {date} - {performers} - {title} [{resolution}]"}
 
 
 @dataclass
@@ -49,7 +50,9 @@ class Settings:
     # stash-box scene matching (needs API keys under stashboxes)
     scene_matching: bool = True
     match_interval_s: int = 3           # one scene lookup every N seconds
-    auto_sort_completed: bool = True
+    auto_sort_completed: bool = True    # move finished downloads into the library
+    rename_files: bool = True           # ...renamed with rename_template (off = keep the original name)
+    preferred_source: str = ""          # source id picked first by "Download preferred" ("" = list order)
     check_updates_on_start: bool = True
     refresh_on_start: bool = True
     # Incremental refresh stops at the first page with no new posts, or after this many pages.
@@ -76,6 +79,8 @@ class Settings:
         boxes = raw.pop("stashboxes", None)
         known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
         s = cls(**known, sources=srcs)
+        if s.rename_template in OLD_DEFAULT_TEMPLATES:  # untouched old default -> new default (adds {group})
+            s.rename_template = DEFAULT_TEMPLATE
         if boxes is not None:
             s.stashboxes = [StashBoxConfig(**b) for b in boxes]
         return s
