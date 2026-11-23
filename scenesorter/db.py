@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .models import DownloadLink, LinkKind, Release
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -117,6 +117,9 @@ CREATE TABLE IF NOT EXISTS performers (
     image_file TEXT,
     checked_at REAL
 );
+
+-- Favourite studios / performers (kind = 'studio' | 'performer', key = normalised name)
+CREATE TABLE IF NOT EXISTS favorites (kind TEXT, key TEXT, name TEXT, added_at REAL, PRIMARY KEY (kind, key));
 
 -- Studio metadata/logos looked up on stash-box instances (cached forever).
 CREATE TABLE IF NOT EXISTS studios (
@@ -378,6 +381,23 @@ class Database:
             rows = self.conn.execute("SELECT key, endpoint FROM scene_matches WHERE stash_id IS NOT NULL "
                                      "OR checked_at > ?", (time.time() - max_age_s,)).fetchall()
         return {(r[0], r[1]) for r in rows}
+
+    def delete_scene_matches(self, rows: list[tuple[str, str]]) -> None:
+        """Forget matches (key, endpoint) so they get looked up again."""
+        with self._lock:
+            self.conn.executemany("DELETE FROM scene_matches WHERE key=? AND endpoint=?", rows)
+
+    # ------------------------------------------------------------ favorites
+    def favorites(self, kind: str) -> dict[str, str]:
+        with self._lock:
+            return {r[0]: r[1] for r in self.conn.execute("SELECT key, name FROM favorites WHERE kind=?", (kind,))}
+
+    def set_favorite(self, kind: str, key: str, name: str, on: bool) -> None:
+        with self._lock:
+            if on:
+                self.conn.execute("INSERT OR REPLACE INTO favorites VALUES (?,?,?,?)", (kind, key, name, time.time()))
+            else:
+                self.conn.execute("DELETE FROM favorites WHERE kind=? AND key=?", (kind, key))
 
     # ----------------------------------------------------------- performers
     def performer(self, key: str) -> sqlite3.Row | None:

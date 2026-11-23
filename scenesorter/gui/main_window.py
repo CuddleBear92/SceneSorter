@@ -33,6 +33,7 @@ from .studios import LogoService, StudiosTab
 from ..importer import scan as scan_files
 from ..performers import collect as collect_performers
 from ..status import VERIFIED
+from ..stashbox import duration_check
 from .workers import ThumbnailLoader, run_async
 
 LINK_PREFERENCE = {LinkKind.DIRECT: 0, LinkKind.TORRENT: 1, LinkKind.MAGNET: 2, LinkKind.HOSTER: 3}
@@ -68,6 +69,7 @@ class MainWindow(QMainWindow):
         self.performer_filter: tuple[str, str] = ("", "")
         self.matches: dict[str, list[dict]] = self.db.scene_matches()
         self._import_running = False
+        self.fav = {"studio": self.db.favorites("studio"), "performer": self.db.favorites("performer")}
         self.releases: dict[tuple[str, str], Release] = {}
         self.next_page: dict[str, int | None] = {}
         self.in_flight: set[str] = set()
@@ -150,6 +152,10 @@ class MainWindow(QMainWindow):
                                  "(includes grabbed and partial)")
         self.have_box.currentIndexChanged.connect(lambda _i: self._set_filter(have=self.have_box.currentData()))
         tb.addWidget(self.have_box)
+        self.fav_box = QCheckBox("★ Favorites")
+        self.fav_box.setToolTip("Only scenes from favourite studios or with favourite performers")
+        self.fav_box.toggled.connect(lambda v: self._set_filter(fav_only=v))
+        tb.addWidget(self.fav_box)
         self.show_hidden = QCheckBox("Show hidden")
         self.show_hidden.setToolTip("Show scenes and studios you've hidden (right-click to unhide)")
         self.show_hidden.toggled.connect(lambda v: self._set_filter(show_hidden=v))
@@ -185,12 +191,18 @@ class MainWindow(QMainWindow):
             pane.context_requested.connect(self._scene_menu)
         self.model.status_changed.connect(self._update_tab_counts)
         self.model.on_visible = self.matcher.visible
+        self.model.fav_studios = set(self.fav["studio"])
+        self.model.fav_performers = set(self.fav["performer"])
 
         self.studios = StudiosTab(self.logos)
         self.studios.studio_activated.connect(self.filter_studio)
         self.studios.hide_requested.connect(self.hide_studio)
+        self.studios.favorite_requested.connect(lambda k, n, on: self.set_favorite("studio", k, n, on))
+        self.studios.set_favorites(set(self.fav["studio"]))
         self.performers_tab = PerformersTab(self.perf_images)
         self.performers_tab.performer_activated.connect(self.filter_performer)
+        self.performers_tab.favorite_requested.connect(lambda k, n, on: self.set_favorite("performer", k, n, on))
+        self.performers_tab.set_favorites(set(self.fav["performer"]))
 
         # --- downloads tab
         self.table = QTableWidget(0, 6)
@@ -260,6 +272,32 @@ class MainWindow(QMainWindow):
                                         Qt.TransformationMode.SmoothTransformation) if pm else QPixmap())
         self.perf_btn.setText(f" {name}  ✕")
         self.perf_btn.setToolTip(f"Showing only scenes with {name} — click to clear")
+
+    def set_favorite(self, kind: str, key: str, name: str, on: bool) -> None:
+        self.db.set_favorite(kind, key, name, on)
+        self.fav[kind] = self.db.favorites(kind)
+        self.model.fav_studios = set(self.fav["studio"])
+        self.model.fav_performers = set(self.fav["performer"])
+        self.studios.set_favorites(set(self.fav["studio"]))
+        self.performers_tab.set_favorites(set(self.fav["performer"]))
+        self.model.set_status()  # repaint + refilter
+        for pane in self.panes:
+            pane.refresh_detail()
+        self.status_label.setText(f"{'★ Added' if on else 'Removed'} {name} {'to' if on else 'from'} favorites")
+
+    def _drop_bad_matches(self) -> None:
+        """Matches saved before the duration check existed: re-check them now that we
+        know both durations; clearly wrong lengths are forgotten and looked up again."""
+        bad = []
+        for s in self.scenes:
+            for m in self.matches.get(s.key, []):
+                if duration_check(s.duration_s, m.get("duration")) == "far":
+                    bad.append((s.key, m["endpoint"]))
+        if bad:
+            self.db.delete_scene_matches(bad)
+            self.matches = self.db.scene_matches()
+            self.matcher.configure(self.settings.stashboxes, self.settings.scene_matching,
+                                   self.settings.match_interval_s)
 
     # ------------------------------------------------- performers/matching
     def _scene_matched(self, key: str) -> None:
@@ -561,6 +599,7 @@ class MainWindow(QMainWindow):
             self._update_tab_counts()
             self.studios.set_scenes(scenes, self.model.has, bool(self.logos.boxes))
             self.studios.set_hidden(set(self.hidden_studios))
+            self._drop_bad_matches()
             self.matcher.prefetch(scenes)
             self.perf_timer.start()
         elif err:
@@ -654,6 +693,10 @@ class MainWindow(QMainWindow):
                            lambda k=skey, n=name, h=sh: self.hide_studio(k, n, not h))
         if one and one.studio:
             menu.addSeparator()
+            sk, sn = normalise_studio(one.studio), self.model.display_studio(one)
+            sf = sk in self.fav["studio"]
+            menu.addAction(f"{'★ Remove' if sf else '☆ Add'} studio “{sn}” {'from' if sf else 'to'} favorites",
+                           lambda: self.set_favorite("studio", sk, sn, not sf))
             menu.addAction(f"Show only “{self.model.display_studio(one)}”",
                            lambda: self.filter_studio(normalise_studio(one.studio), self.model.display_studio(one)))
         if one:
@@ -701,18 +744,35 @@ class MainWindow(QMainWindow):
         title.setWordWrap(True)
         lay.addWidget(title)
         studio_name = self.model.display_studio(scene)
-        studio = QLabel(f"<a href='#' style='color:#60a5fa'>{studio_name}</a>") if scene.studio else None
-        if studio:
-            studio.setToolTip("Show all scenes from this studio")
-            studio.linkActivated.connect(lambda _l: self.filter_studio(normalise_studio(scene.studio), studio_name))
+        skey = normalise_studio(scene.studio) if scene.studio else ""
+        if scene.studio:
+            sfav = skey in self.fav["studio"]
+            studio = QLabel(f"<a href='fav' style='color:{'#fbbf24' if sfav else '#6b7280'};text-decoration:none'>"
+                            f"{'★' if sfav else '☆'}</a> "
+                            f"<a href='show' style='color:#60a5fa'>{studio_name}</a>")
+            studio.setToolTip("Click the name to show all scenes from this studio; the star toggles favourite")
+            studio.linkActivated.connect(lambda l: self.set_favorite("studio", skey, studio_name, not sfav) if l == "fav"
+                                         else self.filter_studio(skey, studio_name))
             lay.addWidget(studio)
         perf_keys = self.model.scene_performers.get(scene.key, [])
         if perf_keys:
-            links = ", ".join(f"<a href='{k}' style='color:#60a5fa'>{self.model.performer_names.get(k, k)}</a>"
-                              for k in perf_keys)
+            favs = self.fav["performer"]
+            links = ", ".join(
+                f"<a href='fav:{k}' style='color:{'#fbbf24' if k in favs else '#6b7280'};text-decoration:none'>"
+                f"{'★' if k in favs else '☆'}</a>"
+                f"<a href='{k}' style='color:#60a5fa'>{self.model.performer_names.get(k, k)}</a>" for k in perf_keys)
             perf = QLabel(f"<b>Performers:</b> {links}")
             perf.setWordWrap(True)
-            perf.linkActivated.connect(lambda k: self.filter_performer(k, self.model.performer_names.get(k, k)))
+            perf.setToolTip("Click a name to show their scenes; the star toggles favourite")
+
+            def perf_link(link: str) -> None:
+                k = link[4:] if link.startswith("fav:") else link
+                name = self.model.performer_names.get(k, k)
+                if link.startswith("fav:"):
+                    self.set_favorite("performer", k, name, k not in self.fav["performer"])
+                else:
+                    self.filter_performer(k, name)
+            perf.linkActivated.connect(perf_link)
             lay.addWidget(perf)
         found = self.matches.get(scene.key, [])
         if found:

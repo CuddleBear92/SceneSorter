@@ -153,19 +153,43 @@ def normalise_scene(raw: dict) -> dict:
     }
 
 
+def duration_check(ours: int | None, theirs: int | None) -> str:
+    """'close', 'far' or '' (unknown / in between).
+
+    Close = within 30 s or 3 %; far = off by more than 3 min AND 15 % (site
+    encodes often trim intros/outros, so small gaps are normal)."""
+    if not ours or not theirs:
+        return ""
+    diff, longest = abs(ours - theirs), max(ours, theirs)
+    if diff <= max(30, 0.03 * longest):
+        return "close"
+    if diff > max(180, 0.15 * longest):
+        return "far"
+    return ""
+
+
 def pick_scene(scene, candidates: list[dict]) -> dict | None:
     """Accept a stash-box scene only if studio and date agree (±1 day) and the
-    words overlap; undated scenes need a strong title match."""
+    words overlap; undated scenes need a strong title match.
+
+    Duration (when both sides know it) is a check too: a clearly different
+    length rejects the candidate, a near-identical length lowers the bar for
+    the title match and wins ties (e.g. "Part 1" vs "Part 2" on the same day).
+    """
     from datetime import date as _date
 
     from .parsing import tokens
 
     want_studio = normalise_studio(scene.studio) if scene.studio else ""
     want_words = set(tokens(" ".join(scene.performers) + " " + (scene.title or "")))
+    our_duration = scene.duration_s
     best, best_score = None, 0.0
     for c in candidates:
         studios = {normalise_studio(c["studio"]), normalise_studio(c.get("parent", ""))} - {""}
         if want_studio and want_studio not in studios:
+            continue
+        dur = duration_check(our_duration, c.get("duration"))
+        if dur == "far":
             continue
         words = set(tokens(c["title"] + " " + " ".join(p["name"] for p in c["performers"])))
         overlap = len(want_words & words) / len(want_words | words) if want_words and words else 0.0
@@ -178,17 +202,20 @@ def pick_scene(scene, candidates: list[dict]) -> dict | None:
             pass
         if scene.scene_date and cdate:
             delta = abs((cdate - scene.scene_date).days)
-            if delta > 1 or sim < 0.3:
+            if delta > 1 or sim < (0.15 if dur == "close" else 0.3):
                 continue
             score = 0.6 + 0.4 * sim - 0.05 * delta
         else:
-            if sim < 0.7:
+            if sim < (0.5 if dur == "close" else 0.7):
                 continue
             score = 0.3 + 0.5 * sim
+        if dur == "close":
+            score += 0.05
         if score > best_score:
             best, best_score = c, score
     if best:
-        best = dict(best, score=round(best_score, 3))
+        best = dict(best, score=round(min(best_score, 1.0), 3),
+                    duration_check=duration_check(our_duration, best.get("duration")) or "unknown")
     return best
 
 

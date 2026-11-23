@@ -27,6 +27,8 @@ class SceneModel(QAbstractListModel):
         self.studio_names: dict[str, str] = {}  # studio key -> official stash-box name
         self.scene_performers: dict[str, list[str]] = {}  # scene key -> performer keys
         self.performer_names: dict[str, str] = {}         # performer key -> display name
+        self.fav_studios: set[str] = set()
+        self.fav_performers: set[str] = set()
         self.on_visible = None  # callback(scene) when a card is painted (drives on-screen-first matching)
         self.thumbs = thumbs
         self._row_by_key: dict[str, int] = {}
@@ -64,6 +66,10 @@ class SceneModel(QAbstractListModel):
 
     def has(self, key: str) -> bool:
         return self.state(key) == "complete"
+
+    def is_favorite(self, s: Scene) -> bool:
+        return (bool(s.studio) and studio_key(s.studio) in self.fav_studios) or \
+            any(k in self.fav_performers for k in self.scene_performers.get(s.key, ()))
 
     def display_studio(self, s: Scene) -> str:
         return self.studio_names.get(studio_key(s.studio), s.studio) if s.studio else ""
@@ -103,6 +109,7 @@ class SceneFilter(QSortFilterProxyModel):
         self.group = ""
         self.studio = ""        # normalised studio key
         self.performer = ""     # performer key
+        self.fav_only = False   # only scenes with a favourite studio or performer
         # "" = all, "missing" = still wanted (none/grabbed/partial), "partial" = grabbed or partial,
         # "have" = complete, "any" = anything grabbed/partial/complete (the Downloaded tab)
         self.have = have
@@ -133,6 +140,8 @@ class SceneFilter(QSortFilterProxyModel):
         if self.studio and studio_key(s.studio) != self.studio:
             return False
         if self.performer and self.performer not in model.scene_performers.get(s.key, ()):
+            return False
+        if self.fav_only and not model.is_favorite(s):
             return False
         if self.resolution and self.resolution not in s.resolutions:
             return False
@@ -257,7 +266,7 @@ class SceneDelegate(QStyledItemDelegate):
         p.setFont(opt.font)
         p.setPen(QColor("#9ca3af"))
         fm = p.fontMetrics()
-        line2 = " · ".join(x for x in [model.display_studio(s), s.scene_date.isoformat() if s.scene_date else "",
+        line2 = ("★ " if model.is_favorite(s) else "") + " · ".join(x for x in [model.display_studio(s), s.scene_date.isoformat() if s.scene_date else "",
                                        fmt_duration(s.duration_s)] if x)
         line3 = ", ".join(s.performers)
         y = text_rect.top() + fm.height() + 4

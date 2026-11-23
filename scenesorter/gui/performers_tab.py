@@ -4,12 +4,12 @@ from __future__ import annotations
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from ..performers import PerformerEntry
 from .matching import PerformerImages
-from .studios import StudioEntry, StudioFilter, StudioRole
+from .studios import StudioEntry, StudioFilter, StudioRole, paint_star
 
 CARD_W, PHOTO_H, TEXT_H = 160, 210, 46
 
@@ -20,6 +20,7 @@ class PerformerModel(QAbstractListModel):
         self.images = images
         self.items: list[StudioEntry] = []   # same shape as studios: key, name, scenes, have
         self.sources: dict[str, set[str]] = {}
+        self.favorites: set[str] = set()
         self._row: dict[str, int] = {}
         images.ready.connect(self._ready)
 
@@ -89,6 +90,7 @@ class PerformerDelegate(QStyledItemDelegate):
             p.setPen(QColor("#374151"))
             p.drawText(photo, Qt.AlignmentFlag.AlignCenter, initials)
         p.setClipping(False)
+        paint_star(p, r, e.key in index.model().sourceModel().favorites)
         text = QRect(r.left() + 8, photo.bottom() + 4, r.width() - 16, TEXT_H)
         f = QFont(opt.font)
         f.setBold(True)
@@ -106,6 +108,7 @@ class PerformerDelegate(QStyledItemDelegate):
 
 class PerformersTab(QWidget):
     performer_activated = Signal(str, str)  # key, name
+    favorite_requested = Signal(str, str, bool)
 
     def __init__(self, images: PerformerImages, parent=None):
         super().__init__(parent)
@@ -127,6 +130,9 @@ class PerformersTab(QWidget):
         self.hint.setStyleSheet("color:#888")
         top.addWidget(self.search)
         top.addWidget(self.sort_box)
+        self.fav_only = QCheckBox("★ Favorites only")
+        self.fav_only.toggled.connect(lambda v: self.proxy.set(fav_only=v))
+        top.addWidget(self.fav_only)
         top.addWidget(self.hint, 1)
         self.view = QListView()
         self.view.setViewMode(QListView.ViewMode.IconMode)
@@ -137,6 +143,8 @@ class PerformersTab(QWidget):
         self.view.setItemDelegate(PerformerDelegate())
         self.view.clicked.connect(self._activate)
         self.view.activated.connect(self._activate)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._menu)
         lay = QVBoxLayout(self)
         lay.addLayout(top)
         lay.addWidget(self.view)
@@ -145,6 +153,23 @@ class PerformersTab(QWidget):
         e = idx.data(StudioRole)
         if e:
             self.performer_activated.emit(e.key, e.name)
+
+    def _menu(self, pos) -> None:
+        idx = self.view.indexAt(pos)
+        e = idx.data(StudioRole) if idx.isValid() else None
+        if not e:
+            return
+        menu = QMenu(self)
+        menu.addAction(f"Show scenes with {e.name}", lambda: self.performer_activated.emit(e.key, e.name))
+        fav = e.key in self.model.favorites
+        menu.addAction("★ Remove from favorites" if fav else "☆ Add to favorites",
+                       lambda: self.favorite_requested.emit(e.key, e.name, not fav))
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def set_favorites(self, favs: set[str]) -> None:
+        self.model.favorites = favs
+        self.proxy.invalidate()
+        self.proxy.sort(0)
 
     def set_performers(self, perf: dict[str, PerformerEntry], has, images_enabled: bool) -> None:
         self.model.set_performers(perf, has)

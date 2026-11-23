@@ -90,8 +90,19 @@ your library.
   been unchanged for a minute.
 - **stash-box scene matching.** Each scene is looked up on ThePornDB and
   StashDB in the background, one lookup every 3 s, with on-screen scenes first.
-  A match is accepted only when studio and date agree. Matches add performers,
-  duration and links to the scene pages.
+  A match is accepted only when studio and date agree. When both sides know
+  the duration, it's checked too: a clearly different length rejects the
+  candidate, and a near-identical length breaks ties, such as Part 1 vs Part 2
+  on the same day. Matches add performers, duration and links to the scene
+  pages.
+- **Favourites.** Star studios and performers in any of these places:
+  - the right-click menu on a Studios or Performers card
+  - the ☆ next to a name in the detail panel
+  - the right-click menu on a scene
+
+  Favourites sort first and have a "★ Favorites only" filter on both tabs.
+  Browse also gets a **★ Favorites** filter for scenes from a favourite studio
+  or with a favourite performer.
 - **Performers tab.** Builds the performer list from three places:
   - stash-box matches
   - names in post titles

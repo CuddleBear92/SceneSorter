@@ -14,7 +14,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from ..db import Database
@@ -154,6 +154,7 @@ class StudioModel(QAbstractListModel):
         super().__init__(parent)
         self.logos = logos
         self.hidden: set[str] = set()
+        self.favorites: set[str] = set()
         self.items: list[StudioEntry] = []
         self._row: dict[str, int] = {}
         logos.ready.connect(self._logo_ready)
@@ -201,11 +202,29 @@ class StudioModel(QAbstractListModel):
             self.dataChanged.emit(idx, idx)
 
 
+
+def paint_star(p: QPainter, rect: QRect, on: bool) -> None:
+    """Small gold star badge in the card's top-left corner."""
+    if not on:
+        return
+    badge = QRect(rect.left() + 6, rect.top() + 6, 22, 22)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(0, 0, 0, 170))
+    p.drawEllipse(badge)
+    p.setPen(QColor("#fbbf24"))
+    f = p.font()
+    f.setBold(True)
+    f.setPointSizeF(max(9.0, f.pointSizeF()))
+    p.setFont(f)
+    p.drawText(badge, Qt.AlignmentFlag.AlignCenter, "★")
+
+
 class StudioFilter(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.text = ""
         self.sort_mode = "name"
+        self.fav_only = False
         self.sort(0)
 
     def set(self, **kw) -> None:
@@ -215,10 +234,18 @@ class StudioFilter(QSortFilterProxyModel):
         self.sort(0)
 
     def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
-        return not self.text or self.text.lower() in self.sourceModel().items[row].name.lower()
+        m = self.sourceModel()
+        e = m.items[row]
+        if self.fav_only and e.key not in m.favorites:
+            return False
+        return not self.text or self.text.lower() in e.name.lower()
 
     def lessThan(self, a, b) -> bool:  # noqa: N802
         ea, eb = a.data(StudioRole), b.data(StudioRole)
+        favs = self.sourceModel().favorites
+        fa, fb = ea.key in favs, eb.key in favs
+        if fa != fb:  # favourites always first
+            return fa
         if self.sort_mode == "scenes":
             return (eb.scenes, ea.name.lower()) < (ea.scenes, eb.name.lower())
         if self.sort_mode == "have":
@@ -268,6 +295,7 @@ class StudioDelegate(QStyledItemDelegate):
         p.setPen(QColor("#9ca3af"))
         sub = f"{e.scenes} scene{'s' if e.scenes != 1 else ''}" + (f" · {e.have} downloaded" if e.have else "")
         p.drawText(QRect(text_rect.left(), text_rect.top() + fm.height() + 2, text_rect.width(), fm.height()), 0, sub)
+        paint_star(p, r, e.key in model.favorites)
         if hidden:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 160))
@@ -281,6 +309,7 @@ class StudioDelegate(QStyledItemDelegate):
 class StudiosTab(QWidget):
     studio_activated = Signal(str, str)  # key, display name
     hide_requested = Signal(str, str, bool)  # key, name, hide?
+    favorite_requested = Signal(str, str, bool)  # key, name, favourite?
 
     def __init__(self, logos: LogoService, parent=None):
         super().__init__(parent)
@@ -300,6 +329,9 @@ class StudiosTab(QWidget):
         self.hint.setStyleSheet("color:#888")
         top.addWidget(self.search)
         top.addWidget(self.sort_box)
+        self.fav_only = QCheckBox("★ Favorites only")
+        self.fav_only.toggled.connect(lambda v: self.proxy.set(fav_only=v))
+        top.addWidget(self.fav_only)
         top.addWidget(self.hint, 1)
         self.view = QListView()
         self.view.setViewMode(QListView.ViewMode.IconMode)
@@ -328,10 +360,18 @@ class StudiosTab(QWidget):
             return
         menu = QMenu(self)
         menu.addAction(f"Show scenes from {e.name}", lambda: self.studio_activated.emit(e.key, e.name))
+        fav = e.key in self.model.favorites
+        menu.addAction("★ Remove from favorites" if fav else "☆ Add to favorites",
+                       lambda: self.favorite_requested.emit(e.key, e.name, not fav))
         hidden = e.key in self.model.hidden
         menu.addAction(f"{'Unhide' if hidden else 'Hide'} studio “{e.name}”",
                        lambda: self.hide_requested.emit(e.key, e.name, not hidden))
         menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def set_favorites(self, favs: set[str]) -> None:
+        self.model.favorites = favs
+        self.proxy.invalidate()
+        self.proxy.sort(0)
 
     def set_hidden(self, hidden: set[str]) -> None:
         self.model.hidden = hidden

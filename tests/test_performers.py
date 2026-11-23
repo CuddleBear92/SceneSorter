@@ -32,3 +32,32 @@ def test_pick_scene_requires_studio_and_date():
     assert pick_scene(s, [dict(good, date="2023-08-21")]) is None          # wrong date
     assert pick_scene(s, [dict(good, studio="Tushy", parent="")]) is None  # wrong studio
     assert pick_scene(s, [dict(good, studio="Something", parent="BrazzersExxtra")])["id"] == "1"  # parent ok
+
+
+def _cand(**kw):
+    base = {"id": "1", "title": "Angela White : Unbound Part 1", "date": "2023-07-21", "studio": "Brazzers Exxtra",
+            "parent": "Brazzers", "performers": [{"id": "a", "name": "Angela White"}], "image_url": None,
+            "duration": 4037}
+    return dict(base, **kw)
+
+
+def test_duration_rejects_and_breaks_ties():
+    rels = [enrich(Release("blog", "1", "", "BrazzersExxtra.23.07.21.Angela.White.Unbound.XXX.1080p.HEVC.x265.PRT",
+                           duration_s=4000))]
+    (s,) = merge_releases(rels)
+    # way too short -> rejected even though studio, date and words fit
+    assert pick_scene(s, [_cand(duration=1500)]) is None
+    # two same-day candidates with similar titles: the one with the right length wins
+    best = pick_scene(s, [_cand(id="p2", title="Angela White : Unbound Part 2", duration=3700),
+                          _cand(id="p1", duration=4010)])
+    assert best["id"] == "p1" and best["duration_check"] == "close"
+    # unknown duration on their side: falls back to the old rules
+    assert pick_scene(s, [_cand(duration=None)])["duration_check"] == "unknown"
+
+
+def test_duration_check_bounds():
+    from scenesorter.stashbox import duration_check
+    assert duration_check(2000, 2025) == "close"
+    assert duration_check(2000, 2150) == ""        # intro/outro trims are normal
+    assert duration_check(2000, 1000) == "far"
+    assert duration_check(None, 1000) == ""

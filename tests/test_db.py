@@ -89,3 +89,12 @@ def test_migrates_build3_flag_names(tmp_path):
     db.close()
     assert Database(tmp_path / "s.db").flags() == {("blog", "1"): "grabbed", ("blog", "2"): "done",
                                                    ("blog", "3"): "done"}
+
+
+def test_favorites(tmp_path):
+    db = Database(tmp_path / "s.db")
+    db.set_favorite("studio", "tushy", "Tushy", True)
+    db.set_favorite("performer", "lilylou", "Lily Lou", True)
+    assert db.favorites("studio") == {"tushy": "Tushy"} and db.favorites("performer") == {"lilylou": "Lily Lou"}
+    db.set_favorite("studio", "tushy", "Tushy", False)
+    assert db.favorites("studio") == {}
