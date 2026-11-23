@@ -98,15 +98,15 @@ python -m scenesorter
 
 ## Releasing
 
-To publish a release, do either of the following:
+Versions are flat build numbers: `v1`, `v2`, `v3`, and so on.
 
-- Push a tag: `git tag v0.2.0 && git push origin v0.2.0`
-- Go to **Actions ▸ Release ▸ Run workflow** and enter `0.2.0`
-
-The workflow runs the tests, builds `SceneSorter.exe` with PyInstaller and
-publishes a GitHub Release. Installed copies find the new release on their next
-start. Every push to `main` also builds a test exe, which you can download from
-that workflow run's artifacts.
+- To release, go to **Actions ▸ Release ▸ Run workflow**. Leave the version
+  field empty and the workflow uses the next number. You can also push a tag
+  like `v7`.
+- The workflow runs the tests, builds `SceneSorter.exe`, and publishes a GitHub
+  Release. Copies already installed find the new build on their next start.
+- Every push to `main` also builds a test exe. Download it from that workflow
+  run's artifacts.
 
 ## Planned integrations
 

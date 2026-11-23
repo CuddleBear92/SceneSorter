@@ -74,3 +74,11 @@ def test_version_compare():
     assert is_newer("v0.2.0", "0.1.9")
     assert not is_newer("v0.1.0", "0.1.0")
     assert is_newer("1.10.0", "1.9.3")
+
+
+def test_flat_build_numbers():
+    assert is_newer("v2", "1")
+    assert is_newer("v2", "0.1.0")  # first release was tagged v0.1.0 (= build 1)
+    assert is_newer("v10", "9")
+    assert not is_newer("v1", "1")
+    assert is_newer("v1", "0-dev+abc1234")  # dev builds always see v1+ as newer

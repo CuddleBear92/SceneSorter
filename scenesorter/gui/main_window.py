@@ -46,7 +46,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: Settings):
         super().__init__()
         self.settings = settings
-        self.setWindowTitle(f"SceneSorter {__version__}")
+        self.setWindowTitle(f"SceneSorter — build {__version__}")
         self.resize(1400, 860)
 
         self.quota = QuotaTracker(DATA_DIR / "quota.json")
