@@ -56,6 +56,17 @@ class SettingsDialog(QDialog):
         self.magnets_bh = QCheckBox("Also save magnet links into the black hole as .magnet files")
         self.magnets_bh.setChecked(settings.magnets_to_blackhole)
         form.addRow("", self.magnets_bh)
+        cache_row = QHBoxLayout()
+        self.cache_mb = QSpinBox(minimum=100, maximum=100_000, value=settings.image_cache_mb, suffix=" MB")
+        self.cache_mb.setSingleStep(256)
+        self.cache_mb.setToolTip("Thumbnails, covers, logos and photos are cached on disk (downscaled). "
+                                 "When the cache grows past this, the least recently used images are removed.")
+        clear = QPushButton("Clear image cache")
+        clear.setToolTip("Delete every cached image now; they're downloaded again when shown")
+        clear.clicked.connect(self._clear_cache)
+        cache_row.addWidget(self.cache_mb)
+        cache_row.addWidget(clear)
+        form.addRow("Image cache size", cache_row)
         self.wanted_res = QComboBox()
         for label, val in (("Best available", ""), ("2160p", "2160p"), ("1080p", "1080p"), ("720p", "720p")):
             self.wanted_res.addItem(label, val)
@@ -217,6 +228,10 @@ class SettingsDialog(QDialog):
         form.addRow(label, row)
         return edit
 
+    def _clear_cache(self) -> None:
+        if self.rescan is not None:
+            self.rescan.prune_image_cache(max_mb=0)
+
     def _toggle_rescan(self, sid: str) -> None:
         if self.rescan is None:
             return
@@ -332,6 +347,7 @@ class SettingsDialog(QDialog):
             crawl_interval_s=self.crawl_interval.value(),
             auto_refresh_minutes=self.auto_refresh.value(),
             rescan_interval_s=self.rescan_interval.value(),
+            image_cache_mb=self.cache_mb.value(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
             stashboxes=self._stashboxes(),

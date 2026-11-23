@@ -130,6 +130,12 @@ your library.
   Browse.
 - **Torrent black hole.** Set a folder and `.torrent` files are saved there for
   your client's watch folder. Magnets can optionally be saved as `.magnet` files.
+- **Bounded memory.** Images are decoded straight to display size, so a
+  4000 px portrait never sits in memory at full size. Only the most recently
+  used few hundred of each kind are kept in memory. The disk cache stores
+  downscaled copies and is capped at 1 GB by default (Settings ▸ General ▸
+  Image cache size). The least recently used images are removed first, and a
+  **Clear image cache** button deletes them all.
 - **Self-updating exe.** GitHub Actions builds `SceneSorter.exe`. The app checks
   GitHub Releases on start and can update itself in place.
 

@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
         self.job_rows: dict[str, int] = {}
 
         self.thumbs = ThumbnailLoader(CACHE_DIR)
+        QTimer.singleShot(5000, self.prune_image_cache)
         self._apply_image_headers()
         self.logos = LogoService(self.db, CACHE_DIR, self)
         self.logos.configure(settings.stashboxes)
@@ -316,6 +317,16 @@ class MainWindow(QMainWindow):
             if urls:
                 out[key] = urls
         return out
+
+    def prune_image_cache(self, max_mb: int | None = None) -> None:
+        """Keep the on-disk image cache under the configured size (oldest files go first)."""
+        from .images import prune_cache
+
+        limit = (self.settings.image_cache_mb if max_mb is None else max_mb) * 1024 * 1024
+        folders = [CACHE_DIR / d for d in ("thumbs", "logos", "performers")]
+        run_async(prune_cache, folders, limit,
+                  on_done=lambda r: r[0] != r[1] and self.status_label.setText(
+                      f"Image cache trimmed from {r[0] // 2**20} MB to {r[1] // 2**20} MB"))
 
     def _apply_image_headers(self) -> None:
         from urllib.parse import urlparse
@@ -724,6 +735,10 @@ class MainWindow(QMainWindow):
         if self._rebuild_running:
             self._rebuild_dirty = True
         elif not self.rebuild_timer.isActive():
+            # Big libraries take seconds to merge; while pages keep arriving (crawl/rescan)
+            # wait ~3x the last merge time between rebuilds instead of merging after every page.
+            last = getattr(self, "_last_rebuild_s", 0.0)
+            self.rebuild_timer.setInterval(int(min(30.0, max(0.4, 3 * last)) * 1000))
             self.rebuild_timer.start()
 
     def _rebuild(self) -> None:
@@ -733,12 +748,14 @@ class MainWindow(QMainWindow):
         """Merge off the UI thread; 40k+ posts take about a second."""
         self._rebuild_running = True
         self._rebuild_dirty = False
+        self._rebuild_started = time.time()
         snapshot = list(self.releases.values())
         run_async(merge_releases, snapshot, on_done=self._apply_rebuild,
                   on_fail=lambda e: self._apply_rebuild(None, e))
 
     def _apply_rebuild(self, scenes, err: str | None = None) -> None:
         self._rebuild_running = False
+        self._last_rebuild_s = time.time() - getattr(self, "_rebuild_started", time.time())
         if scenes is not None:
             self.scenes = scenes
             self.model.studio_names = self.db.studio_names()

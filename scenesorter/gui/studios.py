@@ -21,6 +21,7 @@ from ..db import Database
 from ..models import Scene
 from ..parsing import normalise_studio
 from ..stashbox import StashBox, StashBoxConfig
+from .images import LOGO_SIZE, PixmapLRU, load_file, shrink_for_disk
 from .workers import run_async
 
 RETRY_NOT_FOUND_S = 30 * 24 * 3600
@@ -38,24 +39,11 @@ class StudioEntry:
 
 
 def render_image(data: bytes, max_w: int = 440, max_h: int = 220) -> QPixmap | None:
-    """Load PNG/JPEG/WebP or SVG bytes into a pixmap (stash-box logos are often SVG)."""
-    head = data[:300].lstrip().lower()
-    if head.startswith(b"<svg") or head.startswith(b"<?xml"):
-        r = QSvgRenderer(QByteArray(data))
-        if not r.isValid():
-            return None
-        size = r.defaultSize()
-        if size.isEmpty():
-            size = QSize(max_w, max_h)
-        size.scale(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio)
-        img = QImage(size, QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
-        r.render(p)
-        p.end()
-        return QPixmap.fromImage(img)
-    pm = QPixmap()
-    return pm if pm.loadFromData(data) else None
+    """Load PNG/JPEG/WebP or SVG bytes at (at most) max_w x max_h — never full size."""
+    from .images import decode_scaled
+
+    img = decode_scaled(data, QSize(max_w, max_h))
+    return QPixmap.fromImage(img) if img is not None else None
 
 
 class LogoService(QObject):
@@ -69,7 +57,7 @@ class LogoService(QObject):
         self.dir = Path(cache_dir) / "logos"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.boxes: list[StashBox] = []
-        self.mem: dict[str, QPixmap | None] = {}
+        self.mem = PixmapLRU(300)  # ~0.4 MB per logo
         self.queue: deque[tuple[str, str]] = deque()
         self.queued: set[str] = set()
         self.busy = False
@@ -95,15 +83,15 @@ class LogoService(QObject):
 
     def get(self, key: str, name: str) -> QPixmap | None:
         if key in self.mem:
-            return self.mem[key]
+            return self.mem.get(key)
         row = self.db.studio(key)
         if row is not None:
             if row["logo_file"] and (self.dir / row["logo_file"]).exists():
-                pm = render_image((self.dir / row["logo_file"]).read_bytes())
-                self.mem[key] = pm
+                pm = load_file(self.dir / row["logo_file"], LOGO_SIZE)
+                self.mem.put(key, pm)
                 return pm
             if time.time() - (row["checked_at"] or 0) < RETRY_NOT_FOUND_S:
-                self.mem[key] = None
+                self.mem.put(key, None)
                 return None
         if self.boxes:
             if key in self.queued:  # already waiting (e.g. prefetch) — bump it to the front
@@ -132,7 +120,7 @@ class LogoService(QObject):
                 resp = box.session.get(m.logo_url, timeout=30)  # same session -> same ApiKey header
                 if resp.ok and resp.content:
                     fname = hashlib.sha1(m.logo_url.encode()).hexdigest()
-                    (self.dir / fname).write_bytes(resp.content)
+                    (self.dir / fname).write_bytes(shrink_for_disk(resp.content, LOGO_SIZE))
             return key, m.name, m.endpoint, m.stash_id, m.logo_url, fname
         return key, name, None, None, None, None
 

@@ -60,7 +60,10 @@ class ThumbnailLoader(QObject):
         self.cache_dir = Path(cache_dir) / "thumbs"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.nam = QNetworkAccessManager(self)
-        self.mem: dict[str, QPixmap] = {}
+        from .images import PixmapLRU
+
+        # ~0.9 MB per 640x360 pixmap -> ~270 MB at most, however far you scroll
+        self.mem = PixmapLRU(300)
         self.pending: set[str] = set()
         self.failed: set[str] = set()              # URLs that didn't load this session (don't hammer them)
         self.host_headers: dict[str, dict[str, str]] = {}  # e.g. stash-box image hosts need the ApiKey
@@ -72,17 +75,20 @@ class ThumbnailLoader(QObject):
         return self.cache_dir / (hashlib.sha1(url.encode()).hexdigest() + ".img")
 
     def get(self, key: str, urls: list[str]) -> QPixmap | None:
+        from .images import SCENE_SIZE, load_file, touch
+
         if key in self.mem:
-            return self.mem[key]
+            return self.mem.get(key)
         urls = [u for u in urls if u not in self.failed]
         if key in self.pending or not urls:
             return None
         for url in urls:
             p = self._cache_path(url)
             if p.exists():
-                pm = QPixmap(str(p))
-                if not pm.isNull():
-                    self.mem[key] = pm
+                pm = load_file(p, SCENE_SIZE)
+                if pm is not None:
+                    touch(p)
+                    self.mem.put(key, pm)
                     return pm
         self.pending.add(key)
         self._fetch(key, list(urls))
@@ -106,10 +112,11 @@ class ThumbnailLoader(QObject):
         data = bytes(reply.readAll())
         ok = reply.error() == QNetworkReply.NetworkError.NoError
         reply.deleteLater()
-        pm = QPixmap()
-        if ok and pm.loadFromData(data):
-            self._cache_path(url).write_bytes(data)
-            self.mem[key] = pm
+        from .images import SCENE_SIZE, save_and_load
+
+        pm = save_and_load(self._cache_path(url), data, SCENE_SIZE) if ok and data else None
+        if pm is not None:
+            self.mem.put(key, pm)
             self.pending.discard(key)
             self.loaded.emit(key, pm)
         else:

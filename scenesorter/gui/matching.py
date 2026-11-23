@@ -11,7 +11,7 @@ from PySide6.QtGui import QPixmap
 from ..db import Database
 from ..models import Scene
 from ..stashbox import StashBox, StashBoxConfig
-from .studios import render_image
+from .images import PORTRAIT_SIZE, PixmapLRU, load_file, shrink_for_disk
 from .workers import BackgroundQueue
 
 RECHECK_NOT_FOUND_S = 14 * 24 * 3600   # new scenes get added to stash-boxes; retry misses after 2 weeks
@@ -85,7 +85,7 @@ class PerformerImages(QObject):
         self.dir = Path(cache_dir) / "performers"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.boxes: list[StashBox] = []
-        self.mem: dict[str, QPixmap | None] = {}
+        self.mem = PixmapLRU(200)  # ~1 MB per 400x600 portrait
         self.q = BackgroundQueue(2000, self._work, self._done, self)
 
     def configure(self, configs: list[StashBoxConfig]) -> None:
@@ -96,15 +96,15 @@ class PerformerImages(QObject):
 
     def get(self, key: str, name: str) -> QPixmap | None:
         if key in self.mem:
-            return self.mem[key]
+            return self.mem.get(key)
         row = self.db.performer(key)
         if row is not None:
             if row["image_file"] and (self.dir / row["image_file"]).exists():
-                pm = render_image((self.dir / row["image_file"]).read_bytes(), 400, 600)
-                self.mem[key] = pm
+                pm = load_file(self.dir / row["image_file"], PORTRAIT_SIZE)
+                self.mem.put(key, pm)
                 return pm
             if time.time() - (row["checked_at"] or 0) < RECHECK_PERFORMER_S:
-                self.mem[key] = None
+                self.mem.put(key, None)
                 return None
         self.q.push(key, name, front=True)
         return None
@@ -127,7 +127,7 @@ class PerformerImages(QObject):
                 resp = b.session.get(p["image_url"], timeout=30)
                 if resp.ok and resp.content:
                     fname = hashlib.sha1(p["image_url"].encode()).hexdigest()
-                    (self.dir / fname).write_bytes(resp.content)
+                    (self.dir / fname).write_bytes(shrink_for_disk(resp.content, PORTRAIT_SIZE))
             return p["name"], b.cfg.endpoint, p["id"], p["image_url"], fname
         return name, None, None, None, None
 
