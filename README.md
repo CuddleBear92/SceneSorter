@@ -94,7 +94,8 @@ your library.
   the duration, it's checked too: a clearly different length rejects the
   candidate, and a near-identical length breaks ties, such as Part 1 vs Part 2
   on the same day. Matches add performers, duration and links to the scene
-  pages.
+  pages. Posts without a thumbnail, or whose thumbnail won't load, show the
+  matched scene's cover instead: ThePornDB's first, then StashDB's.
 - **Favourites.** Star studios and performers in any of these places:
   - the right-click menu on a Studios or Performers card
   - the ☆ next to a name in the detail panel

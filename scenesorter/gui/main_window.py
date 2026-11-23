@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         self.job_rows: dict[str, int] = {}
 
         self.thumbs = ThumbnailLoader(CACHE_DIR)
+        self._apply_image_headers()
         self.logos = LogoService(self.db, CACHE_DIR, self)
         self.logos.configure(settings.stashboxes)
         self.logos.ready.connect(self._studio_info_ready)
@@ -300,8 +301,30 @@ class MainWindow(QMainWindow):
                                    self.settings.match_interval_s)
 
     # ------------------------------------------------- performers/matching
+    def _covers(self) -> dict[str, list[str]]:
+        """Stash-box cover per scene, ThePornDB first (its covers are the studio's own poster)."""
+        out: dict[str, list[str]] = {}
+        for key, ms in self.matches.items():
+            urls = [m["image_url"] for m in sorted(ms, key=lambda m: "theporndb" not in m["endpoint"])
+                    if m.get("image_url")]
+            if urls:
+                out[key] = urls
+        return out
+
+    def _apply_image_headers(self) -> None:
+        from urllib.parse import urlparse
+        hdr = {}
+        for b in self.settings.stashboxes:
+            if b.enabled and b.api_key:
+                host = (urlparse(b.endpoint).hostname or "").lower()
+                if host:
+                    hdr[host] = {"ApiKey": b.api_key}
+        self.thumbs.set_host_headers(hdr)
+
     def _scene_matched(self, key: str) -> None:
         self.matches = self.db.scene_matches()
+        self.model.covers = self._covers()
+        self.model.refresh_row(key)  # a post without a thumbnail can now show the cover
         self.perf_timer.start()  # debounce: matches arrive every few seconds
         for pane in self.panes:
             if pane.current and pane.current.key == key:
@@ -593,6 +616,7 @@ class MainWindow(QMainWindow):
         if scenes is not None:
             self.scenes = scenes
             self.model.studio_names = self.db.studio_names()
+            self.model.covers = self._covers()
             self.model.status, self.model.hidden = self._scene_status(), self._hidden_scene_keys()
             self.model.set_scenes(scenes, set(self.owned))
             self._update_group_box()
@@ -734,7 +758,7 @@ class MainWindow(QMainWindow):
         thumb = QLabel()
         thumb.setFixedHeight(210)
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pm = self.thumbs.get(scene.key, scene.thumbnail_urls)
+        pm = self.thumbs.get(scene.key, self.model.thumb_urls(scene))
         if pm:
             thumb.setPixmap(pm.scaled(360, 210, Qt.AspectRatioMode.KeepAspectRatio,
                                       Qt.TransformationMode.SmoothTransformation))
@@ -981,6 +1005,7 @@ class MainWindow(QMainWindow):
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
             self.logos.configure(self.settings.stashboxes)
+            self._apply_image_headers()
             self.matcher.configure(self.settings.stashboxes, self.settings.scene_matching,
                                    self.settings.match_interval_s)
             self.perf_images.configure(self.settings.stashboxes)

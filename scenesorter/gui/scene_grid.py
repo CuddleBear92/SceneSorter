@@ -27,6 +27,7 @@ class SceneModel(QAbstractListModel):
         self.studio_names: dict[str, str] = {}  # studio key -> official stash-box name
         self.scene_performers: dict[str, list[str]] = {}  # scene key -> performer keys
         self.performer_names: dict[str, str] = {}         # performer key -> display name
+        self.covers: dict[str, list[str]] = {}  # scene key -> stash-box cover URLs (TPDB first)
         self.fav_studios: set[str] = set()
         self.fav_performers: set[str] = set()
         self.on_visible = None  # callback(scene) when a card is painted (drives on-screen-first matching)
@@ -67,6 +68,16 @@ class SceneModel(QAbstractListModel):
     def has(self, key: str) -> bool:
         return self.state(key) == "complete"
 
+    def thumb_urls(self, s: Scene) -> list[str]:
+        """The post's own thumbnails first, then stash-box covers as a fallback."""
+        return s.thumbnail_urls + [u for u in self.covers.get(s.key, []) if u not in s.thumbnail_urls]
+
+    def refresh_row(self, key: str) -> None:
+        row = self._row_by_key.get(key)
+        if row is not None:
+            idx = self.index(row)
+            self.dataChanged.emit(idx, idx)
+
     def is_favorite(self, s: Scene) -> bool:
         return (bool(s.studio) and studio_key(s.studio) in self.fav_studios) or \
             any(k in self.fav_performers for k in self.scene_performers.get(s.key, ()))
@@ -88,7 +99,7 @@ class SceneModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DecorationRole:
             if self.on_visible:
                 self.on_visible(s)
-            return self.thumbs.get(s.key, s.thumbnail_urls)
+            return self.thumbs.get(s.key, self.thumb_urls(s))
         if role == Qt.ItemDataRole.ToolTipRole:
             return "\n".join(sorted({r.raw_title for r in s.releases}))
         return None
@@ -204,7 +215,8 @@ class SceneDelegate(QStyledItemDelegate):
         else:
             p.fillRect(thumb_rect, QColor("#0e1116"))
             p.setPen(QColor("#555"))
-            p.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "loading…" if s.thumbnail_urls else "no thumbnail")
+            p.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter,
+                       "loading…" if model.thumb_urls(s) else "no thumbnail")
         p.setClipping(False)
 
         # resolution chips (top-left)

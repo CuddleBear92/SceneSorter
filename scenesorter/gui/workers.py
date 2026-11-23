@@ -62,6 +62,11 @@ class ThumbnailLoader(QObject):
         self.nam = QNetworkAccessManager(self)
         self.mem: dict[str, QPixmap] = {}
         self.pending: set[str] = set()
+        self.failed: set[str] = set()              # URLs that didn't load this session (don't hammer them)
+        self.host_headers: dict[str, dict[str, str]] = {}  # e.g. stash-box image hosts need the ApiKey
+
+    def set_host_headers(self, headers: dict[str, dict[str, str]]) -> None:
+        self.host_headers = headers
 
     def _cache_path(self, url: str) -> Path:
         return self.cache_dir / (hashlib.sha1(url.encode()).hexdigest() + ".img")
@@ -69,6 +74,7 @@ class ThumbnailLoader(QObject):
     def get(self, key: str, urls: list[str]) -> QPixmap | None:
         if key in self.mem:
             return self.mem[key]
+        urls = [u for u in urls if u not in self.failed]
         if key in self.pending or not urls:
             return None
         for url in urls:
@@ -91,6 +97,8 @@ class ThumbnailLoader(QObject):
         req.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
                          QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
         req.setRawHeader(b"User-Agent", b"Mozilla/5.0 SceneSorter")
+        for name, value in self.host_headers.get(QUrl(url).host().lower(), {}).items():
+            req.setRawHeader(name.encode(), value.encode())
         reply = self.nam.get(req)
         reply.finished.connect(lambda: self._on_reply(reply, key, url, urls))
 
@@ -105,7 +113,8 @@ class ThumbnailLoader(QObject):
             self.pending.discard(key)
             self.loaded.emit(key, pm)
         else:
-            self._fetch(key, rest)  # fall back to the other site's thumbnail
+            self.failed.add(url)
+            self._fetch(key, rest)  # fall back to the next image (other site / stash-box cover)
 
 
 class BackgroundQueue(QObject):
