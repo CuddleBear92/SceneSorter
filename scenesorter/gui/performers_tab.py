@@ -4,12 +4,12 @@ from __future__ import annotations
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QPushButton, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from ..performers import PerformerEntry
 from .matching import PerformerImages
-from .studios import FilteredList, StudioEntry, StudioRole, paint_star
+from .studios import FilteredList, StudioEntry, StudioRole, dim_hidden, paint_flag, paint_star
 
 CARD_W, PHOTO_H, TEXT_H = 160, 210, 46
 
@@ -21,6 +21,8 @@ class PerformerModel(FilteredList, QAbstractListModel):
         self.items: list[StudioEntry] = []   # same shape as studios: key, name, scenes, have
         self.sources: dict[str, set[str]] = {}
         self.favorites: set[str] = set()
+        self.hidden: set[str] = set()
+        self.flagged: set[str] = set()
         self._row: dict[str, int] = {}
         images.ready.connect(self._ready)
 
@@ -87,7 +89,11 @@ class PerformerDelegate(QStyledItemDelegate):
             p.setPen(QColor("#374151"))
             p.drawText(photo, Qt.AlignmentFlag.AlignCenter, initials)
         p.setClipping(False)
-        paint_star(p, r, e.key in index.model().favorites)
+        model = index.model()
+        paint_star(p, r, e.key in model.favorites)
+        paint_flag(p, r, e.key in model.flagged)
+        if e.key in model.hidden:
+            dim_hidden(p, r, opt)
         text = QRect(r.left() + 8, photo.bottom() + 4, r.width() - 16, TEXT_H)
         f = QFont(opt.font)
         f.setBold(True)
@@ -106,6 +112,9 @@ class PerformerDelegate(QStyledItemDelegate):
 class PerformersTab(QWidget):
     performer_activated = Signal(str, str)  # key, name
     favorite_requested = Signal(str, str, bool)
+    hide_requested = Signal(str, str, bool)
+    flag_requested = Signal(str, str, str, bool)
+    export_requested = Signal()
 
     def __init__(self, images: PerformerImages, parent=None):
         super().__init__(parent)
@@ -130,6 +139,10 @@ class PerformersTab(QWidget):
         self.fav_only.toggled.connect(lambda v: self.proxy.set(fav_only=v))
         top.addWidget(self.fav_only)
         top.addWidget(self.hint, 1)
+        self.export_btn = QPushButton("Export flagged…")
+        self.export_btn.setToolTip("Save a report of everything you flagged for review, with the posts behind each")
+        self.export_btn.clicked.connect(self.export_requested.emit)
+        top.addWidget(self.export_btn)
         self.view = QListView()
         self.view.setViewMode(QListView.ViewMode.IconMode)
         self.view.setResizeMode(QListView.ResizeMode.Adjust)
@@ -160,7 +173,23 @@ class PerformersTab(QWidget):
         fav = e.key in self.model.favorites
         menu.addAction("★ Remove from favorites" if fav else "☆ Add to favorites",
                        lambda: self.favorite_requested.emit(e.key, e.name, not fav))
+        hidden = e.key in self.model.hidden
+        menu.addAction(f"{'Unhide' if hidden else 'Hide'} performer “{e.name}” (and their scenes)",
+                       lambda: self.hide_requested.emit(e.key, e.name, not hidden))
+        menu.addSeparator()
+        flagged = e.key in self.model.flagged
+        menu.addAction("Remove review flag" if flagged else "⚑ Flag for review (not a performer / wrong)…",
+                       lambda: self.flag_requested.emit("performer", e.key, e.name, not flagged))
         menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def set_flagged(self, keys: set[str], total: int) -> None:
+        self.model.flagged = keys
+        self.export_btn.setText(f"Export flagged ({total})…" if total else "Export flagged…")
+        self.view.viewport().update()
+
+    def set_hidden(self, keys: set[str]) -> None:
+        self.model.hidden = keys
+        self.view.viewport().update()
 
     def set_favorites(self, favs: set[str]) -> None:
         self.model.favorites = favs

@@ -85,6 +85,13 @@ your library.
 
   Hidden items come back with **Show hidden**, where you can unhide them. You
   can also hide studios from the Studios tab.
+- **Flag for review.** Right-click a studio, performer or scene and choose
+  "⚑ Flag for review…", with an optional note. **Export flagged…** on the
+  Studios or Performers tab saves a text report listing the posts behind each
+  flagged item, ready to hand over for parser fixes.
+- **Hide performers.** Works like hiding a studio: the performer and their
+  scenes are hidden unless **Show hidden** is ticked. An optional setting shows
+  scenes from hidden studios when a favourite performer is in them.
 - **Studios.** Every studio gets a card with its StashDB logo and official name.
   Scene cards use the official name too. Clicking a studio filters Browse, and
   the filter chip shows the logo. Logos are fetched slowly in the background,

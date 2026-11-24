@@ -51,6 +51,9 @@ class ViewState:
     performer_names: dict[str, str] = field(default_factory=dict)
     fav_studios: set[str] = field(default_factory=set)
     fav_performers: set[str] = field(default_factory=set)
+    hidden_studios: set[str] = field(default_factory=set)      # studio keys
+    hidden_performers: set[str] = field(default_factory=set)   # performer keys
+    fav_overrides_hidden_studio: bool = False
 
     def state(self, key: str) -> str:
         return "complete" if key in self.owned else self.status.get(key, "none")
@@ -61,6 +64,21 @@ class ViewState:
     def is_favorite(self, s: Scene) -> bool:
         return (bool(s.studio) and normalise_studio(s.studio) in self.fav_studios) or \
             any(k in self.fav_performers for k in self.scene_performers.get(s.key, ()))
+
+
+def is_hidden(s: Scene, st: ViewState) -> bool:
+    """Hidden scene, a hidden studio (unless a favourite performer is in it and the user
+    allows that override), or a hidden performer in it."""
+    if s.key in st.hidden:
+        return True
+    perfs = st.scene_performers.get(s.key, ())
+    if st.hidden_performers and any(k in st.hidden_performers for k in perfs):
+        return True
+    if st.hidden_studios and s.studio and normalise_studio(s.studio) in st.hidden_studios:
+        if st.fav_overrides_hidden_studio and any(k in st.fav_performers for k in perfs):
+            return False
+        return True
+    return False
 
 
 def haystack(s: Scene, st: ViewState) -> str:
@@ -106,7 +124,7 @@ def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Sce
     words = spec.text.lower().split()
     out: list[Scene] = []
     for i, s in enumerate(scenes):
-        if s.key in st.hidden and not spec.show_hidden:
+        if not spec.show_hidden and is_hidden(s, st):
             continue
         if spec.have:
             state = st.state(s.key)

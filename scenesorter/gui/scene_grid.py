@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from ..models import Scene
 from ..parsing import normalise_studio as studio_key
-from ..views import ViewState
+from ..views import ViewState, is_hidden
 from .workers import ThumbnailLoader
 
 SceneRole = Qt.ItemDataRole.UserRole + 1
@@ -31,7 +31,10 @@ class SceneModel(QObject):
         self.by_key: dict[str, Scene] = {}
         self.owned: set[str] = set()          # scene keys found in the library on disk
         self.status: dict[str, str] = {}      # scene key -> grabbed / partial / complete (see status.py)
-        self.hidden: set[str] = set()         # scene keys hidden by the user (scene or studio blacklist)
+        self.hidden: set[str] = set()         # scene keys hidden by the user (scene-level)
+        self.hidden_studios: set[str] = set()     # studio keys hidden by the user
+        self.hidden_performers: set[str] = set()  # performer keys hidden by the user
+        self.fav_overrides_hidden_studio = False  # favourite performer shows a hidden studio's scene
         self.studio_names: dict[str, str] = {}  # studio key -> official stash-box name
         self.scene_performers: dict[str, list[str]] = {}  # scene key -> performer keys
         self.performer_names: dict[str, str] = {}         # performer key -> display name
@@ -73,7 +76,11 @@ class SceneModel(QObject):
 
     def view_state(self) -> ViewState:
         return ViewState(self.owned, self.status, self.hidden, self.studio_names, self.scene_performers,
-                         self.performer_names, self.fav_studios, self.fav_performers)
+                         self.performer_names, self.fav_studios, self.fav_performers,
+                         self.hidden_studios, self.hidden_performers, self.fav_overrides_hidden_studio)
+
+    def is_hidden(self, s: Scene) -> bool:
+        return is_hidden(s, self.view_state())
 
     def state(self, key: str) -> str:
         """'complete' (incl. found in library), 'partial', 'grabbed' or 'none'."""
@@ -181,7 +188,7 @@ class SceneDelegate(QStyledItemDelegate):
         model = index.model().store
         owned = s.key in model.owned
         state = model.state(s.key)
-        hidden = s.key in model.hidden
+        hidden = model.is_hidden(s)
         r = opt.rect.adjusted(6, 6, -6, -6)
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)

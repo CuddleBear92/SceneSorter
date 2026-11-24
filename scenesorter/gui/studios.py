@@ -14,7 +14,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from ..db import Database
@@ -220,6 +220,7 @@ class StudioModel(FilteredList, QAbstractListModel):
         self.logos = logos
         self.hidden: set[str] = set()
         self.favorites: set[str] = set()
+        self.flagged: set[str] = set()
         self.items: list[StudioEntry] = []
         self._row: dict[str, int] = {}
         logos.ready.connect(self._logo_ready)
@@ -248,6 +249,27 @@ class StudioModel(FilteredList, QAbstractListModel):
                 self.items[row] = replace(self.items[row], name=row_db["name"])
             self.dataChanged.emit(idx, idx)
 
+
+
+def paint_flag(p: QPainter, rect: QRect, on: bool) -> None:
+    """Orange ⚑ badge in the top-right corner: flagged for review."""
+    if not on:
+        return
+    badge = QRect(rect.right() - 28, rect.top() + 6, 22, 22)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(0, 0, 0, 170))
+    p.drawEllipse(badge)
+    p.setPen(QColor("#fb923c"))
+    p.drawText(badge, Qt.AlignmentFlag.AlignCenter, "⚑")
+
+
+def dim_hidden(p: QPainter, r: QRect, opt) -> None:
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(0, 0, 0, 160))
+    p.drawRoundedRect(r, 8, 8)
+    p.setPen(QColor("#f87171"))
+    p.setFont(opt.font)
+    p.drawText(QRect(r.left(), r.top() + 6, r.width() - 10, 18), Qt.AlignmentFlag.AlignRight, "HIDDEN")
 
 
 def paint_star(p: QPainter, rect: QRect, on: bool) -> None:
@@ -309,6 +331,7 @@ class StudioDelegate(QStyledItemDelegate):
         sub = f"{e.scenes} scene{'s' if e.scenes != 1 else ''}" + (f" · {e.have} downloaded" if e.have else "")
         p.drawText(QRect(text_rect.left(), text_rect.top() + fm.height() + 2, text_rect.width(), fm.height()), 0, sub)
         paint_star(p, r, e.key in model.favorites)
+        paint_flag(p, r, e.key in model.flagged)
         if hidden:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 160))
@@ -323,6 +346,8 @@ class StudiosTab(QWidget):
     studio_activated = Signal(str, str)  # key, display name
     hide_requested = Signal(str, str, bool)  # key, name, hide?
     favorite_requested = Signal(str, str, bool)  # key, name, favourite?
+    flag_requested = Signal(str, str, str, bool)  # kind, key, name, flag?
+    export_requested = Signal()
 
     def __init__(self, logos: LogoService, parent=None):
         super().__init__(parent)
@@ -345,6 +370,11 @@ class StudiosTab(QWidget):
         self.fav_only.toggled.connect(lambda v: self.proxy.set(fav_only=v))
         top.addWidget(self.fav_only)
         top.addWidget(self.hint, 1)
+        self.export_btn = QPushButton("Export flagged…")
+        self.export_btn.setToolTip("Save a report of everything you flagged for review (studios, performers, "
+                                   "scenes) with the posts behind each — hand it over to get the parsing fixed")
+        self.export_btn.clicked.connect(self.export_requested.emit)
+        top.addWidget(self.export_btn)
         self.view = QListView()
         self.view.setViewMode(QListView.ViewMode.IconMode)
         self.view.setResizeMode(QListView.ResizeMode.Adjust)
@@ -378,12 +408,21 @@ class StudiosTab(QWidget):
         hidden = e.key in self.model.hidden
         menu.addAction(f"{'Unhide' if hidden else 'Hide'} studio “{e.name}”",
                        lambda: self.hide_requested.emit(e.key, e.name, not hidden))
+        menu.addSeparator()
+        flagged = e.key in self.model.flagged
+        menu.addAction("Remove review flag" if flagged else "⚑ Flag for review (wrong studio)…",
+                       lambda: self.flag_requested.emit("studio", e.key, e.name, not flagged))
         menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def set_favorites(self, favs: set[str]) -> None:
         self.model.favorites = favs
         self.proxy.invalidate()
         self.proxy.sort(0)
+
+    def set_flagged(self, keys: set[str], total: int) -> None:
+        self.model.flagged = keys
+        self.export_btn.setText(f"Export flagged ({total})…" if total else "Export flagged…")
+        self.view.viewport().update()
 
     def set_hidden(self, hidden: set[str]) -> None:
         self.model.hidden = hidden

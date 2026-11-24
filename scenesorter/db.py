@@ -77,6 +77,14 @@ CREATE TABLE IF NOT EXISTS flags (
 CREATE TABLE IF NOT EXISTS hidden_scenes (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
 CREATE TABLE IF NOT EXISTS hidden_posts (source TEXT, post_id TEXT, PRIMARY KEY (source, post_id));
 CREATE TABLE IF NOT EXISTS hidden_studios (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
+CREATE TABLE IF NOT EXISTS hidden_performers (key TEXT PRIMARY KEY, name TEXT, hidden_at REAL);
+
+-- Items the user flagged for review (wrong studio/performer names, bad merges) — exported
+-- as a report to improve the parser. kind = 'studio' | 'performer' | 'scene'.
+CREATE TABLE IF NOT EXISTS review_flags (
+    kind TEXT NOT NULL, key TEXT NOT NULL, name TEXT, note TEXT, flagged_at REAL,
+    PRIMARY KEY (kind, key)
+);
 
 -- Video files seen on disk (drag & drop, import folders, library) and what they matched.
 CREATE TABLE IF NOT EXISTS scanned_files (
@@ -372,6 +380,36 @@ class Database:
             else:
                 self.conn.execute("DELETE FROM hidden_scenes WHERE key=?", (key,))
                 self.conn.executemany("DELETE FROM hidden_posts WHERE source=? AND post_id=?", posts)
+
+    def hidden_performers(self) -> dict[str, str]:
+        with self._lock:
+            return {r[0]: r[1] for r in self.conn.execute("SELECT key, name FROM hidden_performers")}
+
+    def hide_performer(self, key: str, name: str, hide: bool = True) -> None:
+        with self._lock:
+            if hide:
+                self.conn.execute("INSERT OR REPLACE INTO hidden_performers VALUES (?,?,?)", (key, name, time.time()))
+            else:
+                self.conn.execute("DELETE FROM hidden_performers WHERE key=?", (key,))
+
+    # ------------------------------------------------------- review flags
+    def review_flags(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute("SELECT kind, key, name, note, flagged_at FROM review_flags "
+                                     "ORDER BY kind, flagged_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def flag(self, kind: str, key: str, name: str, note: str = "", on: bool = True) -> None:
+        with self._lock:
+            if on:
+                self.conn.execute("INSERT OR REPLACE INTO review_flags VALUES (?,?,?,?,?)",
+                                  (kind, key, name, note, time.time()))
+            else:
+                self.conn.execute("DELETE FROM review_flags WHERE kind=? AND key=?", (kind, key))
+
+    def clear_review_flags(self) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM review_flags")
 
     def hide_studio(self, key: str, name: str, hide: bool = True) -> None:
         with self._lock:

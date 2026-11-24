@@ -77,10 +77,11 @@ def compute_status(scenes: list[Scene], flags: dict, preferred_resolution: str) 
     return out
 
 
-def compute_hidden(scenes: list[Scene], hidden_keys: set, hidden_posts: set, hidden_studios) -> set[str]:
+def compute_hidden(scenes: list[Scene], hidden_keys: set, hidden_posts: set, _hidden_studios=None) -> set[str]:
+    """Scenes the user hid *as scenes*. Hidden studios/performers are applied when filtering
+    (views.is_hidden), so the favourite-performer override can be honoured."""
     return {s.key for s in scenes
-            if s.key in hidden_keys or normalise_studio(s.studio) in hidden_studios
-            or any((r.source, r.post_id) in hidden_posts for r in s.releases)}
+            if s.key in hidden_keys or any((r.source, r.post_id) in hidden_posts for r in s.releases)}
 
 
 SCENE_CACHE_VERSION = f"{PARSER_VERSION}:{MERGE_VERSION}"
@@ -156,6 +157,7 @@ class MainWindow(QMainWindow):
         self.db.mark_interrupted_downloads()
         self.flags: dict[tuple[str, str], str] = self.db.flags()
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
+        self.hidden_perf = self.db.hidden_performers()
         self.studio_filter: tuple[str, str] = ("", "")
         self.performer_filter: tuple[str, str] = ("", "")
         self.matches: dict[str, list[dict]] = self.db.scene_matches()
@@ -309,15 +311,25 @@ class MainWindow(QMainWindow):
         self.model.on_visible = self.matcher.visible
         self.model.fav_studios = set(self.fav["studio"])
         self.model.fav_performers = set(self.fav["performer"])
+        self.model.hidden_studios = set(self.hidden_studios)
+        self.model.hidden_performers = set(self.hidden_perf)
+        self.model.fav_overrides_hidden_studio = self.settings.fav_performers_override_hidden_studios
 
         self.studios = StudiosTab(self.logos)
         self.studios.studio_activated.connect(self.filter_studio)
         self.studios.hide_requested.connect(self.hide_studio)
         self.studios.favorite_requested.connect(lambda k, n, on: self.set_favorite("studio", k, n, on))
+        self.studios.flag_requested.connect(self.flag_item)
+        self.studios.export_requested.connect(self.export_review)
         self.studios.set_favorites(set(self.fav["studio"]))
         self.performers_tab = PerformersTab(self.perf_images)
         self.performers_tab.performer_activated.connect(self.filter_performer)
         self.performers_tab.favorite_requested.connect(lambda k, n, on: self.set_favorite("performer", k, n, on))
+        self.performers_tab.hide_requested.connect(self.hide_performer)
+        self.performers_tab.flag_requested.connect(self.flag_item)
+        self.performers_tab.export_requested.connect(self.export_review)
+        self.performers_tab.set_hidden(set(self.hidden_perf))
+        QTimer.singleShot(0, self._update_flags)
         self.performers_tab.set_favorites(set(self.fav["performer"]))
 
         # --- downloads tab
@@ -1086,9 +1098,13 @@ class MainWindow(QMainWindow):
 
     def _hidden_changed(self) -> None:
         self.hidden_keys, self.hidden_posts, self.hidden_studios = self.db.hidden()
+        self.hidden_perf = self.db.hidden_performers()
         self.studios.set_hidden(set(self.hidden_studios))
+        self.performers_tab.set_hidden(set(self.hidden_perf))
+        self.model.hidden_studios = set(self.hidden_studios)
+        self.model.hidden_performers = set(self.hidden_perf)
         run_async(compute_hidden, self.scenes, set(self.hidden_keys), set(self.hidden_posts),
-                  dict(self.hidden_studios), on_done=lambda h: self.model.set_status(hidden=h), pool="cpu")
+                  on_done=lambda h: self.model.set_status(hidden=h), pool="cpu")
 
     def mark_downloaded(self, releases: list[Release], on: bool) -> None:
         """User action: flag releases as done, or clear their flags (= wanted again)."""
@@ -1119,6 +1135,59 @@ class MainWindow(QMainWindow):
         self._hidden_changed()
         self.status_label.setText(f"{'Hid' if hide else 'Unhid'} all scenes from {name}"
                                   + (" — tick “Show hidden” to see them" if hide else ""))
+
+    def hide_performer(self, key: str, name: str, hide: bool) -> None:
+        self.db.hide_performer(key, name, hide)
+        if hide and self.performer_filter[0] == key:
+            self.filter_performer("", "")
+        self._hidden_changed()
+        self.status_label.setText(f"{'Hid' if hide else 'Unhid'} {name} and their scenes"
+                                  + (" — tick “Show hidden” to see them" if hide else ""))
+
+    # ------------------------------------------------------- review flags
+    def flag_item(self, kind: str, key: str, name: str, on: bool) -> None:
+        """Flag a studio/performer/scene for review (with an optional note), or unflag it."""
+        note = ""
+        if on:
+            from PySide6.QtWidgets import QInputDialog
+            what = {"studio": "studio", "performer": "performer", "scene": "scene"}[kind]
+            note, ok = QInputDialog.getText(self, "Flag for review",
+                                            f"Flag {what} “{name}”.\nOptional note (what's wrong?):")
+            if not ok:
+                return
+        self.db.flag(kind, key, name, note.strip(), on)
+        self._update_flags()
+        self.status_label.setText(f"{'Flagged' if on else 'Unflagged'} {kind} {name}"
+                                  + (" — use “Export flagged…” on the Studios/Performers tab" if on else ""))
+
+    def _update_flags(self) -> None:
+        flags = self.db.review_flags()
+        self.flagged = {(f["kind"], f["key"]) for f in flags}
+        self.studios.set_flagged({k for kind, k in self.flagged if kind == "studio"}, len(flags))
+        self.performers_tab.set_flagged({k for kind, k in self.flagged if kind == "performer"}, len(flags))
+
+    def export_review(self) -> None:
+        flags = self.db.review_flags()
+        if not flags:
+            QMessageBox.information(self, "Export flagged", "Nothing flagged yet — right-click a studio, performer "
+                                                            "or scene and choose “Flag for review”.")
+            return
+        from datetime import datetime
+
+        from ..review import build_report
+        default = str(DATA_DIR / f"scenesorter-review-{datetime.now():%Y%m%d-%H%M}.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Export flagged items", default, "Text files (*.txt)")
+        if not path:
+            return
+        text = build_report(flags, self.scenes, self.model.scene_performers,
+                            self.performers_tab.model.sources, __version__)
+        Path(path).write_text(text, encoding="utf-8")
+        ans = QMessageBox.question(self, "Export flagged",
+                                   f"Saved {len(flags)} flagged item(s) to:\n{path}\n\n"
+                                   "Clear the flags now? (Keep them if you want to export again later.)")
+        if ans == QMessageBox.StandardButton.Yes:
+            self.db.clear_review_flags()
+            self._update_flags()
 
     def _scene_menu(self, scenes: list[Scene], pos) -> None:
         if not scenes:
@@ -1154,6 +1223,16 @@ class MainWindow(QMainWindow):
                            lambda: self.filter_studio(normalise_studio(one.studio), self.model.display_studio(one)))
         if one:
             menu.addAction("Open post in browser", lambda: webbrowser.open(one.primary.post_url))
+            menu.addSeparator()
+            fl = ("scene", one.key) in getattr(self, "flagged", set())
+            menu.addAction("Remove review flag" if fl else "⚑ Flag scene for review (wrong merge/split)…",
+                           lambda: self.flag_item("scene", one.key, one.title or one.primary.raw_title, not fl))
+            if one.studio:
+                sk = normalise_studio(one.studio)
+                sfl = ("studio", sk) in getattr(self, "flagged", set())
+                if not sfl:
+                    menu.addAction(f"⚑ Flag studio “{self.model.display_studio(one)}” for review…",
+                                   lambda: self.flag_item("studio", sk, self.model.display_studio(one), True))
         menu.exec(pos)
 
     def _update_codec_box(self, counts: dict[str, int]) -> None:
@@ -1272,7 +1351,7 @@ class MainWindow(QMainWindow):
             done = QLabel("✔ Downloaded")
             done.setStyleSheet("color:#60a5fa")
             lay.addWidget(done)
-        if scene.key in self.model.hidden:
+        if self.model.is_hidden(scene):
             hid = QLabel("Hidden (blacklisted scene or studio)")
             hid.setStyleSheet("color:#f87171")
             lay.addWidget(hid)
@@ -1496,6 +1575,8 @@ class MainWindow(QMainWindow):
             self.settings = dlg.result_settings()
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
+            self.model.fav_overrides_hidden_studio = self.settings.fav_performers_override_hidden_studios
+            self.model.names_changed()
             self.logos.configure(self.settings.stashboxes)
             self._apply_image_headers()
             self.matcher.configure(self.settings.stashboxes, self.settings.scene_matching,

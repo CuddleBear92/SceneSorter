@@ -64,6 +64,8 @@ class Settings:
     # Optional size limit for cached *scene thumbnails* (0 = no limit, keep everything).
     # Studio logos and performer photos are always kept.
     thumb_cache_limit_mb: int = 0
+    # Scenes from a hidden studio still show when a favourite performer is in them.
+    fav_performers_override_hidden_studios: bool = False
     rescan_interval_s: int = 5          # "Rescan all pages": one page request every N seconds
     # Release groups to prefer when picking which release to download (first = best).
     preferred_groups: list[str] = field(default_factory=lambda: ["PRT"])

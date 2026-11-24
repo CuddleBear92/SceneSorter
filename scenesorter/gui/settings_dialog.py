@@ -70,6 +70,9 @@ class SettingsDialog(QDialog):
         cache_row.addWidget(self.cache_mb)
         cache_row.addWidget(clear)
         form.addRow("Thumbnail cache limit", cache_row)
+        self.fav_override = QCheckBox("Show scenes from hidden studios when a favourite performer is in them")
+        self.fav_override.setChecked(settings.fav_performers_override_hidden_studios)
+        form.addRow("", self.fav_override)
         self.wanted_res = QComboBox()
         for label, val in (("Best available", ""), ("2160p", "2160p"), ("1080p", "1080p"), ("720p", "720p")):
             self.wanted_res.addItem(label, val)
@@ -362,6 +365,7 @@ class SettingsDialog(QDialog):
             auto_refresh_minutes=self.auto_refresh.value(),
             rescan_interval_s=self.rescan_interval.value(),
             thumb_cache_limit_mb=self.cache_mb.value(),
+            fav_performers_override_hidden_studios=self.fav_override.isChecked(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             sources=srcs,
             stashboxes=self._stashboxes(),
