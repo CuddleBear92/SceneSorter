@@ -299,9 +299,10 @@ class MainWindow(QMainWindow):
         self.model = SceneModel(self.thumbs)
         self.delegate = SceneDelegate([])
         self.delegate.preferred_groups = self.settings.preferred_groups
-        self.browse = ScenePane(self.model, self.delegate, self.render_detail)
+        self.browse = ScenePane(self.model, self.delegate, self.render_detail, render_multi=self.render_multi)
         self.have_pane = ScenePane(self.model, self.delegate, self.render_detail, have="any",
-                                   empty_text="Scenes you've grabbed, partly downloaded or downloaded show up here.")
+                                   empty_text="Scenes you've grabbed, partly downloaded or downloaded show up here.",
+                                   render_multi=self.render_multi)
         self.panes = [self.browse, self.have_pane]
         for pane in self.panes:
             pane.context_requested.connect(self._scene_menu)
@@ -320,6 +321,7 @@ class MainWindow(QMainWindow):
         self.studios.hide_requested.connect(self.hide_studio)
         self.studios.favorite_requested.connect(lambda k, n, on: self.set_favorite("studio", k, n, on))
         self.studios.flag_requested.connect(self.flag_item)
+        self.studios.bulk_requested.connect(self.bulk_action)
         self.studios.export_requested.connect(self.export_review)
         self.studios.set_favorites(set(self.fav["studio"]))
         self.performers_tab = PerformersTab(self.perf_images)
@@ -327,6 +329,7 @@ class MainWindow(QMainWindow):
         self.performers_tab.favorite_requested.connect(lambda k, n, on: self.set_favorite("performer", k, n, on))
         self.performers_tab.hide_requested.connect(self.hide_performer)
         self.performers_tab.flag_requested.connect(self.flag_item)
+        self.performers_tab.bulk_requested.connect(self.bulk_action)
         self.performers_tab.export_requested.connect(self.export_review)
         self.performers_tab.set_hidden(set(self.hidden_perf))
         QTimer.singleShot(0, self._update_flags)
@@ -416,7 +419,11 @@ class MainWindow(QMainWindow):
 
     def set_favorite(self, kind: str, key: str, name: str, on: bool) -> None:
         self.db.set_favorite(kind, key, name, on)
-        self.fav[kind] = self.db.favorites(kind)
+        self._favorites_changed()
+        self.status_label.setText(f"{'★ Added' if on else 'Removed'} {name} {'to' if on else 'from'} favorites")
+
+    def _favorites_changed(self) -> None:
+        self.fav = {"studio": self.db.favorites("studio"), "performer": self.db.favorites("performer")}
         self.model.fav_studios = set(self.fav["studio"])
         self.model.fav_performers = set(self.fav["performer"])
         self.studios.set_favorites(set(self.fav["studio"]))
@@ -424,7 +431,6 @@ class MainWindow(QMainWindow):
         self.model.names_changed()  # repaint + refilter
         for pane in self.panes:
             pane.refresh_detail()
-        self.status_label.setText(f"{'★ Added' if on else 'Removed'} {name} {'to' if on else 'from'} favorites")
 
     def _drop_bad_matches(self) -> None:
         """Matches saved before the duration check existed: re-check them now that we
@@ -1160,6 +1166,41 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{'Flagged' if on else 'Unflagged'} {kind} {name}"
                                   + (" — use “Export flagged…” on the Studios/Performers tab" if on else ""))
 
+    def bulk_action(self, action: str, kind: str, items: list, on: bool) -> None:
+        """Favourite / hide / flag many studios or performers at once (one DB pass, one refresh)."""
+        if not items:
+            return
+        n = len(items)
+        label = items[0][1] if n == 1 else f"{n} {kind}s"
+        if action == "favorite":
+            for key, name in items:
+                self.db.set_favorite(kind, key, name, on)
+            self._favorites_changed()
+            self.status_label.setText(f"{'★ Added' if on else 'Removed'} {label} {'to' if on else 'from'} favorites")
+        elif action == "hide":
+            for key, name in items:
+                (self.db.hide_studio if kind == "studio" else self.db.hide_performer)(key, name, on)
+                if on and kind == "studio" and self.studio_filter[0] == key:
+                    self.filter_studio("", "")
+                if on and kind == "performer" and self.performer_filter[0] == key:
+                    self.filter_performer("", "")
+            self._hidden_changed()
+            self.status_label.setText(f"{'Hid' if on else 'Unhid'} {label}"
+                                      + (" — tick “Show hidden” to see them" if on else ""))
+        elif action == "flag":
+            note = ""
+            if on:
+                from PySide6.QtWidgets import QInputDialog
+                note, ok = QInputDialog.getText(self, "Flag for review",
+                                                f"Flag {label} for review.\nOptional note (applies to all of them):")
+                if not ok:
+                    return
+            for key, name in items:
+                self.db.flag(kind, key, name, note.strip(), on)
+            self._update_flags()
+            self.status_label.setText(f"{'Flagged' if on else 'Unflagged'} {label}"
+                                      + (" — use “Export flagged…” to save the report" if on else ""))
+
     def _update_flags(self) -> None:
         flags = self.db.review_flags()
         self.flagged = {(f["kind"], f["key"]) for f in flags}
@@ -1383,6 +1424,35 @@ class MainWindow(QMainWindow):
     def _source_order(self) -> list[str]:
         return source_order([c.id for c in self.settings.sources], self.settings.preferred_source)
 
+    def render_multi(self, pane: ScenePane, scenes: list[Scene]) -> None:
+        """Detail panel for a multi-selection: counts + bulk actions."""
+        lay = pane.detail_layout
+        states = [self.model.state(s.key) for s in scenes]
+        wanted = sum(1 for st in states if st != "complete")
+        head = QLabel(f"<h3>{len(scenes)} scenes selected</h3>"
+                      f"{wanted} still wanted · {states.count('partial') + states.count('grabbed')} grabbed/partial · "
+                      f"{states.count('complete')} downloaded<br><span style='color:#888'>Ctrl-click / Shift-click to "
+                      f"change the selection, Ctrl+A for all, Esc to clear.</span>")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        dl = QPushButton(f"⬇  Download preferred ({wanted})")
+        dl.setEnabled(wanted > 0)
+        dl.setStyleSheet("QPushButton { background:#2563eb; color:white; padding:6px; border-radius:4px; font-weight:bold }"
+                         "QPushButton:hover { background:#3b82f6 } QPushButton:disabled { background:#374151; color:#9ca3af }")
+        dl.setToolTip("Queues the preferred release of every selected scene that isn't downloaded yet "
+                      "(wanted resolution → preferred group → preferred source)")
+        dl.clicked.connect(lambda: self.download_preferred(scenes))
+        lay.addWidget(dl)
+        for text, fn in (("Mark all as downloaded", lambda: self.mark_scenes(scenes, True)),
+                         ("Mark all as not downloaded (wanted)", lambda: self.mark_scenes(scenes, False)),
+                         ("Hide these scenes", lambda: self.hide_scenes(scenes, True)),
+                         ("⚑ Flag these scenes for review…",
+                          lambda: self.bulk_action("flag", "scene", [(s.key, s.title or s.primary.raw_title)
+                                                                     for s in scenes], True))):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            lay.addWidget(b)
+
     def _source_priority(self, r: Release) -> tuple[int, int]:
         # Preferred release groups first, then the preferred source, then sources in settings order.
         groups = self.settings.preferred_groups
@@ -1406,10 +1476,46 @@ class MainWindow(QMainWindow):
             if len(scenes) > 10 and QMessageBox.question(
                     self, "Download preferred", f"Start {len(scenes)} downloads?") != QMessageBox.StandardButton.Yes:
                 return
-        for sc in scenes:
-            self.start_download(self._preferred(sc))
-        if len(scenes) > 1:
-            self.status_label.setText(f"Started {len(scenes)} preferred downloads")
+        if len(scenes) == 1:
+            self.start_download(self._preferred(scenes[0]))
+            return
+        rels = [self._preferred(sc) for sc in scenes]
+        # log in once per source that needs it
+        for sid in {r.source for r in rels}:
+            src = self.sources.get(sid)
+            if src and src.requires_login and not src.is_logged_in() and not self._ensure_login(src):
+                rels = [r for r in rels if r.source != sid]
+        # daily limits: ask once instead of failing scene by scene
+        for sid in {r.source for r in rels}:
+            src = self.sources.get(sid)
+            if not (src and src.daily_quota):
+                continue
+            mine = [r for r in rels if r.source == sid]
+            left = self.quota.remaining(sid, src.daily_quota)
+            if len(mine) > left:
+                ans = QMessageBox.question(
+                    self, "Daily limit", f"{src.display_name} has {left} download(s) left today, but "
+                    f"{len(mine)} of the selected scenes would use it.\n\nQueue the first {left} and skip the rest?")
+                if ans != QMessageBox.StandardButton.Yes:
+                    return
+                skip = {id(r) for r in mine[left:]}
+                rels = [r for r in rels if id(r) not in skip]
+        self._bulk_problems = []
+        for r in rels:
+            self.start_download(r, quiet=True)
+        self.status_label.setText(f"Queued {len(rels)} preferred download(s)"
+                                  + (f" — see the Queue tab" if rels else ""))
+        QTimer.singleShot(8000, self._report_bulk_problems)
+
+    def _report_bulk_problems(self) -> None:
+        probs = getattr(self, "_bulk_problems", [])
+        if probs:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Some downloads didn't start")
+            msg.setText(f"{len(probs)} of the selected downloads couldn't be queued.")
+            msg.setDetailedText("\n".join(probs))
+            msg.exec()
+        self._bulk_problems = []
 
     def _release_row(self, rel: Release) -> QWidget:
         outer = QWidget()
@@ -1467,9 +1573,35 @@ class MainWindow(QMainWindow):
         return outer
 
     # ------------------------------------------------------------ downloads
-    def start_download(self, rel: Release) -> None:
+    def _ensure_login(self, src) -> bool:
+        if hasattr(src, "request_otp") and hasattr(src, "verify_otp"):
+            dlg = EncodedFapLoginDialog(src, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return False
+            for cfg in self.settings.sources:
+                if cfg.id == src.id:
+                    cfg.options = dict(src.options)
+                    break
+            self.settings.save()
+            if hasattr(src, "refresh_quota"):
+                src.refresh_quota()
+            self._update_quota_label()
+            return True
+        QMessageBox.information(self, "Login required", f"Log in to {src.display_name} in Settings first.")
+        return False
+
+    def _problem(self, quiet: bool, title: str, text: str) -> None:
+        if quiet:
+            getattr(self, "_bulk_problems", []).append(text)
+        else:
+            QMessageBox.warning(self, title, text)
+
+    def start_download(self, rel: Release, quiet: bool = False) -> None:
         src = self.sources.get(rel.source)
         if src is None:
+            return
+        if quiet and src.requires_login and not src.is_logged_in():
+            self._problem(True, "", f"{rel.raw_title}: not logged in to {src.display_name}")
             return
         if src.requires_login and not src.is_logged_in():
             if hasattr(src, "request_otp") and hasattr(src, "verify_otp"):
@@ -1490,22 +1622,22 @@ class MainWindow(QMainWindow):
                 return
         if not rel.details_loaded:
             self.status_label.setText("Loading post details…")
-            run_async(src.load_details, rel, on_done=self._enqueue,
-                      on_fail=lambda e: QMessageBox.warning(self, "Error", e.splitlines()[0]))
+            run_async(src.load_details, rel, on_done=lambda r: self._enqueue(r, quiet),
+                      on_fail=lambda e: self._problem(quiet, "Error", f"{rel.raw_title}: {e.splitlines()[0]}"))
         else:
-            self._enqueue(rel)
+            self._enqueue(rel, quiet)
 
-    def _enqueue(self, rel: Release) -> None:
+    def _enqueue(self, rel: Release, quiet: bool = False) -> None:
         if not rel.links:
-            QMessageBox.information(self, "No links", "No downloadable links found on this post.")
+            self._problem(quiet, "No links", f"{rel.raw_title}: no downloadable links found on this post.")
             return
         src = self.sources.get(rel.source)
         if src and src.daily_quota:
             if not self.quota.try_consume(src.id, src.daily_quota):
                 wait = self.quota.seconds_until_next(src.id)
-                QMessageBox.warning(self, "Daily limit reached",
-                                    f"{src.display_name}: no actions left. Next one frees up in "
-                                    f"{int(wait // 3600)}h {int(wait % 3600 // 60)}m.")
+                self._problem(quiet, "Daily limit reached",
+                              f"{src.display_name}: no actions left. Next one frees up in "
+                              f"{int(wait // 3600)}h {int(wait % 3600 // 60)}m.")
                 return
         link = min(rel.links, key=lambda l: LINK_PREFERENCE.get(l.kind, 9))
         self.downloads.enqueue(rel, link, Settings.resolve(self.settings.download_dir))

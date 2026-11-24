@@ -11,7 +11,7 @@ from PySide6.QtCore import (
     QAbstractListModel, QByteArray, QModelIndex, QObject, QRect, QSize, Qt,
     QTimer, Signal,
 )
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+from PySide6.QtGui import QKeySequence, QShortcut, QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListView, QMenu, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
@@ -342,11 +342,70 @@ class StudioDelegate(QStyledItemDelegate):
         p.restore()
 
 
+# ----------------------------------------------------------- multi-select menus
+def selected_entries(view, pos) -> list:
+    """Entries the context menu should act on: the selection if the click was inside it,
+    else just the clicked card (which becomes the selection, like a file manager)."""
+    idx = view.indexAt(pos)
+    if not idx.isValid():
+        return []
+    sm = view.selectionModel()
+    if not sm.isSelected(idx):
+        view.setCurrentIndex(idx)  # also selects it, replacing the selection
+    return [i.data(StudioRole) for i in sm.selectedIndexes() if i.data(StudioRole)] or [idx.data(StudioRole)]
+
+
+def bulk_menu(parent, view, pos, kind: str, model, activate, bulk) -> None:
+    """Right-click menu for one or many selected studio/performer cards.
+    ``bulk(action, kind, [(key, name)], on)`` applies an action to all of them at once."""
+    entries = selected_entries(view, pos)
+    if not entries:
+        return
+    one = entries[0] if len(entries) == 1 else None
+    items = [(e.key, e.name) for e in entries]
+    what = f"“{one.name}”" if one else f"{len(entries)} {kind}s"
+    menu = QMenu(parent)
+    if one:
+        menu.addAction(f"Show scenes {'from' if kind == 'studio' else 'with'} {one.name}",
+                       lambda: activate(one.key, one.name))
+        menu.addSeparator()
+    favs = [e.key in model.favorites for e in entries]
+    if not all(favs):
+        menu.addAction(f"☆ Add {what} to favorites", lambda: bulk("favorite", kind, items, True))
+    if any(favs):
+        menu.addAction(f"★ Remove {what} from favorites", lambda: bulk("favorite", kind, items, False))
+    hidden = [e.key in model.hidden for e in entries]
+    extra = " (and their scenes)" if kind == "performer" else ""
+    if not all(hidden):
+        menu.addAction(f"Hide {what}{extra}", lambda: bulk("hide", kind, items, True))
+    if any(hidden):
+        menu.addAction(f"Unhide {what}", lambda: bulk("hide", kind, items, False))
+    menu.addSeparator()
+    flagged = [e.key in model.flagged for e in entries]
+    if not all(flagged):
+        menu.addAction(f"⚑ Flag {what} for review…", lambda: bulk("flag", kind, items, True))
+    if any(flagged):
+        menu.addAction(f"Remove review flag from {what}", lambda: bulk("flag", kind, items, False))
+    if not one:
+        menu.addSeparator()
+        menu.addAction(f"{len(entries)} selected — Ctrl-click / Shift-click to change, Ctrl+A for all").setEnabled(False)
+    menu.exec(view.viewport().mapToGlobal(pos))
+
+
+def plain_click() -> bool:
+    """Ctrl/Shift-clicks only change the selection; a plain click opens the scenes."""
+    from PySide6.QtWidgets import QApplication
+    mods = QApplication.keyboardModifiers()
+    return not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+                        | Qt.KeyboardModifier.MetaModifier))
+
+
 class StudiosTab(QWidget):
     studio_activated = Signal(str, str)  # key, display name
     hide_requested = Signal(str, str, bool)  # key, name, hide?
     favorite_requested = Signal(str, str, bool)  # key, name, favourite?
     flag_requested = Signal(str, str, str, bool)  # kind, key, name, flag?
+    bulk_requested = Signal(str, str, list, bool)  # action, kind, [(key, name)], on
     export_requested = Signal()
 
     def __init__(self, logos: LogoService, parent=None):
@@ -382,8 +441,10 @@ class StudiosTab(QWidget):
         self.view.setMovement(QListView.Movement.Static)
         self.view.setModel(self.proxy)
         self.view.setItemDelegate(StudioDelegate())
-        self.view.activated.connect(self._activate)
-        self.view.clicked.connect(self._activate)
+        self.view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)  # Ctrl/Shift-click, Ctrl+A
+        # single click selects (Ctrl/Shift for several); double-click or Enter opens the scenes
+        self.view.doubleClicked.connect(self._activate)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self.view, activated=lambda: self._activate(self.view.currentIndex()))
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._menu)
         lay = QVBoxLayout(self)
@@ -396,23 +457,8 @@ class StudiosTab(QWidget):
             self.studio_activated.emit(e.key, e.name)
 
     def _menu(self, pos) -> None:
-        idx = self.view.indexAt(pos)
-        e: StudioEntry | None = idx.data(StudioRole) if idx.isValid() else None
-        if not e:
-            return
-        menu = QMenu(self)
-        menu.addAction(f"Show scenes from {e.name}", lambda: self.studio_activated.emit(e.key, e.name))
-        fav = e.key in self.model.favorites
-        menu.addAction("★ Remove from favorites" if fav else "☆ Add to favorites",
-                       lambda: self.favorite_requested.emit(e.key, e.name, not fav))
-        hidden = e.key in self.model.hidden
-        menu.addAction(f"{'Unhide' if hidden else 'Hide'} studio “{e.name}”",
-                       lambda: self.hide_requested.emit(e.key, e.name, not hidden))
-        menu.addSeparator()
-        flagged = e.key in self.model.flagged
-        menu.addAction("Remove review flag" if flagged else "⚑ Flag for review (wrong studio)…",
-                       lambda: self.flag_requested.emit("studio", e.key, e.name, not flagged))
-        menu.exec(self.view.viewport().mapToGlobal(pos))
+        bulk_menu(self, self.view, pos, "studio", self.model,
+                  lambda k, n: self.studio_activated.emit(k, n), self.bulk_requested.emit)
 
     def set_favorites(self, favs: set[str]) -> None:
         self.model.favorites = favs
@@ -440,6 +486,6 @@ class StudiosTab(QWidget):
             self.model.set_items(items)
             self.proxy.sort(0)
             self.model.logos.prefetch([(e.key, e.name) for e in items])
-            self.hint.setText(f"{len(items)} studios · click one to browse its scenes" +
+            self.hint.setText(f"{len(items)} studios · double-click one to browse its scenes · Ctrl/Shift-click to select several" +
                               ("" if logos_enabled else " · add a StashDB API key in Settings to load logos"))
         run_async(aggregate_studios, scenes, has, self.model.logos.db.studio_names(), on_done=apply, pool="cpu")

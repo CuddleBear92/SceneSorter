@@ -71,11 +71,12 @@ class ScenePane(QSplitter):
 
     def __init__(self, model: SceneModel, delegate: SceneDelegate,
                  render_detail: Callable[["ScenePane", Scene], None], have: str = "",
-                 empty_text: str = "Select a scene"):
+                 empty_text: str = "Select a scene", render_multi=None):
         super().__init__()
         self.model = model                      # the shared store
         self.list = SceneListModel(model)       # this pane's visible rows
         self.render_detail_cb = render_detail
+        self.render_multi_cb = render_multi  # (pane, [scenes]) when several are selected
         self.empty_text = empty_text
         self.current: Scene | None = None
         self._restoring = False
@@ -102,6 +103,7 @@ class ScenePane(QSplitter):
         self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._context_menu)
         self.grid.selectionModel().currentChanged.connect(self._current_changed)
+        self.grid.selectionModel().selectionChanged.connect(lambda *_: self._selection_changed())
         self.grid.deselected.connect(lambda: self.show_scene(None))
         self.list.needs_repaint.connect(self._repaint)
 
@@ -249,9 +251,22 @@ class ScenePane(QSplitter):
             QTimer.singleShot(50, self._apply_scroll_target)
 
     # ------------------------------------------------------------ selection
+    def selected_scenes(self) -> list[Scene]:
+        return [i.data(SceneRole) for i in self.grid.selectionModel().selectedIndexes()]
+
     def _current_changed(self, cur: QModelIndex, _prev) -> None:
-        if not self._restoring and cur.isValid():
+        if not self._restoring and cur.isValid() and len(self.grid.selectionModel().selectedIndexes()) <= 1:
             self.show_scene(cur.data(SceneRole))
+
+    def _selection_changed(self) -> None:
+        if self._restoring:
+            return
+        sel = self.selected_scenes()
+        if len(sel) > 1 and self.render_multi_cb:
+            self.clear_detail()
+            self.render_multi_cb(self, sel)
+        elif len(sel) == 1 and (self.current is None or self.current.key != sel[0].key):
+            self.show_scene(sel[0])
 
     def _context_menu(self, pos) -> None:
         idx = self.grid.indexAt(pos)
@@ -273,6 +288,11 @@ class ScenePane(QSplitter):
             self.render_detail_cb(self, scene)
 
     def refresh_detail(self) -> None:
+        sel = self.selected_scenes()
+        if len(sel) > 1 and self.render_multi_cb:
+            self.clear_detail()
+            self.render_multi_cb(self, sel)
+            return
         if self.current:
             self.current = self.model.by_key.get(self.current.key, self.current)
             self.clear_detail()

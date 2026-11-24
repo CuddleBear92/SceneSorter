@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QKeySequence, QShortcut, QColor, QFont, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QListView, QMenu, QPushButton, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from ..performers import PerformerEntry
 from .matching import PerformerImages
-from .studios import FilteredList, StudioEntry, StudioRole, dim_hidden, paint_flag, paint_star
+from .studios import (
+    FilteredList, StudioEntry, StudioRole, bulk_menu, dim_hidden, paint_flag, paint_star, plain_click,
+)
 
 CARD_W, PHOTO_H, TEXT_H = 160, 210, 46
 
@@ -114,6 +116,7 @@ class PerformersTab(QWidget):
     favorite_requested = Signal(str, str, bool)
     hide_requested = Signal(str, str, bool)
     flag_requested = Signal(str, str, str, bool)
+    bulk_requested = Signal(str, str, list, bool)  # action, kind, [(key, name)], on
     export_requested = Signal()
 
     def __init__(self, images: PerformerImages, parent=None):
@@ -150,8 +153,10 @@ class PerformersTab(QWidget):
         self.view.setMovement(QListView.Movement.Static)
         self.view.setModel(self.proxy)
         self.view.setItemDelegate(PerformerDelegate())
-        self.view.clicked.connect(self._activate)
-        self.view.activated.connect(self._activate)
+        self.view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)  # Ctrl/Shift-click, Ctrl+A
+        # single click selects (Ctrl/Shift for several); double-click or Enter opens the scenes
+        self.view.doubleClicked.connect(self._activate)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self.view, activated=lambda: self._activate(self.view.currentIndex()))
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._menu)
         lay = QVBoxLayout(self)
@@ -164,23 +169,8 @@ class PerformersTab(QWidget):
             self.performer_activated.emit(e.key, e.name)
 
     def _menu(self, pos) -> None:
-        idx = self.view.indexAt(pos)
-        e = idx.data(StudioRole) if idx.isValid() else None
-        if not e:
-            return
-        menu = QMenu(self)
-        menu.addAction(f"Show scenes with {e.name}", lambda: self.performer_activated.emit(e.key, e.name))
-        fav = e.key in self.model.favorites
-        menu.addAction("★ Remove from favorites" if fav else "☆ Add to favorites",
-                       lambda: self.favorite_requested.emit(e.key, e.name, not fav))
-        hidden = e.key in self.model.hidden
-        menu.addAction(f"{'Unhide' if hidden else 'Hide'} performer “{e.name}” (and their scenes)",
-                       lambda: self.hide_requested.emit(e.key, e.name, not hidden))
-        menu.addSeparator()
-        flagged = e.key in self.model.flagged
-        menu.addAction("Remove review flag" if flagged else "⚑ Flag for review (not a performer / wrong)…",
-                       lambda: self.flag_requested.emit("performer", e.key, e.name, not flagged))
-        menu.exec(self.view.viewport().mapToGlobal(pos))
+        bulk_menu(self, self.view, pos, "performer", self.model,
+                  lambda k, n: self.performer_activated.emit(k, n), self.bulk_requested.emit)
 
     def set_flagged(self, keys: set[str], total: int) -> None:
         self.model.flagged = keys
@@ -201,5 +191,5 @@ class PerformersTab(QWidget):
         # prefetch portraits for the most frequent performers first
         top = sorted(self.model.items, key=lambda e: -e.scenes)
         self.images.prefetch([(e.key, e.name) for e in top])
-        self.hint.setText(f"{len(self.model.items)} performers · click one to browse their scenes" +
+        self.hint.setText(f"{len(self.model.items)} performers · double-click one to browse their scenes · Ctrl/Shift-click to select several" +
                           ("" if images_enabled else " · add stash-box API keys in Settings for photos"))
