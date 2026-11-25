@@ -208,3 +208,41 @@ def test_append_assumed_group_to_file_name(tmp_path):
     # not moved: tagged where it is
     f.write_bytes(b"x")
     assert tag_in_place(f, "PRT").name.endswith("HEVC-PRT.mkv") and not f.exists()
+
+
+def test_full_rescan_resumes_after_interruption(tmp_path):
+    import threading
+    from scenesorter.db import Database
+    from scenesorter.gui.main_window import library_job
+
+    lib = tmp_path / "Library"
+    scenes = []
+    for i in range(30):
+        d = lib / f"Studio {i}"
+        d.mkdir(parents=True)
+        for j in range(100):
+            (d / f"Studio{i}.2025-01-{j % 28 + 1:02d}.Title.{j}.WEBDL-1080p.HEVC-PRT.mp4").write_bytes(b"")
+    db = Database(tmp_path / "t.db")
+    assert library_job(db, str(lib), scenes, {}, "", True, False).files == 3000  # normal scan, cached
+
+    cancel = threading.Event()
+    seen = []
+
+    def progress(done, total):
+        seen.append((done, total))
+        if done >= 1500:
+            cancel.set()  # like closing the app halfway
+
+    r1 = library_job(db, str(lib), scenes, {}, "", True, True, progress, cancel)
+    assert r1.cancelled and r1.full and 1500 <= r1.files < 3000
+    assert seen and seen[-1][1] == 3000                      # total known from the earlier scan
+    assert db.get_meta("library_full_rescan") == str(lib)    # still pending after the "restart"
+    done_dirs = len(db.library_dirs(str(lib)))
+    assert 10 <= done_dirs < 31
+
+    r2 = library_job(db, str(lib), scenes, {}, "", False, False)   # next start: carries on
+    assert r2.full and not r2.cancelled and r2.files == 3000
+    assert r2.folders_listed == 31 - done_dirs               # only the folders it hadn't finished
+    assert db.get_meta("library_full_rescan") == ""
+    r3 = library_job(db, str(lib), scenes, {}, "", False, False)
+    assert not r3.full and r3.folders_listed == 0

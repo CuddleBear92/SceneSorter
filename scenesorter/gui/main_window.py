@@ -113,15 +113,28 @@ def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tupl
 log = logging.getLogger(__name__)
 
 
-def library_job(db, root, scenes, studio_names, scheme, retry_unmatched, full):
-    """Worker thread: load the caches, scan, save. Keeps DB work off the UI thread."""
+def library_job(db, root, scenes, studio_names, scheme, retry_unmatched, full, progress=None, cancel=None):
+    """Worker thread: load the caches, scan, save as it goes. Keeps DB work off the UI thread.
+
+    A full rescan forgets the folder cache and re-matches every file. It's remembered in the
+    database until it completes, so after a restart it carries on: folders it finished are
+    cached again by then, and the rest are read and re-matched."""
+    flag = "library_full_rescan"
     if full:
         db.clear_library_cache(root)
+        db.set_meta(flag, root)
+    resuming = db.get_meta(flag) == root
+    save = lambda rows, dirs: db.save_library_scan(rows, [], dirs, [])  # noqa: E731
     res = scan_library(root, scenes, db.scanned_under(root), studio_names, scheme,
-                       dir_cache=db.library_dirs(root), retry_unmatched=retry_unmatched, full=full)
+                       dir_cache=db.library_dirs(root), retry_unmatched=retry_unmatched or resuming,
+                       rematch_listed=resuming, on_batch=save, progress=progress, cancel=cancel)
     if res.rows or res.gone or res.dirs or res.dirs_gone:
         db.save_library_scan(res.rows, res.gone, res.dirs, res.dirs_gone)
+    if resuming and not res.cancelled:
+        db.set_meta(flag, "")
+    res.full = resuming
     return res
+
 
 class Progress(QObject):
     """Thread-safe progress for long steps (loading, merging, filtering, performers).
@@ -150,11 +163,15 @@ class Progress(QObject):
             self.bar.hide()
             self.label.hide()
             return
-        text, done, total = list(self.phases.values())[-1]   # most recently started step
+        phases = list(self.phases.values())
+        # the bar follows the most recent step that knows its size, else shows "busy"
+        sized = [p for p in phases if p[2]]
+        _t, done, total = sized[-1] if sized else phases[-1]
         self.bar.setRange(0, total if total else 0)           # 0..0 = busy indicator
         if total:
             self.bar.setValue(done)
-        self.label.setText(text)
+        # every running step is listed, so a long one (library scan) isn't hidden by others
+        self.label.setText("  ·  ".join(p[0] for p in reversed(phases)))
         self.bar.show()
         self.label.show()
 
@@ -200,6 +217,8 @@ class MainWindow(QMainWindow):
         self.owned: dict[str, list[Path]] = {}  # scene key -> files in the (Whisparr) library
         self.lib_info: dict[str, tuple] = {}    # library file -> (resolution, group, codec, how matched)
         self._library_running = False
+        self._library_queued_full = False
+        self._library_cancel = None
         self._library_checked = False
         self._scene_gen = 0       # bumps whenever the scene list is rebuilt
         self._library_gen = -1    # scene list the last library scan matched against
@@ -1410,10 +1429,18 @@ class MainWindow(QMainWindow):
             if manual:
                 QMessageBox.information(self, "Library", "Set your library folder in Settings ▸ General first.")
             return
-        if self._library_running or not self.scenes:
+        if self.draining:
+            return
+        if self._library_running:
+            if full:  # run it as soon as the current check ends
+                self._library_queued_full = True
+                self.status_label.setText("Library: full rescan starts when the current check finishes")
+            elif manual:
+                self.status_label.setText("Library: already scanning — see the progress bar")
+            return
+        if not self.scenes:
             if manual:
-                self.status_label.setText("Library: already scanning…" if self._library_running
-                                          else "Library: waiting for scenes to load…")
+                self.status_label.setText("Library: waiting for scenes to load…")
             return
         self._library_running = True
         root = str(Settings.resolve(lib))
@@ -1421,23 +1448,42 @@ class MainWindow(QMainWindow):
         self._library_gen = self._scene_gen
         if manual:
             self.status_label.setText("Library: full rescan…" if full else "Library: checking for changes…")
+        import threading
+
+        self._library_cancel = threading.Event()
+        resuming = not full and self.db.get_meta("library_full_rescan") == root
+        what = "Library: full rescan" if full or resuming else "Library: checking for changes"
+        progress = self.progress
+
+        def report(done: int, total: int) -> None:  # worker thread; Progress is thread-safe
+            progress.report("library", f"{what} — {done:,} of ~{total:,} files", done, total)
+        progress.report("library", f"{what}…")
         run_async(library_job, self.db, root, list(self.scenes), self.db.studio_names(),
-                  self.settings.library_naming, retry, full,
+                  self.settings.library_naming, retry, full, report, self._library_cancel,
                   on_done=lambda r: self._library_scanned(r, manual),
                   on_fail=self._library_failed, pool="cpu")
 
     def _library_failed(self, err: str) -> None:
         self._library_running = False
+        self.progress.done("library")
         log.warning("library scan failed: %s", err.splitlines()[0] if err else err)
         self.status_label.setText("Library scan failed: " + (err.splitlines()[0] if err else "?"))
 
     def _library_scanned(self, res, manual: bool) -> None:
         self._library_running = False
+        self.progress.done("library")
+        if res is not None and res.cancelled:
+            log.info("library scan stopped early (closing); %d files done, saved", res.files)
+            return
+        if self._library_queued_full and not self.draining:
+            self._library_queued_full = False
+            QTimer.singleShot(0, lambda: self.rescan_library(manual=True, full=True))
         if res is None:
             self.owned, self.lib_info = {}, {}
         else:
             self.owned, self.lib_info = res.owned, res.info
-            msg = (f"Library: {res.files} files in {res.folders} folders ({res.folders_listed} changed), "
+            msg = (f"Library{' full rescan' if res.full else ''}: {res.files} files in {res.folders} folders "
+                   f"({res.folders_listed} read), "
                    f"{len(res.owned)} scenes, {res.unmatched} unmatched — {res.seconds:.1f}s")
             log.info(msg)
             if manual or res.matched_now or res.gone:
@@ -1973,6 +2019,8 @@ class MainWindow(QMainWindow):
             out.append("merging scenes")
         if self._import_running:
             out.append("scanning files")
+        if self._library_running:
+            out.append("saving the library scan")
         if self.matcher.q.busy or self.perf_images.q.busy or self.logos.busy:
             out.append("a stash-box lookup")
         return out
@@ -2004,6 +2052,8 @@ class MainWindow(QMainWindow):
             for j in active:
                 self.downloads.cancel(j.id)
         self.draining = True
+        if self._library_cancel is not None:
+            self._library_cancel.set()  # stops at the next file; what's done is saved
         for q in (self.matcher.q, self.perf_images.q):
             q.enabled = False
         self.logos.timer.stop()

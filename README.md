@@ -64,6 +64,11 @@ studio-sorted library to show what you already have.
   The library is checked on start, when Settings are saved, and on the
   import-folder timer. **Scan library** in the toolbar checks now, and its
   arrow menu has a full rescan that reads every folder and file again.
+  Progress shows in the status bar, with a percentage once the file count is
+  known. Results are saved every 1,000 files. A full rescan carries on after a
+  restart with only the folders it hadn't finished. Asking for a full rescan
+  during a background check runs it as soon as that check ends. Closing the
+  app stops the scan at the next file and keeps what's done.
 - **Library naming.** Paste Whisparr's scene naming format, for example
   `{Studio CleanTitleSlug}{.Release Date}.{Scene.CleanTitle}{.Scene.Performers}{.Quality.Title}{.MediaInfo VideoCodec}{-Release Group}`.
   File names that fit it are read field by field, so studio, date, quality,

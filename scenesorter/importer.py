@@ -113,6 +113,8 @@ class LibraryScan:
     matched_now: int = 0
     unmatched: int = 0
     seconds: float = 0.0
+    cancelled: bool = False
+    full: bool = False        # this was (part of) a full rescan
 
 
 def _walk_library(root: Path, dir_cache: dict[str, tuple], full: bool, res: LibraryScan, visited: set[str]):
@@ -152,22 +154,29 @@ def _walk_library(root: Path, dir_cache: dict[str, tuple], full: bool, res: Libr
                         continue
         except OSError:
             continue
-        res.dirs[key] = (mtime, subdirs, names)
         stack.extend(d / n for n in subdirs)
         for n, st in zip(names, stats):
             yield d / n, st
+        res.dirs[key] = (mtime, subdirs, names)  # only now: every file in it has been handled
 
 
 def scan_library(root: str | Path, scenes: list[Scene], known: dict[str, tuple] | None = None,
                  studio_names: dict[str, str] | None = None, scheme: str = "",
                  dir_cache: dict[str, tuple] | None = None, retry_unmatched: bool = True,
-                 full: bool = False) -> LibraryScan:
+                 full: bool = False, rematch_listed: bool = False, on_batch=None, progress=None,
+                 cancel=None, batch: int = 1000) -> LibraryScan:
     """Scan the final, studio-sorted library (read-only) and map scene key -> files.
 
-    ``known``: path -> (size, mtime, source, post_id) from earlier scans; unchanged files
+    ``known``: path -> (size, mtime, source, post_id, how) from earlier scans; unchanged files
     that matched are not matched again. ``dir_cache``: folder -> (mtime, subdirs, files);
     unchanged folders are not listed again. Unmatched files are retried when
-    ``retry_unmatched`` (new posts arrived since). ``full`` ignores both caches.
+    ``retry_unmatched`` (new posts arrived since). ``full`` ignores both caches;
+    ``rematch_listed`` re-matches every file in a folder that is read again (how a full
+    rescan resumes: finished folders are cached, the rest are read and matched afresh).
+
+    ``on_batch(rows, dirs)`` is called every ``batch`` files with what to save so far (then
+    cleared), so an interrupted scan keeps its work. ``progress(files, total)`` reports
+    progress; ``cancel`` (a threading.Event) stops the scan early — ``res.cancelled``.
     """
     import time
 
@@ -176,22 +185,31 @@ def scan_library(root: str | Path, scenes: list[Scene], known: dict[str, tuple] 
     res = LibraryScan()
     if not root.is_dir():
         return res
-    known = {} if full or known is None else known
+    known = known or {}
+    dir_cache = {} if full else (dir_cache or {})
+    total = sum(len(v[2]) for v in dir_cache.values()) or len(known)
     by_post = {(r.source, r.post_id): s.key for s in scenes for r in s.releases}
     index: SceneIndex | None = None
     seen: set[str] = set()
     visited: set[str] = set()
     how_now: dict[str, str] = {}
-    for p, st in _walk_library(root, dir_cache or {}, full, res, visited):
+    for p, st in _walk_library(root, dir_cache, full, res, visited):
+        if cancel is not None and cancel.is_set():
+            res.cancelled = True
+            break
         sp = str(p)
         seen.add(sp)
         res.files += 1
-        k = known.get(sp)
+        if progress and res.files % 200 == 0:
+            progress(res.files, max(total, res.files))
+        if on_batch and len(res.rows) + len(res.dirs) >= batch:
+            on_batch(res.rows, res.dirs)
+            res.rows, res.dirs = [], {}
+        fresh = full or (rematch_listed and st is not None)  # match again, ignore the old result
+        k = None if fresh else known.get(sp)
         if st is None:  # folder unchanged: trust the earlier scan
-            if k is None:
-                st = _stat(p)
-            else:
-                st = (k[0], k[1])
+            kk = known.get(sp)
+            st = (kk[0], kk[1]) if kk else _stat(p)
         if k and (k[0], k[1]) == st:
             key = by_post.get((k[2], k[3])) if k[2] else None
             if key:
@@ -211,14 +229,15 @@ def scan_library(root: str | Path, scenes: list[Scene], known: dict[str, tuple] 
             res.rows.append((sp, *st, m.scene.key, m.release.source, m.release.post_id, m.score, m.reason))
         else:
             res.unmatched += 1
-            if not k or k[2] or (k[0], k[1]) != st:
+            if fresh or not k or k[2] or (k[0], k[1]) != st:
                 res.rows.append((sp, *st, None, None, None, 0.0))
     for paths in res.owned.values():
         for p in paths:
             k = known.get(str(p))
             how = how_now.get(str(p)) or (k[4] if k and len(k) > 4 else "") or "earlier scan"
             res.info[str(p)] = (*file_quality(p.name, scheme), how)
-    res.gone = [p for p in known if p not in seen]
-    res.dirs_gone = [d for d in (dir_cache or {}) if d not in visited]
+    if not res.cancelled:  # only a complete walk knows what's gone
+        res.gone = [p for p in known if p not in seen]
+        res.dirs_gone = [d for d in dir_cache if d not in visited]
     res.seconds = time.monotonic() - t0
     return res
