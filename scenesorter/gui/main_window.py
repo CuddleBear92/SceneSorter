@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
-    QDialog, QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
+    QApplication, QDialog, QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
     QFileDialog, QMainWindow, QMessageBox, QProgressBar, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
@@ -185,6 +185,7 @@ class MainWindow(QMainWindow):
         self._scene_cache: dict = {}   # studio key -> merged scenes (see merge.merge_incremental)
         self._dirty_studios: set | None = None  # studios to re-merge; None = all
         self._close_ok = False
+        self._updating = False
         self._refresh_page1_after: set[str] = set()
         self.fav = {"studio": self.db.favorites("studio"), "performer": self.db.favorites("performer")}
         self.releases: dict[tuple[str, str], Release] = {}
@@ -1955,8 +1956,10 @@ class MainWindow(QMainWindow):
     def _apply_update(self, path: Path) -> None:
         """Let running work finish (current page, merge, imports) before swapping the exe."""
         def go():
+            log.info("installing update %s", path.name)
             updater.apply_update_and_restart(path)
             self._close_ok = True
+            self._updating = True
             self.close()
         self._drain("Installing the update", go)
 
@@ -2019,12 +2022,22 @@ class MainWindow(QMainWindow):
             if not self.draining:
                 self._drain("Closing", really_close)
             return
+        from ..app import exit_watchdog
+        log.info("closing%s", " for update" if self._updating else "")
+        # Whatever happens below, the process ends: a stuck background job must never keep
+        # SceneSorter.exe alive (that blocks the updater from replacing it).
+        exit_watchdog(20, "shutdown")
         self.draining = True
+        for t in (self.import_timer, self.rebuild_timer, self.perf_timer):
+            t.stop()
         self.downloads.shutdown()
         from .workers import _pools
         for p in [QThreadPool.globalInstance(), *_pools.values()]:
             p.waitForDone(2500)  # let any last DB write complete
         self.thumbs.placeholders.save()
-        self.db.close()
+        if not self.db.close(timeout=3):
+            log.warning("database still busy at exit; leaving it to SQLite (unfinished work is rolled back)")
         super().closeEvent(ev)
+        ev.accept()
+        QApplication.quit()  # don't depend on Qt noticing the last window closed
 

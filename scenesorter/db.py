@@ -193,9 +193,17 @@ class Database:
                               "AND d.post_id=flags.post_id AND d.state='Done')")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 
-    def close(self) -> None:
-        with self._lock:
+    def close(self, timeout: float | None = None) -> bool:
+        """Close the connection. With ``timeout``, give up (and leave it to the OS) if a
+        background job still holds the lock after that many seconds: SQLite rolls back an
+        unfinished transaction on the next open, so nothing is corrupted. Returns closed?"""
+        if not self._lock.acquire(timeout=-1 if timeout is None else timeout):
+            return False
+        try:
             self.conn.close()
+            return True
+        finally:
+            self._lock.release()
 
     # ------------------------------------------------------------------ meta
     def get_meta(self, key: str, default: str | None = None) -> str | None:

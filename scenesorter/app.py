@@ -70,6 +70,39 @@ def _setup_logging() -> None:
     log.info("SceneSorter build %s starting", __version__)
 
 
+def exit_watchdog(seconds: float, why: str) -> None:
+    """Make sure the process ends: if it's still alive ``seconds`` from now (something
+    blocked shutdown), write every thread's stack to data/shutdown-hang.log and exit hard.
+    Runs on a daemon thread, so it works even if the UI thread is stuck."""
+    import faulthandler
+    import logging
+    import threading
+    import time
+
+    from .config import DATA_DIR
+
+    def fire() -> None:
+        log = logging.getLogger("scenesorter")
+        log.error("%s: still running after %.0f s, forcing exit (stacks in shutdown-hang.log)", why, seconds)
+        try:
+            with open(DATA_DIR / "shutdown-hang.log", "a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {why}: forced exit ===\n")
+                fh.flush()
+                faulthandler.dump_traceback(fh, all_threads=True)
+        except OSError:
+            pass
+        for h in log.handlers:
+            try:
+                h.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        os._exit(0)
+
+    t = threading.Timer(seconds, fire)
+    t.daemon = True
+    t.start()
+
+
 def main(argv: list[str] | None = None) -> int:
     # Heavy work (merging, filtering, matching) runs on worker threads. With Python's
     # default 5 ms GIL switch interval, every small Qt->Python callback on the UI thread
@@ -104,10 +137,15 @@ def main(argv: list[str] | None = None) -> int:
                                    f"Build {ver} was downloaded earlier but didn't get installed.\n\nInstall it now?")
         if ans == QMessageBox.StandardButton.Yes:
             updater.apply_update_and_restart(f)
-            return 0
+            _flush_streams()
+            os._exit(0)  # nothing else is running yet; leave at once so the exe can be replaced
     win = MainWindow(settings)
     win.show()
     rc = app.exec()
+    import logging
+
+    logging.getLogger("scenesorter").info("event loop ended (rc=%s), exiting", rc)
+    exit_watchdog(10, "after event loop")
     # The window has already finished/saved its work (closeEvent drains, closes the DB).
     # Don't let a background job that's still running (e.g. a long merge on a busy, swapping
     # machine) keep the process alive: Qt's thread pool would wait for it on exit, which also
@@ -119,4 +157,6 @@ def main(argv: list[str] | None = None) -> int:
     for p in [QThreadPool.globalInstance(), *_pools.values()]:
         p.waitForDone(1500)
     _flush_streams()
+    for h in logging.getLogger("scenesorter").handlers:
+        h.flush()
     os._exit(rc)
