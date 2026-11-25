@@ -87,6 +87,13 @@ CREATE TABLE IF NOT EXISTS review_flags (
 );
 
 -- Video files seen on disk (drag & drop, import folders, library) and what they matched.
+CREATE TABLE IF NOT EXISTS library_dirs (
+    path    TEXT PRIMARY KEY,
+    mtime   REAL,
+    subdirs TEXT,
+    files   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS scanned_files (
     path       TEXT PRIMARY KEY,
     size       INTEGER,
@@ -436,6 +443,38 @@ class Database:
             rows = self.conn.execute("SELECT path, size, mtime, source, post_id FROM scanned_files "
                                      "WHERE substr(path, 1, ?) = ?", (len(root), root)).fetchall()
         return {r["path"]: (r["size"], r["mtime"], r["source"], r["post_id"]) for r in rows}
+
+    def library_dirs(self, root: str) -> dict[str, tuple]:
+        """folder -> (mtime, [sub-folder names], [video file names]) below ``root``."""
+        root = root.rstrip("/\\")
+        with self._lock:
+            rows = self.conn.execute("SELECT path, mtime, subdirs, files FROM library_dirs "
+                                     "WHERE substr(path, 1, ?) = ?", (len(root), root)).fetchall()
+        return {r["path"]: (r["mtime"], json.loads(r["subdirs"]), json.loads(r["files"])) for r in rows}
+
+    def save_library_scan(self, rows: list[tuple], gone: list[str], dirs: dict[str, tuple],
+                          dirs_gone: list[str]) -> None:
+        now = time.time()
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO scanned_files(path, size, mtime, scene_key, source, post_id, score, "
+                    "scanned_at) VALUES (?,?,?,?,?,?,?,?)", [(*r, now) for r in rows])
+                self.conn.executemany("DELETE FROM scanned_files WHERE path=?", [(p,) for p in gone])
+                self.conn.executemany("INSERT OR REPLACE INTO library_dirs VALUES (?,?,?,?)",
+                                      [(k, m, json.dumps(sd), json.dumps(f)) for k, (m, sd, f) in dirs.items()])
+                self.conn.executemany("DELETE FROM library_dirs WHERE path=?", [(d,) for d in dirs_gone])
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    def clear_library_cache(self, root: str) -> None:
+        """Forget folder listings (a full rescan reads every folder and file again)."""
+        root = root.rstrip("/\\")
+        with self._lock:
+            self.conn.execute("DELETE FROM library_dirs WHERE substr(path, 1, ?) = ?", (len(root), root))
 
     def save_scanned(self, rows: list[tuple]) -> None:
         """rows: (path, size, mtime, scene_key, source, post_id, score)"""

@@ -37,8 +37,14 @@ studio-sorted library to show what you already have.
   Whisparr imports to. SceneSorter only reads it. Matching scenes get an
   **IN LIBRARY** badge, even when your file is a different resolution or came
   from another site. When a file name doesn't name the studio, the studio
-  folder is used. Already-matched files aren't matched again unless they
-  change, and the library is checked on the import-folder timer.
+  folder is used.
+- **Fast library checks.** The scan runs in the background. It remembers each
+  folder's modified date and contents. A folder's date changes whenever a file
+  in it is added, removed or renamed, so unchanged folders aren't read again
+  and their files aren't looked at. Only new or changed files are matched.
+  The library is checked on start, when Settings are saved, and on the
+  import-folder timer. **Scan library** in the toolbar checks now, and its
+  arrow menu has a full rescan that reads every folder and file again.
 - **Library naming.** Paste Whisparr's scene naming format, for example
   `{Studio CleanTitleSlug}{.Release Date}.{Scene.CleanTitle}{.Scene.Performers}{.Quality.Title}{.MediaInfo VideoCodec}{-Release Group}`.
   File names that fit it are read field by field, so studio, date, quality,

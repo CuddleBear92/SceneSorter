@@ -109,6 +109,17 @@ def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tupl
 
 log = logging.getLogger(__name__)
 
+
+def library_job(db, root, scenes, studio_names, scheme, retry_unmatched, full):
+    """Worker thread: load the caches, scan, save. Keeps DB work off the UI thread."""
+    if full:
+        db.clear_library_cache(root)
+    res = scan_library(root, scenes, db.scanned_under(root), studio_names, scheme,
+                       dir_cache=db.library_dirs(root), retry_unmatched=retry_unmatched, full=full)
+    if res.rows or res.gone or res.dirs or res.dirs_gone:
+        db.save_library_scan(res.rows, res.gone, res.dirs, res.dirs_gone)
+    return res
+
 class Progress(QObject):
     """Thread-safe progress for long steps (loading, merging, filtering, performers).
     ``report``/``done`` may be called from worker threads; the bar updates on the UI thread."""
@@ -185,6 +196,8 @@ class MainWindow(QMainWindow):
         self.owned: dict[str, list[Path]] = {}  # scene key -> files in the (Whisparr) library
         self._library_running = False
         self._library_checked = False
+        self._scene_gen = 0       # bumps whenever the scene list is rebuilt
+        self._library_gen = -1    # scene list the last library scan matched against
         self.scenes: list[Scene] = []
 
         self.bridge = _JobBridge()
@@ -230,6 +243,14 @@ class MainWindow(QMainWindow):
         act_import = QAction("Import files…", self, triggered=self._import_dialog)
         act_import.setToolTip("Pick a folder of videos to mark as downloaded (or just drag files/folders onto the window)")
         act_update = QAction("Check for updates", self, triggered=lambda: self.check_updates(False))
+        act_library = QAction("Scan library", self, triggered=lambda: self.rescan_library(manual=True))
+        act_library.setToolTip("Check your library folder for new, moved or removed files now "
+                               "(only changed folders are read). The arrow has a full rescan.")
+        lib_menu = QMenu(self)
+        lib_menu.addAction("Check for changes", lambda: self.rescan_library(manual=True))
+        lib_menu.addAction("Full rescan (read every folder and file again)",
+                           lambda: self.rescan_library(manual=True, full=True))
+        act_library.setMenu(lib_menu)
         for a in (act_refresh, self.act_crawl):
             tb.addAction(a)
         tb.addSeparator()
@@ -294,6 +315,7 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
                              spacer.sizePolicy().verticalPolicy().Preferred)
         tb.addWidget(spacer)
+        tb.addAction(act_library)
         tb.addAction(act_import)
         tb.addAction(act_settings)
         tb.addAction(act_update)
@@ -1080,6 +1102,7 @@ class MainWindow(QMainWindow):
             self.model.covers = self._covers()
             self.model.status, self.model.hidden = bundle["status"], bundle["hidden"]
             self.model.set_scenes(scenes, set(self.owned))
+            self._scene_gen += 1
             if not self._library_checked:  # first scenes in: check the library once
                 self._library_checked = True
                 QTimer.singleShot(3000, self.rescan_library)
@@ -1310,34 +1333,48 @@ class MainWindow(QMainWindow):
         self.group_box.setCurrentIndex(max(idx, 0))
         self.group_box.blockSignals(False)
 
-    def rescan_library(self) -> None:
-        """Scan the final, studio-sorted library (read-only) and mark what's in it."""
+    def rescan_library(self, manual: bool = False, full: bool = False) -> None:
+        """Check the final, studio-sorted library (read-only) and mark what's in it. Runs on a
+        worker thread; only folders whose modified date changed are read again."""
         lib = self.settings.library_dir.strip()
         if not lib:
             if self.owned:
-                self._library_scanned(None)
+                self._library_scanned(None, False)
+            if manual:
+                QMessageBox.information(self, "Library", "Set your library folder in Settings ▸ General first.")
             return
         if self._library_running or not self.scenes:
+            if manual:
+                self.status_label.setText("Library: already scanning…" if self._library_running
+                                          else "Library: waiting for scenes to load…")
             return
         self._library_running = True
         root = str(Settings.resolve(lib))
-        run_async(scan_library, root, list(self.scenes), self.db.scanned_under(root),
-                  self.db.studio_names(), self.settings.library_naming,
-                  on_done=self._library_scanned, on_fail=self._library_failed, pool="cpu")
+        retry = full or self._library_gen != self._scene_gen  # new posts since: retry unmatched files
+        self._library_gen = self._scene_gen
+        if manual:
+            self.status_label.setText("Library: full rescan…" if full else "Library: checking for changes…")
+        run_async(library_job, self.db, root, list(self.scenes), self.db.studio_names(),
+                  self.settings.library_naming, retry, full,
+                  on_done=lambda r: self._library_scanned(r, manual),
+                  on_fail=self._library_failed, pool="cpu")
 
     def _library_failed(self, err: str) -> None:
         self._library_running = False
         log.warning("library scan failed: %s", err.splitlines()[0] if err else err)
+        self.status_label.setText("Library scan failed: " + (err.splitlines()[0] if err else "?"))
 
-    def _library_scanned(self, res) -> None:
+    def _library_scanned(self, res, manual: bool) -> None:
         self._library_running = False
         if res is None:
             self.owned = {}
         else:
-            if res.rows:
-                self.db.save_scanned(res.rows)
             self.owned = res.owned
-            log.info("library: %d files, %d scenes, %d unmatched", res.files, len(res.owned), res.unmatched)
+            msg = (f"Library: {res.files} files in {res.folders} folders ({res.folders_listed} changed), "
+                   f"{len(res.owned)} scenes, {res.unmatched} unmatched — {res.seconds:.1f}s")
+            log.info(msg)
+            if manual or res.matched_now or res.gone:
+                self.status_label.setText(msg)
         self.model.set_status(owned=set(self.owned))
 
     # --------------------------------------------------------------- detail

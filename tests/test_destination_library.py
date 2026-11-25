@@ -63,3 +63,38 @@ def test_studio_folder_used_when_name_lacks_studio(tmp_path):
     f = lib / "Brazzers Exxtra" / "2024-01-15 - Hot Summer Day In The City [WEBDL-1080p].mp4"
     f.write_bytes(b"x")
     assert scan_library(lib, [s]).owned == {s.key: [f]}
+
+
+def test_folder_cache_skips_unchanged_folders(tmp_path):
+    import os
+    from scenesorter.db import Database
+    from scenesorter.gui.main_window import library_job
+
+    a = _scene("LittleAsians.26.06.30.Kaori.Ojima.First.Scene.Here.XXX.1080p.HEVC.x265.PRT")
+    b = _scene("LittleAsians.26.07.02.Mei.Lin.Second.Scene.There.XXX.1080p.HEVC.x265.PRT")
+    lib = tmp_path / "Library"
+    studio = lib / "Little Asians"
+    studio.mkdir(parents=True)
+    fa = studio / "LittleAsians.2026-06-30.First.Scene.Here.Kaori.Ojima.WEBDL-1080p.HEVC-PRT.mp4"
+    fa.write_bytes(b"x")
+    db = Database(tmp_path / "t.db")
+    run = lambda full=False: library_job(db, str(lib), [a, b], {}, WHISPARR, False, full)  # noqa: E731
+
+    r1 = run()
+    assert r1.owned == {a.key: [fa]} and r1.folders == 2 and r1.folders_listed == 2
+    r2 = run()  # nothing changed: no folder listed again, match reused
+    assert r2.owned == {a.key: [fa]} and r2.folders_listed == 0 and r2.matched_now == 0
+
+    fb = studio / "LittleAsians.2026-07-02.Second.Scene.There.Mei.Lin.WEBDL-1080p.HEVC-PRT.mp4"
+    fb.write_bytes(b"x")
+    os.utime(studio, (1e9, 1e9))  # make sure the folder date moved, whatever the clock resolution
+    r3 = run()
+    assert set(r3.owned) == {a.key, b.key} and r3.folders_listed == 1 and r3.matched_now == 1
+
+    fa.unlink()
+    os.utime(studio, (1e9 + 5, 1e9 + 5))
+    r4 = run()
+    assert set(r4.owned) == {b.key} and r4.gone == [str(fa)]
+
+    r5 = run(full=True)
+    assert set(r5.owned) == {b.key} and r5.folders_listed == 2
