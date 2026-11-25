@@ -11,7 +11,7 @@ from datetime import date
 
 from .models import Scene
 from .parsing import normalise_studio
-from .status import LIB_OK, LIB_UPGRADE, library_upgrade
+from .status import LIB_OK, LIB_UPGRADE, group_of, library_upgrade
 
 SORTS = {
     "posted": "Newest posted",
@@ -57,10 +57,12 @@ class ViewState:
     hidden_studios: set[str] = field(default_factory=set)      # studio keys
     hidden_performers: set[str] = field(default_factory=set)   # performer keys
     fav_overrides_hidden_studio: bool = False
-    library_files: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # key -> [(res, group)]
+    library_files: dict[str, list[tuple]] = field(default_factory=dict)  # key -> [(res, group, codec)]
     preferred_groups: tuple[str, ...] = ()                             # lowercased
     wanted_resolution: str = ""
     grabbed: frozenset = frozenset()   # (source, post_id) of releases grabbed/done/verified
+    assume_group: str = ""             # count HEVC/AV1 posts without a group as this group
+    source_order: tuple = ()
 
     def state(self, key: str) -> str:
         return "complete" if key in self.owned else self.status.get(key, "none")
@@ -130,7 +132,7 @@ def upgrade_wanted(s: Scene, st: ViewState, include_unavailable: bool = False) -
     """Library file below your preference, and (unless ``include_unavailable``) a release
     that meets it is posted and hasn't been grabbed yet."""
     verdict, rel = library_upgrade(s, st.library_files.get(s.key, []), st.wanted_resolution,
-                                   st.preferred_groups)
+                                   st.preferred_groups, list(st.source_order), st.assume_group)
     if verdict == LIB_OK:
         return False
     if include_unavailable:
@@ -138,7 +140,8 @@ def upgrade_wanted(s: Scene, st: ViewState, include_unavailable: bool = False) -
     if verdict != LIB_UPGRADE:
         return False
     return not any((r.source, r.post_id) in st.grabbed for r in s.releases
-                   if r.resolution_rank == rel.resolution_rank and r.release_group.lower() in st.preferred_groups)
+                   if r.resolution_rank == rel.resolution_rank
+                   and group_of(r.release_group.lower(), r.codec, st.assume_group.lower()) in st.preferred_groups)
 
 
 def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Scene]:

@@ -30,7 +30,7 @@ from ..quota import QuotaTracker
 from ..sources import RateLimited, Source, build_source
 from ..parsing import normalise_studio
 from ..status import (
-    DONE, FINISHED, GRABBED, LIB_OK, LIB_UPGRADE, library_upgrade, preferred_release, scene_status, source_order,
+    DONE, FINISHED, GRABBED, LIB_OK, LIB_UPGRADE, group_of, library_upgrade, preferred_release, scene_status, source_order,
     target_release,
 )
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
@@ -332,6 +332,8 @@ class MainWindow(QMainWindow):
         self.model.preferred_groups = tuple(g.lower() for g in self.settings.preferred_groups)
         self.model.wanted_resolution = self.settings.preferred_resolution
         self.model.grabbed = self._grabbed_posts()
+        self.model.assume_group = self._assume_group()
+        self.model.source_order = tuple(self._source_order())
         self.delegate = SceneDelegate([])
         self.delegate.preferred_groups = self.settings.preferred_groups
         self.browse = ScenePane(self.model, self.delegate, self.render_detail, render_multi=self.render_multi)
@@ -1392,6 +1394,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "model", None) is not None:
             self.model.preferred_groups = tuple(g.lower() for g in self.settings.preferred_groups)
             self.model.wanted_resolution = self.settings.preferred_resolution
+            self.model.assume_group = self._assume_group()
+            self.model.source_order = tuple(self._source_order())
             self._upgrade_hint()
             self.model.names_changed()  # refilter
 
@@ -1437,7 +1441,7 @@ class MainWindow(QMainWindow):
             log.info(msg)
             if manual or res.matched_now or res.gone:
                 self.status_label.setText(msg)
-        files = {k: [self.lib_info.get(str(p), ("", "", "", ""))[:2] for p in paths]
+        files = {k: [self.lib_info.get(str(p), ("", "", "", ""))[:3] for p in paths]
                  for k, paths in self.owned.items()}
         self.model.set_status(owned=set(self.owned), library_files=files)
 
@@ -1613,7 +1617,12 @@ class MainWindow(QMainWindow):
 
     def _preferred(self, scene: Scene) -> Release:
         return preferred_release(scene, self.settings.preferred_resolution, self.settings.preferred_groups,
-                                 self._source_order())
+                                 self._source_order(), self._assume_group())
+
+    def _assume_group(self) -> str:
+        """Group that HEVC/AV1 posts without a group count as ('' = off)."""
+        g = self.settings.preferred_groups
+        return g[0] if g and self.settings.assume_group_for_hevc else ""
 
     def download_preferred(self, scenes: list[Scene]) -> None:
         """Grab the preferred release of each scene (wanted resolution -> group -> source).
@@ -1635,7 +1644,8 @@ class MainWindow(QMainWindow):
     def upgrade_for(self, scene: Scene):
         """(verdict, release) for a scene in your library — see status.library_upgrade."""
         files = self.model.library_files.get(scene.key, [])
-        return library_upgrade(scene, files, self.settings.preferred_resolution, self.model.preferred_groups)
+        return library_upgrade(scene, files, self.settings.preferred_resolution, self.model.preferred_groups,
+                               self._source_order(), self._assume_group())
 
     def download_upgrades(self, scenes: list[Scene]) -> None:
         """Grab the release that meets your preference for library scenes that don't."""
@@ -1721,13 +1731,15 @@ class MainWindow(QMainWindow):
         quota_txt = ""
         if src and src.daily_quota:
             quota_txt = f" · {self.quota.remaining(src.id, src.daily_quota)} left today"
-        grp = rel.release_group or "?"
+        assumed = "" if rel.release_group else group_of("", rel.codec, self._assume_group())
+        grp = rel.release_group or (f"{assumed}?" if assumed else "?")
         grp_html = (f"<span style='color:#f59e0b'><b>{grp}</b></span>"
-                    if grp in self.settings.preferred_groups else grp)
+                    if (rel.release_group or assumed) in self.settings.preferred_groups else grp)
         codec = f" · {rel.codec}" if rel.codec else ""
         lbl = QLabel(f"<b>{rel.resolution or '?'}</b> · {grp_html}{codec} — {name}"
                      f"{' · ' + fmt_bytes(rel.size_bytes) if rel.size_bytes else ''}{quota_txt}")
-        lbl.setToolTip(rel.raw_title)
+        lbl.setToolTip(rel.raw_title + (f"\n{assumed}? = no release group in the post; counted as {assumed} "
+                                         "because it's HEVC/AV1 (Settings ▸ General)" if assumed else ""))
         lbl.setWordWrap(True)
         h.addWidget(lbl, 1)
         btn_dl = QPushButton("Download")

@@ -144,3 +144,39 @@ def test_file_quality_and_match_reason(tmp_path):
     res = scan_library(lib, [s], scheme=WHISPARR)
     assert res.info[str(f)][:3] == ("1080p", "PRT", "HEVC")
     assert res.info[str(f)][3].startswith("naming scheme")
+
+
+def test_hevc_without_group_counts_as_preferred_group():
+    from scenesorter.status import LIB_OK, LIB_UPGRADE, library_upgrade, preferred_release
+
+    prt = enrich(Release("pornrips", "1", "", "Deeper.21.07.29.Angela.White.Florentine.Part.1.XXX.1080p.HEVC.x265.PRT"))
+    efap = enrich(Release("efap", "2", "", "Deeper 2021.07.29 Angela White - Florentine Part 1 1080p X265 HEVC.mkv"))
+    avc = enrich(Release("efap", "3", "", "Deeper 2021.07.29 Angela White - Florentine Part 1 1080p x264.mkv"))
+    scene = merge_releases([prt, efap, avc])[0]
+    assert len(scene.releases) == 3
+    order = ["efap", "pornrips"]           # EncodedFapFiles first in Sources
+    # without the rule, only the tagged PRT post qualifies; with it, the preferred source wins
+    assert preferred_release(scene, "1080p", ["PRT"], order).source == "pornrips"
+    assert preferred_release(scene, "1080p", ["PRT"], order, assume="PRT").post_id == "2"
+    files = [("720p", "PRT", "HEVC")]
+    assert library_upgrade(scene, files, "1080p", ("prt",), order)[1].source == "pornrips"
+    verdict, rel = library_upgrade(scene, files, "1080p", ("prt",), order, assume="PRT")
+    assert verdict == LIB_UPGRADE and rel.post_id == "2"   # never the x264 one
+    # a library file with no group but HEVC also counts, an x264 one doesn't
+    assert library_upgrade(scene, [("1080p", "", "HEVC")], "1080p", ("prt",), order, "PRT")[0] == LIB_OK
+    assert library_upgrade(scene, [("1080p", "", "AVC")], "1080p", ("prt",), order, "PRT")[0] == LIB_UPGRADE
+    # a different group named in the post is never overridden
+    grp = enrich(Release("efap", "4", "", "Deeper.21.07.29.Angela.White.Florentine.Part.1.XXX.1080p.HEVC.x265-GRP"))
+    assert grp.release_group and library_upgrade(
+        merge_releases([grp])[0], [("720p", "", "")], "1080p", ("prt",), order, "PRT")[0] != LIB_UPGRADE
+
+
+def test_spaced_studio_date_performer_title_file_name():
+    from scenesorter.parsing import parse_title
+
+    p = parse_title("Deeper 2021.07.29 Angela White - Florentine Part 1 1080p X265 HEVC.mkv")
+    assert (p["studio"], p["performers"], p["title"]) == ("Deeper", ["Angela White"], "Florentine Part 1")
+    p = parse_title("Studio 24.01.15 Jane Doe & Ann Lee - Hot Title [1080p]")
+    assert (p["studio"], p["performers"], p["title"]) == ("Studio", ["Jane Doe", "Ann Lee"], "Hot Title")
+    p = parse_title("Deeper - 2021.07.29 - Angela White - Florentine Part 1 1080p")  # unchanged
+    assert (p["studio"], p["performers"], p["title"]) == ("Deeper", ["Angela White"], "Florentine Part 1")

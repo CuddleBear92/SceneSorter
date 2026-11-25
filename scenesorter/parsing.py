@@ -22,7 +22,7 @@ from datetime import date
 from .models import Release
 
 # Bump whenever parsing changes; cached posts are re-parsed on next start.
-PARSER_VERSION = "9"
+PARSER_VERSION = "10"
 
 RESOLUTION_RE = re.compile(r"(?<![a-z0-9])(4320|2160|1440|1080|720|576|540|480|360)[pi](?![a-z0-9])", re.I)
 UHD_RE = re.compile(r"(?<![a-z0-9])(4k|uhd)(?![a-z0-9])", re.I)
@@ -229,7 +229,7 @@ def _title_case(s: str) -> str:
 
 def parse_title(raw: str) -> dict:
     """Parse a raw post title into studio/performers/title/date/resolution."""
-    text = strip_accents(raw).strip()
+    text = VIDEO_EXT_RE.sub("", strip_accents(raw).strip()).strip()  # "....mkv" file names as titles
     resolution = find_resolution(text)
     scene_date, span = find_date(text)
 
@@ -249,6 +249,14 @@ def parse_title(raw: str) -> dict:
             title = " - ".join(parts[1:])
         elif parts:
             title = parts[0]
+    elif (sep := re.search(r"\s[-–—|]\s", text)) and span and span[1] <= sep.start() \
+            and text[:span[0]].strip(" ._") and text[span[1]:sep.start()].strip(" ._") \
+            and not re.search(r"\s[-–—|]\s", text[:span[0]]):
+        # "Studio 2021.07.29 Performers - Title 1080p X265 HEVC": the date separates studio
+        # from performers, only the title comes after the dash
+        studio = text[:span[0]]
+        performers = _split_performers(_clean_spaces(re.sub(r"[._]", " ", text[span[1]:sep.start()])))
+        title = _strip_tail(text[sep.end():])
     elif re.search(r"\s[-–—|]\s", text):
         # "Studio - Performers - Title 720p"
         body = _strip_tail(text, span_text=text[span[0]:span[1]] if span else None)

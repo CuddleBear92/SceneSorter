@@ -34,6 +34,8 @@ class SceneModel(QObject):
         self.preferred_groups: tuple[str, ...] = ("prt",)
         self.wanted_resolution = "1080p"
         self.grabbed: frozenset = frozenset()  # releases grabbed/done/verified
+        self.assume_group = ""                 # HEVC/AV1 posts without a group count as this
+        self.source_order: tuple = ()
         self.status: dict[str, str] = {}      # scene key -> grabbed / partial / complete (see status.py)
         self.hidden: set[str] = set()         # scene keys hidden by the user (scene-level)
         self.hidden_studios: set[str] = set()     # studio keys hidden by the user
@@ -87,7 +89,8 @@ class SceneModel(QObject):
         return ViewState(self.owned, self.status, self.hidden, self.studio_names, self.scene_performers,
                          self.performer_names, self.fav_studios, self.fav_performers,
                          self.hidden_studios, self.hidden_performers, self.fav_overrides_hidden_studio,
-                         self.library_files, self.preferred_groups, self.wanted_resolution, self.grabbed)
+                         self.library_files, self.preferred_groups, self.wanted_resolution, self.grabbed,
+                         self.assume_group, self.source_order)
 
     def is_hidden(self, s: Scene) -> bool:
         return is_hidden(s, self.view_state())

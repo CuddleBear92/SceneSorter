@@ -76,6 +76,9 @@ class Settings:
     rescan_interval_s: int = 5          # "Rescan all pages": one page request every N seconds
     # Release groups to prefer when picking which release to download (first = best).
     preferred_groups: list[str] = field(default_factory=lambda: ["PRT"])
+    # Posts (and library files) with no release group that are HEVC/x265 or AV1 count as the
+    # first preferred group: usually a PRT release posted without its tag.
+    assume_group_for_hevc: bool = True
     update_repo: str = "CuddleBear92/SceneSorter"
     sources: list[SourceConfig] = field(default_factory=list)
     # stash-box instances for studio logos / scene matching. Keys are stored in

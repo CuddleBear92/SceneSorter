@@ -118,6 +118,13 @@ class SettingsDialog(QDialog):
         self.groups.setPlaceholderText("PRT, GUSH, …")
         form.addRow("Preferred release groups", self.groups)
         form.addRow("", QLabel("Comma-separated, best first. Preferred groups are highlighted and picked first."))
+        self.assume_group = QCheckBox("Posts without a release group that are HEVC/x265 or AV1 count as "
+                                      "the first preferred group")
+        self.assume_group.setToolTip("Such posts are usually a PRT release posted without its tag, e.g.\n"
+                                     "Deeper 2021.07.29 Angela White - Florentine Part 1 1080p X265 HEVC.mkv\n"
+                                     "Shown as \"PRT?\". Applies to Download preferred, upgrades and library files.")
+        self.assume_group.setChecked(settings.assume_group_for_hevc)
+        form.addRow("", self.assume_group)
         self.refresh_start = QCheckBox("Check sources for new posts on start")
         self.refresh_start.setChecked(settings.refresh_on_start)
         form.addRow("", self.refresh_start)
@@ -409,6 +416,7 @@ class SettingsDialog(QDialog):
             thumb_cache_limit_mb=self.cache_mb.value(),
             fav_performers_override_hidden_studios=self.fav_override.isChecked(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
+            assume_group_for_hevc=self.assume_group.isChecked(),
             sources=srcs,
             stashboxes=self._stashboxes(),
             import_dirs=[l.strip() for l in self.import_dirs.toPlainText().splitlines() if l.strip()],

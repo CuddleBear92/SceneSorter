@@ -97,6 +97,11 @@ studio-sorted library to show what you already have.
   like `…XXX.1080p.HEVC.x265.PRT`, `…MP4-GRP` and `[GRP]`, or from a
   `Group:` / `Filename:` line in the post. You can filter by group. Preferred
   groups (PRT by default) are highlighted and offered first.
+  A post with no release group that is HEVC/x265 or AV1, such as
+  `Deeper 2021.07.29 Angela White - Florentine Part 1 1080p X265 HEVC.mkv`,
+  counts as your first preferred group and is shown as "PRT?". This is
+  usually a PRT release posted without its tag. A different group named in
+  the post is never overridden. You can turn this off in Settings ▸ General.
 - **Download tracking, including partial downloads.** Each release is
   recorded as *grabbed*, *done* or *failed*:
   - **grabbed:** an HTTP download started, or the release was sent to the
