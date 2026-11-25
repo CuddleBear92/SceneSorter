@@ -45,6 +45,15 @@ studio-sorted library to show what you already have.
   **IN LIBRARY** badge, even when your file is a different resolution or came
   from another site. When a file name doesn't name the studio, the studio
   folder is used.
+- **Library upgrade filters.** The release group of each library file is read
+  from its name, using your naming scheme when it fits. The Downloaded filter
+  in the toolbar has three library options:
+  - **In library**
+  - **In library · not PRT:** your file isn't from a preferred group
+  - **In library · PRT available (upgrade):** the same, and a PRT release has
+    been posted, so you can download the better copy
+
+  The group name follows your first preferred group in Settings.
 - **Fast library checks.** The scan runs in the background. It remembers each
   folder's modified date and contents. A folder's date changes whenever a file
   in it is added, removed or renamed, so unchanged folders aren't read again

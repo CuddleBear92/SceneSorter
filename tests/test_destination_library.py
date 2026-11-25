@@ -98,3 +98,20 @@ def test_folder_cache_skips_unchanged_folders(tmp_path):
 
     r5 = run(full=True)
     assert set(r5.owned) == {b.key} and r5.folders_listed == 2
+
+
+def test_library_group_filters():
+    from scenesorter.views import ViewSpec, ViewState, compute_view
+
+    prt = _scene("Studio.24.01.01.Has.Prt.Copy.XXX.1080p.HEVC.x265.PRT")
+    other = _scene("Studio.24.01.02.Other.Group.Copy.XXX.1080p.HEVC.x265.PRT")   # PRT posted, we hold GRP
+    nogrp = _scene("Studio.24.01.03.No.Prt.Posted.XXX.1080p.MP4-GRP")            # no PRT posted at all
+    missing = _scene("Studio.24.01.04.Not.In.Library.XXX.1080p.HEVC.x265.PRT")
+    st = ViewState(owned={prt.key, other.key, nogrp.key},
+                   library_groups={prt.key: {"PRT"}, other.key: {"GRP"}, nogrp.key: set()},
+                   preferred_groups=("prt",))
+    scenes = [prt, other, nogrp, missing]
+    view = lambda mode: {s.key for s in compute_view(scenes, ViewSpec(have=mode), st)}  # noqa: E731
+    assert view("lib") == {prt.key, other.key, nogrp.key}
+    assert view("lib_other") == {other.key, nogrp.key}
+    assert view("lib_upgrade") == {other.key}

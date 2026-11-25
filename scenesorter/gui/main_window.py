@@ -31,7 +31,7 @@ from ..sources import RateLimited, Source, build_source
 from ..parsing import normalise_studio
 from ..status import DONE, FINISHED, GRABBED, preferred_release, scene_status, source_order, target_release
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
-from .scene_pane import ScenePane
+from .scene_pane import FitImage, ScenePane, breakable
 from .settings_dialog import SettingsDialog
 from .matching import MatchService, PerformerImages
 from .performers_tab import PerformersTab
@@ -286,11 +286,10 @@ class MainWindow(QMainWindow):
         self.sort_box.currentIndexChanged.connect(lambda _i: self._set_filter(sort=self.sort_box.currentData()))
         tb.addWidget(self.sort_box)
         self.have_box = QComboBox()
-        for label, mode in (("Downloaded or not", ""), ("Still wanted", "missing"),
-                            ("Grabbed / partial", "partial"), ("Downloaded", "have")):
-            self.have_box.addItem(label, mode)
-        self.have_box.setToolTip("Still wanted = not downloaded at your wanted resolution yet "
-                                 "(includes grabbed and partial)")
+        self.have_box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.have_box.setMinimumContentsLength(16)
+        self.have_box.view().setMinimumWidth(300)  # the list shows the long options in full
+        self._fill_have_box()
         self.have_box.currentIndexChanged.connect(lambda _i: self._set_filter(have=self.have_box.currentData()))
         tb.addWidget(self.have_box)
         self.fav_box = QCheckBox("★ Favorites")
@@ -326,6 +325,7 @@ class MainWindow(QMainWindow):
 
         # --- scene panes (Browse + Downloaded share model, delegate and detail rendering)
         self.model = SceneModel(self.thumbs)
+        self.model.preferred_groups = tuple(g.lower() for g in self.settings.preferred_groups)
         self.delegate = SceneDelegate([])
         self.delegate.preferred_groups = self.settings.preferred_groups
         self.browse = ScenePane(self.model, self.delegate, self.render_detail, render_multi=self.render_multi)
@@ -1334,6 +1334,28 @@ class MainWindow(QMainWindow):
         self.group_box.setCurrentIndex(max(idx, 0))
         self.group_box.blockSignals(False)
 
+    def _fill_have_box(self) -> None:
+        """Download-state filter; the library options name your preferred group (PRT)."""
+        pref = self.settings.preferred_groups[0] if self.settings.preferred_groups else "preferred group"
+        current = self.have_box.currentData()
+        self.have_box.blockSignals(True)
+        self.have_box.clear()
+        for label, mode in (("Downloaded or not", ""), ("Still wanted", "missing"),
+                            ("Grabbed / partial", "partial"), ("Downloaded", "have"),
+                            ("In library", "lib"), (f"In library · not {pref}", "lib_other"),
+                            (f"In library · {pref} available (upgrade)", "lib_upgrade")):
+            self.have_box.addItem(label, mode)
+        self.have_box.setCurrentIndex(max(self.have_box.findData(current), 0))
+        self.have_box.blockSignals(False)
+        self.have_box.setToolTip(
+            "Still wanted = not downloaded at your wanted resolution yet (includes grabbed and partial)\n"
+            f"In library · not {pref} = your library file for the scene isn't from a preferred group "
+            "(Settings ▸ preferred groups)\n"
+            f"In library · {pref} available = same, and a {pref} release has been posted: ready to upgrade")
+        if getattr(self, "model", None) is not None:
+            self.model.preferred_groups = tuple(g.lower() for g in self.settings.preferred_groups)
+            self.model.names_changed()  # refilter
+
     def rescan_library(self, manual: bool = False, full: bool = False) -> None:
         """Check the final, studio-sorted library (read-only) and mark what's in it. Runs on a
         worker thread; only folders whose modified date changed are read again."""
@@ -1367,27 +1389,23 @@ class MainWindow(QMainWindow):
 
     def _library_scanned(self, res, manual: bool) -> None:
         self._library_running = False
+        groups = {}
         if res is None:
             self.owned = {}
         else:
             self.owned = res.owned
+            groups = res.groups
             msg = (f"Library: {res.files} files in {res.folders} folders ({res.folders_listed} changed), "
                    f"{len(res.owned)} scenes, {res.unmatched} unmatched — {res.seconds:.1f}s")
             log.info(msg)
             if manual or res.matched_now or res.gone:
                 self.status_label.setText(msg)
-        self.model.set_status(owned=set(self.owned))
+        self.model.set_status(owned=set(self.owned), library_groups=groups)
 
     # --------------------------------------------------------------- detail
     def render_detail(self, pane: ScenePane, scene: Scene) -> None:
         lay = pane.detail_layout
-        thumb = QLabel()
-        thumb.setFixedHeight(210)
-        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pm = self.thumbs.get(scene.key, self.model.thumb_urls(scene))
-        if pm:
-            thumb.setPixmap(pm.scaled(360, 210, Qt.AspectRatioMode.KeepAspectRatio,
-                                      Qt.TransformationMode.SmoothTransformation))
+        thumb = FitImage(self.thumbs.get(scene.key, self.model.thumb_urls(scene)))
         lay.addWidget(thumb)
 
         title = QLabel(f"<h3>{scene.title or scene.primary.raw_title}</h3>")
@@ -1448,7 +1466,9 @@ class MainWindow(QMainWindow):
         flagged = [r for r in scene.releases if (r.source, r.post_id) in self.flags]
         state = self.model.state(scene.key)
         if scene.key in self.owned:
-            own = QLabel("✔ In library:<br>" + "<br>".join(p.name for p in self.owned[scene.key]))
+            own = QLabel("✔ In library:<br>" + "<br>".join(breakable(p.name) for p in self.owned[scene.key]))
+            own.setToolTip("\n".join(str(p) for p in self.owned[scene.key]))
+            own.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             own.setWordWrap(True)
             own.setStyleSheet("color:#22c55e")
             lay.addWidget(own)
@@ -1471,7 +1491,7 @@ class MainWindow(QMainWindow):
         best = self._preferred(scene)
         src = self.sources.get(best.source)
         bits = " · ".join(x for x in [best.resolution, best.release_group, src.display_name if src else best.source] if x)
-        dl = QPushButton(f"⬇  Download preferred  ({bits})")
+        dl = QPushButton(f"⬇  Download preferred\n{bits}")
         dl.setStyleSheet("QPushButton { background:#2563eb; color:white; padding:6px; border-radius:4px; font-weight:bold }"
                          "QPushButton:hover { background:#3b82f6 }")
         dl.setToolTip("Picks your wanted resolution, then preferred release group, then preferred source "
@@ -1598,7 +1618,7 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(0, 0, 0, 0)
         v.addWidget(w)
         # zero-width spaces let long dotted release names wrap instead of scrolling
-        fname = QLabel((rel.filename or rel.raw_title).replace(".", ".\u200b").replace("_", "_\u200b"))
+        fname = QLabel(breakable(rel.filename or rel.raw_title))
         fname.setStyleSheet("color:#8b95a5; font-size:11px")
         fname.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         fname.setWordWrap(True)
@@ -1615,6 +1635,7 @@ class MainWindow(QMainWindow):
         lbl = QLabel(f"<b>{rel.resolution or '?'}</b> · {grp_html}{codec} — {name}"
                      f"{' · ' + fmt_bytes(rel.size_bytes) if rel.size_bytes else ''}{quota_txt}")
         lbl.setToolTip(rel.raw_title)
+        lbl.setWordWrap(True)
         h.addWidget(lbl, 1)
         btn_dl = QPushButton("Download")
         btn_dl.clicked.connect(lambda: self.start_download(rel))
@@ -1776,6 +1797,7 @@ class MainWindow(QMainWindow):
             self.settings = dlg.result_settings()
             self.settings.save()
             self.delegate.preferred_groups = self.settings.preferred_groups
+            self._fill_have_box()
             self.model.fav_overrides_hidden_studio = self.settings.fav_performers_override_hidden_studios
             self.model.names_changed()
             self.logos.configure(self.settings.stashboxes)

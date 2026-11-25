@@ -32,6 +32,8 @@ class ViewSpec:
     performer: str = ""     # performer key
     fav_only: bool = False
     # "" all · "missing" still wanted · "partial" grabbed/partial · "have" complete · "any" not none
+    # · "lib" in library · "lib_other" in library, no file from a preferred group
+    # · "lib_upgrade" lib_other and a preferred-group release is posted
     have: str = ""
     show_hidden: bool = False
     sort: str = "posted"
@@ -54,6 +56,8 @@ class ViewState:
     hidden_studios: set[str] = field(default_factory=set)      # studio keys
     hidden_performers: set[str] = field(default_factory=set)   # performer keys
     fav_overrides_hidden_studio: bool = False
+    library_groups: dict[str, set[str]] = field(default_factory=dict)  # scene key -> groups of library files
+    preferred_groups: tuple[str, ...] = ()                             # lowercased
 
     def state(self, key: str) -> str:
         return "complete" if key in self.owned else self.status.get(key, "none")
@@ -136,6 +140,15 @@ def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Sce
                 continue
             if spec.have == "any" and state == "none":
                 continue
+            if spec.have.startswith("lib"):
+                if s.key not in st.owned:
+                    continue
+                if spec.have != "lib":
+                    if any(g.lower() in st.preferred_groups for g in st.library_groups.get(s.key, ())):
+                        continue  # already have a preferred-group file
+                    if spec.have == "lib_upgrade" and not any(
+                            r.release_group.lower() in st.preferred_groups for r in s.releases):
+                        continue
         if spec.studio and ix.studio[i] != spec.studio:
             continue
         if spec.performer and spec.performer not in st.scene_performers.get(s.key, ()):

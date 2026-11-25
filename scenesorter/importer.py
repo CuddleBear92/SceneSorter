@@ -78,9 +78,22 @@ def match_with_folder(index: SceneIndex, p: Path, studio_folder: str = "", schem
     return m
 
 
+def file_group(name: str, scheme: str = "") -> str:
+    """Release group of a file on disk ('' if the name doesn't show one)."""
+    from .filematch import _clean_name
+    from .naming import parse_with_scheme
+    from .parsing import find_group
+
+    parts = parse_with_scheme(scheme, name) if scheme else None
+    if parts is not None and parts.group:
+        return parts.group
+    return find_group(_clean_name(name)) or ""
+
+
 @dataclass
 class LibraryScan:
     owned: dict[str, list[Path]] = field(default_factory=dict)  # scene key -> files
+    groups: dict[str, set[str]] = field(default_factory=dict)    # scene key -> release groups of those files
     rows: list[tuple] = field(default_factory=list)              # new/changed rows for save_scanned
     gone: list[str] = field(default_factory=list)                # files no longer on disk
     dirs: dict[str, tuple] = field(default_factory=dict)         # changed folders -> cache entry
@@ -189,6 +202,8 @@ def scan_library(root: str | Path, scenes: list[Scene], known: dict[str, tuple] 
             res.unmatched += 1
             if not k or k[2] or (k[0], k[1]) != st:
                 res.rows.append((sp, *st, None, None, None, 0.0))
+    for key, paths in res.owned.items():
+        res.groups[key] = {g for g in (file_group(p.name, scheme) for p in paths) if g}
     res.gone = [p for p in known if p not in seen]
     res.dirs_gone = [d for d in (dir_cache or {}) if d not in visited]
     res.seconds = time.monotonic() - t0

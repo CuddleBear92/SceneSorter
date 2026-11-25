@@ -61,6 +61,44 @@ class SceneGrid(QListView):
         self.deselected.emit()
 
 
+def breakable(text: str) -> str:
+    """Let long dotted/underscored file names wrap (zero-width spaces after separators)."""
+    return text.replace(".", ".\u200b").replace("_", "_\u200b").replace("-", "-\u200b")
+
+
+class FitImage(QLabel):
+    """Thumbnail that fills the panel's width (16:9, capped) instead of a fixed size."""
+
+    MAX_W, RATIO = 640, 9 / 16
+
+    def __init__(self, pm=None, parent=None):
+        super().__init__(parent)
+        self._pm = pm
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(1, 1)
+        sp = self.sizePolicy()
+        sp.setHorizontalPolicy(sp.Policy.Ignored)  # never pushes the panel wider
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, w: int) -> int:  # noqa: N802
+        return int(min(w, self.MAX_W) * self.RATIO)
+
+    def sizeHint(self):  # noqa: N802
+        from PySide6.QtCore import QSize
+        return QSize(360, int(360 * self.RATIO))
+
+    def resizeEvent(self, ev) -> None:  # noqa: N802
+        super().resizeEvent(ev)
+        if self._pm is not None and not self._pm.isNull():
+            w = min(self.width(), self.MAX_W)
+            self.setPixmap(self._pm.scaled(w, int(w * self.RATIO), Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+
+
 class ScenePane(QSplitter):
     #: right-click on the grid: (selected scenes, global position)
     context_requested = Signal(list, QPoint)
@@ -119,13 +157,28 @@ class ScenePane(QSplitter):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self.detail)
-        scroll.setMinimumWidth(380)
+        scroll.setMinimumWidth(400)
+        self._scroll = scroll
+        self._sized = False
 
         self.addWidget(self.grid)
         self.addWidget(scroll)
-        self.setStretchFactor(0, 3)
-        self.setStretchFactor(1, 1)
+        self.setStretchFactor(0, 1)
+        self.setStretchFactor(1, 0)  # extra window width goes to the grid; the panel keeps its size
         self.show_message(empty_text)
+
+    DETAIL_W = 480  # default detail panel width: room for the thumbnail, buttons and file names
+
+    def showEvent(self, ev) -> None:  # noqa: N802
+        super().showEvent(ev)
+        if not self._sized:  # first show: give the panel a sensible width once laid out
+            self._sized = True
+            QTimer.singleShot(0, self._default_sizes)
+
+    def _default_sizes(self) -> None:
+        total = sum(self.sizes()) or self.width()
+        panel = min(self.DETAIL_W, max(400, total // 2))
+        self.setSizes([max(total - panel, 200), panel])
 
     # ------------------------------------------------------------ filtering
     def request_update(self) -> None:

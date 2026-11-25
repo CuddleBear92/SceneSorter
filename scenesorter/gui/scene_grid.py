@@ -30,6 +30,8 @@ class SceneModel(QObject):
         self.scenes: list[Scene] = []
         self.by_key: dict[str, Scene] = {}
         self.owned: set[str] = set()          # scene keys found in the library on disk
+        self.library_groups: dict[str, set[str]] = {}  # scene key -> release groups of those files
+        self.preferred_groups: tuple[str, ...] = ("prt",)
         self.status: dict[str, str] = {}      # scene key -> grabbed / partial / complete (see status.py)
         self.hidden: set[str] = set()         # scene keys hidden by the user (scene-level)
         self.hidden_studios: set[str] = set()     # studio keys hidden by the user
@@ -52,10 +54,12 @@ class SceneModel(QObject):
         self.scenes_changed.emit()
 
     def set_status(self, owned: set[str] | None = None, status: dict[str, str] | None = None,
-                   hidden: set[str] | None = None) -> None:
+                   hidden: set[str] | None = None, library_groups: dict[str, set[str]] | None = None) -> None:
         """Update marks (panes refilter in the background and repaint)."""
         if owned is not None:
             self.owned = owned
+        if library_groups is not None:
+            self.library_groups = library_groups
         if status is not None:
             self.status = status
         if hidden is not None:
@@ -77,7 +81,8 @@ class SceneModel(QObject):
     def view_state(self) -> ViewState:
         return ViewState(self.owned, self.status, self.hidden, self.studio_names, self.scene_performers,
                          self.performer_names, self.fav_studios, self.fav_performers,
-                         self.hidden_studios, self.hidden_performers, self.fav_overrides_hidden_studio)
+                         self.hidden_studios, self.hidden_performers, self.fav_overrides_hidden_studio,
+                         self.library_groups, self.preferred_groups)
 
     def is_hidden(self, s: Scene) -> bool:
         return is_hidden(s, self.view_state())
