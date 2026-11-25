@@ -79,14 +79,17 @@ def download_update(info: UpdateInfo, progress: Callable[[int, int], None] | Non
     return target
 
 
-def build_update_script(pid: int, new_exe: Path, current: Path, log: Path) -> str:
+def build_update_script(pid: int, new_exe: Path, current: Path, log: Path, parent_pid: int = 0) -> str:
     """Windows batch script that swaps in the new exe once we've exited.
 
     Notes on the gotchas this handles:
-    * A PyInstaller one-file exe runs as two processes (bootloader + app). We
-      only know the app's PID, and the bootloader keeps SceneSorter.exe locked
-      for a moment after the app exits while it cleans up — so the move is
-      retried for up to a minute instead of attempted once.
+    * A PyInstaller one-file exe runs as two processes (bootloader + app). We know the
+      app's PID and its parent's (the bootloader). The bootloader keeps SceneSorter.exe
+      locked until the app is gone, so the move is retried instead of attempted once.
+    * The app is never trusted to exit on its own: if it's still running after 30 s it
+      is ended (with its bootloader). If the exe is *still* locked after that, every
+      SceneSorter process running from this exe file is ended (e.g. an older copy that
+      hung on an earlier update).
     * ``timeout`` fails instantly without a console (we run hidden), so sleeps
       use ``ping -n 2 127.0.0.1`` (~1 s).
     * Every step is logged to data/update.log.
@@ -97,6 +100,8 @@ def build_update_script(pid: int, new_exe: Path, current: Path, log: Path) -> st
         "chcp 65001 >NUL",
         "setlocal",
         f'set "PID={pid}"',
+        f'set "PARENT={parent_pid}"',
+        f'set "EXE={exe_name}"',
         f'set "NEW={new_exe}"',
         f'set "CUR={current}"',
         f'set "LOG={log}"',
@@ -104,16 +109,29 @@ def build_update_script(pid: int, new_exe: Path, current: Path, log: Path) -> st
         "set TRIES=0",
         'echo [%date% %time%] update: waiting for PID %PID% to exit>>"%LOG%"',
         ":wait",
-        f'tasklist /FI "PID eq %PID%" /NH 2>NUL | find /I "{exe_name}" >NUL',
+        'tasklist /FI "PID eq %PID%" /NH 2>NUL | find /I "%EXE%" >NUL',
         "if errorlevel 1 goto move",
         "set /a WAITS+=1",
-        "if %WAITS% GEQ 120 goto move",
+        "if %WAITS% GEQ 30 goto kill",
         "ping -n 2 127.0.0.1 >NUL",
         "goto wait",
+        ":kill",
+        'echo [%date% %time%] update: still running after 30 s, ending PID %PID%>>"%LOG%"',
+        'taskkill /F /T /PID %PID% >>"%LOG%" 2>&1',
+        'if not "%PARENT%"=="0" taskkill /F /IM "%EXE%" /FI "PID eq %PARENT%" >>"%LOG%" 2>&1',
+        "ping -n 3 127.0.0.1 >NUL",
+        "goto move",
+        ":killall",
+        'echo [%date% %time%] update: exe still locked, ending every SceneSorter running from it>>"%LOG%"',
+        'powershell -NoProfile -NonInteractive -Command "Get-Process | Where-Object { $_.Path -eq $env:CUR } '
+        '| Stop-Process -Force" >>"%LOG%" 2>&1',
+        "ping -n 3 127.0.0.1 >NUL",
+        "goto move",
         ":move",
         'move /Y "%NEW%" "%CUR%" >NUL 2>&1',
         "if not errorlevel 1 goto moved",
         "set /a TRIES+=1",
+        "if %TRIES% EQU 8 goto killall",
         "if %TRIES% GEQ 60 goto failed",
         "ping -n 2 127.0.0.1 >NUL",
         "goto move",
@@ -138,8 +156,10 @@ def apply_update_and_restart(new_exe: Path) -> None:
 
     current = Path(sys.executable)
     script = Path(tempfile.gettempdir()) / f"scenesorter_update_{os.getpid()}.cmd"
-    script.write_text(build_update_script(os.getpid(), new_exe, current, DATA_DIR / "update.log"),
-                      encoding="utf-8")
+    # one-file exe: our parent is the PyInstaller bootloader (same exe); the script only ends
+    # it if its image name matches, so a normal parent (Explorer) is never touched
+    script.write_text(build_update_script(os.getpid(), new_exe, current, DATA_DIR / "update.log",
+                                          os.getppid()), encoding="utf-8")
     # A PyInstaller one-file exe passes its private env vars (_MEIPASS2, _PYI_*) to child
     # processes; the relaunched exe would then look for its DLLs in *our* temp folder, which
     # is deleted when we exit ("Failed to load Python DLL"). Start it with a clean slate.

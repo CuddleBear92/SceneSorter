@@ -2002,7 +2002,9 @@ class MainWindow(QMainWindow):
     def _apply_update(self, path: Path) -> None:
         """Let running work finish (current page, merge, imports) before swapping the exe."""
         def go():
+            from ..app import exit_watchdog
             log.info("installing update %s", path.name)
+            exit_watchdog(25, "update")  # the exe must be free for the swap, whatever happens next
             updater.apply_update_and_restart(path)
             self._close_ok = True
             self._updating = True

@@ -117,8 +117,15 @@ def test_update_script_retries_and_logs():
                             W(r"C:\Apps\Scene Sorter\SceneSorter.exe"), W(r"C:\Apps\Scene Sorter\data\update.log"))
     assert "\r\n" in s and "timeout" not in s           # timeout fails without a console
     assert 'set "PID=4242"' in s
-    assert 'find /I "SceneSorter.exe"' in s              # waits for *our* exe, not any PID substring
-    assert sum(l.endswith("goto move") for l in s.split("\r\n")) == 3 and "%TRIES% GEQ 60" in s
+    assert 'set "EXE=SceneSorter.exe"' in s and 'find /I "%EXE%"' in s  # waits for *our* exe
+    assert "%TRIES% GEQ 60" in s and "%WAITS% GEQ 30 goto kill" in s
+    lines = s.split("\r\n")
+    # never falls through into the kill blocks: each is only reached by a goto
+    for label in (":kill", ":killall"):
+        assert lines[lines.index(label) - 1].startswith("goto ")
+    assert "taskkill /F /T /PID %PID%" in s
+    assert 'taskkill /F /IM "%EXE%" /FI "PID eq %PARENT%"' in s   # bootloader only if it's our exe
+    assert "$_.Path -eq $env:CUR" in s                           # only copies of *this* exe file
     assert 'move /Y "%NEW%" "%CUR%"' in s and 'start "" "%CUR%"' in s
     assert s.index(":wait") < s.index(":move") < s.index(":moved") < s.index(":failed")
 
