@@ -13,6 +13,13 @@ studio-sorted library to show what you already have.
   scene, with chips for 2160p / 1080p / 720p and a dot for each source.
 - **Thumbnails from any source.** If one site's image fails to load, the app
   falls back to another site's. Images are cached on disk.
+- **"Picture removed" placeholders are skipped.** Some hosts, such as pixhost,
+  answer a taken-down image with a normal "Picture removed" picture instead of
+  an error. When the same picture comes back for four or more different
+  scenes, it's treated as missing. Its cached copies are deleted and those
+  cards fall back to another site's thumbnail or the stash-box cover.
+  Placeholders already in the cache are cleared once on start. Dead image
+  links are retried after two weeks.
 - **Download queue.** Direct links download inside the app with progress and
   speed. Magnet and .torrent links are passed to your torrent client.
 - **Daily quota tracking.** Sources can declare a daily action limit. Each

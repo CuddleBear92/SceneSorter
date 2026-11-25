@@ -12,6 +12,8 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
+log = logging.getLogger(__name__)
+
 
 class _Signals(QObject):
     done = Signal(object)
@@ -110,6 +112,12 @@ class ThumbnailLoader(QObject):
         self.mem = PixmapLRU(300)
         self.pending: set[str] = set()
         self.failed: dict[str, float] = {}          # URL -> when it failed; retried after 10 min
+        from ..placeholders import PlaceholderTracker
+
+        # "Picture removed" images hosts serve instead of an error (see placeholders.py)
+        self.placeholders = PlaceholderTracker(Path(cache_dir) / "image_placeholders.json")
+        self._save_timer = QTimer(self, interval=30_000, timeout=self.placeholders.save)
+        self._save_timer.start()
         self.host_headers: dict[str, dict[str, str]] = {}  # e.g. stash-box image hosts need the ApiKey
 
     def set_host_headers(self, headers: dict[str, dict[str, str]]) -> None:
@@ -125,7 +133,7 @@ class ThumbnailLoader(QObject):
         if key in self.mem:
             return self.mem.get(key)
         now = time.time()
-        urls = [u for u in urls if now - self.failed.get(u, 0) > 600]
+        urls = [u for u in urls if now - self.failed.get(u, 0) > 600 and not self.placeholders.is_dead(u, now)]
         if key in self.pending or not urls:
             return None
         for url in urls:
@@ -158,9 +166,7 @@ class ThumbnailLoader(QObject):
         data = bytes(reply.readAll())
         ok = reply.error() == QNetworkReply.NetworkError.NoError
         reply.deleteLater()
-        from .images import SCENE_SIZE, save_image
-
-        pm = save_image(self._cache_path(url), data, SCENE_SIZE)[0] if ok and data else None
+        pm = self._store(key, url, data) if ok and data else None
         if pm is not None:
             self.mem.put(key, pm)
             self.pending.discard(key)
@@ -168,6 +174,54 @@ class ThumbnailLoader(QObject):
         else:
             self.failed[url] = time.time()
             self._fetch(key, rest)  # fall back to the next image (other site / stash-box cover)
+
+
+    def _store(self, key: str, url: str, data: bytes) -> QPixmap | None:
+        """Downscale and cache a downloaded picture; None if it's unusable or a placeholder."""
+        from ..placeholders import digest
+        from .images import SCENE_SIZE, atomic_write, decode_scaled, encode, ext_for, is_svg
+
+        img = decode_scaled(data, SCENE_SIZE)
+        if img is None:
+            return None
+        out = data if is_svg(data) else encode(img)
+        base = self._cache_path(url)
+        path = base.with_name(base.name + ext_for(out))
+        others = self.placeholders.check(digest(out), key, url, str(path))
+        if others is not None:  # a "picture removed" placeholder: drop it and every copy of it
+            for k, _u, p in others:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.mem.pop(k)
+            if others:
+                log.info("image placeholder found (%d scenes); falling back to other images", len(others) + 1)
+                self.loaded.emit("", QPixmap())  # repaint: those cards pick their next image
+            return None
+        try:
+            atomic_write(path, out)
+        except OSError:
+            pass
+        return QPixmap.fromImage(img)
+
+    def sweep_cached_placeholders(self) -> None:
+        """Once: delete placeholders already in the cache (from builds before this check)."""
+        if self.placeholders.cache_swept:
+            return
+        from ..placeholders import sweep_cache
+
+        def done(res) -> None:
+            found, deleted = res
+            self.placeholders.add_hashes(found)
+            self.placeholders.cache_swept = True
+            self.placeholders.dirty = True
+            self.placeholders.save()
+            if deleted:
+                log.info("removed %d cached placeholder images (%d kinds)", deleted, len(found))
+                self.mem = type(self.mem)(300)
+                self.loaded.emit("", QPixmap())
+        run_async(sweep_cache, self.cache_dir, set(self.placeholders.hashes), on_done=done, pool="cpu")
 
 
 class BackgroundQueue(QObject):

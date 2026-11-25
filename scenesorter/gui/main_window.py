@@ -210,6 +210,7 @@ class MainWindow(QMainWindow):
         self.thumbs = ThumbnailLoader(CACHE_DIR)
         QTimer.singleShot(5000, self.prune_image_cache)
         QTimer.singleShot(3000, self._migrate_image_files)
+        QTimer.singleShot(8000, self.thumbs.sweep_cached_placeholders)
         self._apply_image_headers()
         self.logos = LogoService(self.db, CACHE_DIR, self)
         self.logos.configure(settings.stashboxes)
@@ -1887,6 +1888,7 @@ class MainWindow(QMainWindow):
         from .workers import _pools
         for p in [QThreadPool.globalInstance(), *_pools.values()]:
             p.waitForDone(2500)  # let any last DB write complete
+        self.thumbs.placeholders.save()
         self.db.close()
         super().closeEvent(ev)
 
