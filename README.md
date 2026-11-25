@@ -102,6 +102,9 @@ studio-sorted library to show what you already have.
   counts as your first preferred group and is shown as "PRT?". This is
   usually a PRT release posted without its tag. A different group named in
   the post is never overridden. You can turn this off in Settings ▸ General.
+  A second option, off by default, adds that group to the file name when such
+  a download finishes, e.g. `… 1080p X265 HEVC-PRT.mkv`. It works whether or
+  not renaming is on. With renaming on, it fills `{group}` in the template.
 - **Download tracking, including partial downloads.** Each release is
   recorded as *grabbed*, *done* or *failed*:
   - **grabbed:** an HTTP download started, or the release was sent to the

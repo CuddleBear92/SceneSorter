@@ -180,3 +180,31 @@ def test_spaced_studio_date_performer_title_file_name():
     assert (p["studio"], p["performers"], p["title"]) == ("Studio", ["Jane Doe", "Ann Lee"], "Hot Title")
     p = parse_title("Deeper - 2021.07.29 - Angela White - Florentine Part 1 1080p")  # unchanged
     assert (p["studio"], p["performers"], p["title"]) == ("Deeper", ["Angela White"], "Florentine Part 1")
+
+
+def test_append_assumed_group_to_file_name(tmp_path):
+    from scenesorter.library import sort_into_library, tag_in_place, with_group
+    from pathlib import Path
+
+    name = "Deeper 2021.07.29 Angela White - Florentine Part 1 1080p X265 HEVC.mkv"
+    assert with_group(Path(name), "PRT").name == "Deeper 2021.07.29 Angela White - Florentine Part 1 1080p X265 HEVC-PRT.mkv"
+    assert with_group(Path("X.HEVC-PRT.mkv"), "PRT").name == "X.HEVC-PRT.mkv"      # already tagged
+    assert with_group(Path("X.mkv"), "").name == "X.mkv"
+    r = enrich(Release("efap", "1", "", name))
+    # renaming off: original name + group
+    (tmp_path / "dl").mkdir()
+    f = tmp_path / "dl" / name
+    f.write_bytes(b"x")
+    out = sort_into_library(f, r, tmp_path / "dest", "{studio}/{title}", rename=False, add_group="PRT")
+    assert out.name.endswith("HEVC-PRT.mkv")
+    # renaming on: fills {group}
+    f.write_bytes(b"x")
+    out = sort_into_library(f, r, tmp_path / "dest2", "{studio}/{title} [{group}]", add_group="PRT")
+    assert out.name.endswith("[PRT].mkv")
+    # renaming on, template without {group}: appended
+    f.write_bytes(b"x")
+    out = sort_into_library(f, r, tmp_path / "dest3", "{studio}/{title}", add_group="PRT")
+    assert out.name.endswith("-PRT.mkv")
+    # not moved: tagged where it is
+    f.write_bytes(b"x")
+    assert tag_in_place(f, "PRT").name.endswith("HEVC-PRT.mkv") and not f.exists()

@@ -18,7 +18,7 @@ from .. import __version__, updater
 from ..config import CACHE_DIR, DATA_DIR, Settings
 from ..db import Database
 from ..downloader import DownloadManager, Job, State
-from ..library import sort_into_library
+from ..library import sort_into_library, tag_in_place
 import logging
 from ..importer import scan_library
 from ..merge import (
@@ -1845,9 +1845,18 @@ class MainWindow(QMainWindow):
 
     def _on_download_finished(self, job: Job) -> None:
         """Runs on the download thread."""
-        if self.settings.auto_sort_completed and job.path:
-            job.final_path = sort_into_library(job.path, job.release, Settings.resolve(self.settings.destination_dir),
-                                               self.settings.rename_template, rename=self.settings.rename_files)
+        if not job.path:
+            return
+        r = job.release
+        add = ""
+        if self.settings.append_assumed_group and not r.release_group:
+            add = group_of("", r.codec, self._assume_group())  # "PRT" for an untagged HEVC/AV1 post
+        if self.settings.auto_sort_completed:
+            job.final_path = sort_into_library(job.path, r, Settings.resolve(self.settings.destination_dir),
+                                               self.settings.rename_template, rename=self.settings.rename_files,
+                                               add_group=add)
+        elif add:
+            job.final_path = tag_in_place(job.path, add)
 
     def _job_changed(self, job: Job) -> None:
         self.db.log_download(job)

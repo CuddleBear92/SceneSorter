@@ -125,6 +125,15 @@ class SettingsDialog(QDialog):
                                      "Shown as \"PRT?\". Applies to Download preferred, upgrades and library files.")
         self.assume_group.setChecked(settings.assume_group_for_hevc)
         form.addRow("", self.assume_group)
+        self.append_group = QCheckBox("…and add that group to their file name when the download finishes "
+                                      "(… X265 HEVC-PRT.mkv)")
+        self.append_group.setToolTip("Works whether or not renaming is on, and also when finished downloads "
+                                     "aren't moved. With renaming on, it fills {group} in the template "
+                                     "(or is appended if the template has no {group}).")
+        self.append_group.setChecked(settings.append_assumed_group)
+        self.append_group.setEnabled(settings.assume_group_for_hevc)
+        self.assume_group.toggled.connect(self.append_group.setEnabled)
+        form.addRow("", self.append_group)
         self.refresh_start = QCheckBox("Check sources for new posts on start")
         self.refresh_start.setChecked(settings.refresh_on_start)
         form.addRow("", self.refresh_start)
@@ -417,6 +426,7 @@ class SettingsDialog(QDialog):
             fav_performers_override_hidden_studios=self.fav_override.isChecked(),
             preferred_groups=[g.strip() for g in self.groups.text().split(",") if g.strip()],
             assume_group_for_hevc=self.assume_group.isChecked(),
+            append_assumed_group=self.append_group.isChecked(),
             sources=srcs,
             stashboxes=self._stashboxes(),
             import_dirs=[l.strip() for l in self.import_dirs.toPlainText().splitlines() if l.strip()],

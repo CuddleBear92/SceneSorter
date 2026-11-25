@@ -79,6 +79,9 @@ class Settings:
     # Posts (and library files) with no release group that are HEVC/x265 or AV1 count as the
     # first preferred group: usually a PRT release posted without its tag.
     assume_group_for_hevc: bool = True
+    # ...and finished downloads of such posts get that group added to the file name
+    # ("... X265 HEVC.mkv" -> "... X265 HEVC-PRT.mkv"), whether or not renaming is on.
+    append_assumed_group: bool = False
     update_repo: str = "CuddleBear92/SceneSorter"
     sources: list[SourceConfig] = field(default_factory=list)
     # stash-box instances for studio logos / scene matching. Keys are stored in
