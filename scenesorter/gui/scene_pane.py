@@ -110,6 +110,46 @@ class _DetailWidget(QWidget):
         return QSize(0, h.height())
 
 
+class DetailPanel(QScrollArea):
+    """A scene detail panel on its own (the Queue tab's side panel); renders with the same
+    callback as the scene panes, so it looks and works the same."""
+
+    def __init__(self, render_detail, empty_text: str = "", parent=None):
+        super().__init__(parent)
+        self.render_detail_cb = render_detail
+        self.empty_text = empty_text
+        self.current: Scene | None = None
+        self.detail = _DetailWidget()
+        self.detail_layout = QVBoxLayout(self.detail)
+        self.detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setWidget(self.detail)
+        self.setMinimumWidth(420)
+        self.show_scene(None)
+
+    def show_scene(self, scene: Scene | None) -> None:
+        self.current = scene
+        self.clear_detail()
+        if scene is None:
+            lbl = QLabel(self.empty_text)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#888; padding:20px")
+            self.detail_layout.addWidget(lbl)
+        else:
+            self.render_detail_cb(self, scene)
+
+    def refresh_detail(self, lookup=None) -> None:
+        if self.current is not None:
+            self.show_scene(lookup(self.current.key) or self.current if lookup else self.current)
+
+    def clear_detail(self) -> None:
+        while self.detail_layout.count():
+            w = self.detail_layout.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+
+
 class ScenePane(QSplitter):
     #: right-click on the grid: (selected scenes, global position)
     context_requested = Signal(list, QPoint)

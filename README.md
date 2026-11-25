@@ -186,6 +186,25 @@ studio-sorted library to show what you already have.
   Browse.
 - **Torrent black hole.** Set a folder and `.torrent` files are saved there for
   your client's watch folder. Magnets can optionally be saved as `.magnet` files.
+- **Queue tab.** Has these buttons:
+  - **Retry failed**
+  - **Clear finished:** removes done, sent-to-torrent and cancelled entries.
+    Failed ones stay.
+  - **Clear failed & cancelled:** also deletes their unfinished `.part`
+    files, and any other leftover `.part` files in the download folder.
+
+  Right-click an entry, or several, to show its scene in the side panel,
+  retry or restart, cancel, remove it from the list, or open its folder.
+  Selecting an entry also shows its scene. Removing an entry deletes its
+  `.part` file.
+- **Upgrades leave the tab once the file is there.** A finished download, or
+  the file found in your destination folder, counts. A torrent sent to your
+  client or a download still running doesn't. Bulk upgrade downloads skip
+  ones already queued or sent.
+- **Slow sites.** When a WordPress site takes too long to answer a page
+  (common for the oldest pages of a big blog), the wait doubles each time,
+  up to 5 minutes, instead of treating the site as offline. Page failures
+  are logged in `data/scenesorter.log`.
 - **Smooth with large libraries.** Merging, filtering, sorting, status and
   studio counts all run on worker threads, and the window only swaps in
   finished lists. New posts no longer move what you're looking at: the card at

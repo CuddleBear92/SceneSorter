@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QCheckBox, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
+    QApplication, QDialog, QCheckBox, QSplitter, QComboBox, QFrame, QMenu, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView,
     QFileDialog, QMainWindow, QMessageBox, QProgressBar, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
@@ -34,7 +34,7 @@ from ..status import (
     target_release,
 )
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
-from .scene_pane import FitImage, ScenePane, breakable
+from .scene_pane import DetailPanel, FitImage, ScenePane, breakable
 from .settings_dialog import SettingsDialog
 from .matching import MatchService, PerformerImages
 from .performers_tab import PerformersTab
@@ -230,6 +230,9 @@ class MainWindow(QMainWindow):
         self._apply_blackhole()
         self.downloads.subscribe(self.bridge.changed.emit)
         self.job_rows: dict[str, int] = {}
+        self._remove_when_stopped: set[str] = set()
+        self._post_scene: dict = {}
+        self._post_scene_for = None
 
         self.thumbs = ThumbnailLoader(CACHE_DIR)
         QTimer.singleShot(5000, self.prune_image_cache)
@@ -432,12 +435,43 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._queue_menu)
+        self.table.itemSelectionChanged.connect(self._queue_selection)
+        self.queue_detail = DetailPanel(self.render_detail, "Select a download to see its scene here.")
         dl_tab = QWidget()
         dl_layout = QVBoxLayout(dl_tab)
-        dl_layout.addWidget(self.table)
-        btn_cancel = QPushButton("Cancel selected")
-        btn_cancel.clicked.connect(self._cancel_selected)
-        dl_layout.addWidget(btn_cancel, alignment=Qt.AlignmentFlag.AlignRight)
+        qbar = QHBoxLayout()
+        for text, tip, fn in (
+                ("↻ Retry failed", "Start every failed download again", self._retry_failed),
+                ("Clear finished", "Remove finished and cancelled entries (failed ones stay)", self._clear_finished),
+                ("Clear failed && cancelled", "Remove failed and cancelled entries and delete their unfinished "
+                 ".part files, plus any other leftover .part files in the download folder",
+                 self._clear_failed)):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            qbar.addWidget(b)
+        qbar.addStretch(1)
+        hint = QLabel("Right-click an entry for more")
+        hint.setStyleSheet("color:#888")
+        qbar.addWidget(hint)
+        dl_layout.addLayout(qbar)
+        qsplit = QSplitter()
+        qsplit.addWidget(self.table)
+        qsplit.addWidget(self.queue_detail)
+        qsplit.setStretchFactor(0, 1)
+        qsplit.setStretchFactor(1, 0)
+        qsplit.setSizes([1000, 480])
+        dl_layout.addWidget(qsplit, 1)
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        for text, fn in (("Cancel selected", self._cancel_selected), ("Remove selected", self._remove_selected)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            bottom.addWidget(b)
+        dl_layout.addLayout(bottom)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.browse, "Browse")
@@ -884,7 +918,7 @@ class MainWindow(QMainWindow):
             return rels, (db.upsert_releases(rels) if rels else 0)
 
         run_async(job, on_done=lambda res: self._page_loaded(sid, page, res, mode),
-                  on_fail=lambda err: self._page_failed(sid, page, err))
+                  on_fail=lambda err: self._page_failed(sid, page, err, mode))
 
     # ------------------------------------------------------------ crawler
     def _apply_timers(self) -> None:
@@ -1073,17 +1107,32 @@ class MainWindow(QMainWindow):
             self._schedule_rebuild()
         self._update_crawl_label()
 
-    def _page_failed(self, sid: str, page: int, err: str) -> None:
+    def _page_failed(self, sid: str, page: int, err: str, mode: str = "") -> None:
         self.in_flight.discard(sid)
         first = err.splitlines()[0] if err else "unknown error"
         name = self.sources[sid].display_name if sid in self.sources else sid
+        log.warning("%s: page %s (%s) failed: %s", sid, page, mode, first)
+        src = self.sources.get(sid)
+        slow = ("ReadTimeout" in err or "Read timed out" in err) and hasattr(src, "read_timeout")
+        if slow and src.read_timeout < 300:
+            # The site is there but slow to answer this page (deep pages of a big WordPress
+            # blog can take minutes). Waiting longer is the fix, not backing off as if offline.
+            old = src.read_timeout
+            src.read_timeout = min(300.0, old * 2)
+            self.backoff_until[sid] = time.time() + 15
+            self.status_label.setText(f"{name} is slow to answer page {page} (nothing in {old:.0f}s) — "
+                                      f"trying again, waiting up to {src.read_timeout:.0f}s")
+            self._update_crawl_label()
+            return
         if is_network_error(err):
             # Offline / VPN switching / DNS: retry soon (max 2 min), not the long site-error backoff.
             n = self.fail_count.get(sid, 0) + 1
             self.fail_count[sid] = n
             delay = min(120, 10 * 2 ** (n - 1))
             self.backoff_until[sid] = time.time() + delay
-            self.status_label.setText(f"Can't reach {name} (offline or VPN switching?) — retrying in {delay}s")
+            self.status_label.setText(
+                f"{name} didn't answer page {page} within 5 minutes — retrying in {delay}s" if slow else
+                f"Can't reach {name} (offline or VPN switching?) — retrying in {delay}s")
         else:
             self._backoff(sid, None)
             self.status_label.setText(f"{sid}: page {page} failed ({first}) — retrying later")
@@ -1196,6 +1245,7 @@ class MainWindow(QMainWindow):
             self.model.set_status(status=status)
             for pane in self.panes:
                 pane.refresh_detail()
+            self.queue_detail.refresh_detail(self.model.by_key.get)
             self.studios.set_scenes(self.scenes, self.model.has, bool(self.logos.boxes))
         run_async(compute_status, self.scenes, dict(self.flags), self.settings.preferred_resolution,
                   on_done=apply, pool="cpu")
@@ -1706,8 +1756,11 @@ class MainWindow(QMainWindow):
     def download_upgrades(self, scenes: list[Scene]) -> None:
         """Grab the release that meets your preference for library scenes that don't."""
         rels = [rel for verdict, rel in map(self.upgrade_for, scenes) if verdict == LIB_UPGRADE]
+        if len(scenes) > 1:  # bulk: don't queue the same upgrade twice, or re-send a torrent
+            rels = [r for r in rels if not self._in_queue(r) and self.flags.get((r.source, r.post_id)) != GRABBED]
         if not rels:
-            self.status_label.setText("No upgrades posted for the selected scenes.")
+            self.status_label.setText("No upgrades to queue for the selected scenes "
+                                      "(none posted, or already queued / sent to the torrent client).")
             return
         if len(rels) == 1:
             self.start_download(rels[0])
@@ -1746,7 +1799,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(8000, self._report_bulk_problems)
 
     def _grabbed_posts(self) -> frozenset:
-        return frozenset(k for k, v in self.flags.items() if v in (GRABBED, DONE, VERIFIED))
+        """Releases with a finished media file (downloaded, or found on disk). A torrent handed
+        to the client or a download still running doesn't count: the scene stays an upgrade
+        until the file is actually there."""
+        return frozenset(k for k, v in self.flags.items() if v in (DONE, VERIFIED))
+
+    def _in_queue(self, rel: Release) -> bool:
+        return any(j.release.source == rel.source and j.release.post_id == rel.post_id
+                   and j.state in DownloadManager.ACTIVE for j in self.downloads.jobs.values())
 
     def _upgrade_mode(self, include_all: bool) -> None:
         self.upgrade_pane.filter.have = "below" if include_all else "upgrade"
@@ -1916,11 +1976,26 @@ class MainWindow(QMainWindow):
 
     def _job_changed(self, job: Job) -> None:
         self.db.log_download(job)
+        if job.id in self._remove_when_stopped and job.state not in DownloadManager.ACTIVE:
+            self._remove_when_stopped.discard(job.id)
+            self.downloads.remove(job.id)
+        if job.id not in self.downloads.jobs:  # removed from the list; just keep the flags right
+            new_flag = {State.DONE: DONE, State.FAILED: "failed", State.CANCELLED: "failed"}.get(job.state)
+            if new_flag:
+                self.db.set_flag(job.release.source, job.release.post_id, new_flag,
+                                 path=str(job.final_path or job.path or "") or None)
+                self._flags_changed()
+            self._queue_rebuild()
+            return
         new_flag = {State.DONE: DONE, State.FAILED: "failed", State.CANCELLED: "failed"}.get(job.state)
         if new_flag:  # set_flag never knocks a finished release back to failed
             self.db.set_flag(job.release.source, job.release.post_id, new_flag,
                              path=str(job.final_path or job.path or "") or None)
             self._flags_changed()
+        self._job_changed_row(job)
+        self.tabs.setTabText(self.QUEUE_TAB, f"Queue ({len(self.downloads.jobs)})")
+
+    def _job_changed_row(self, job: Job) -> None:
         row = self.job_rows.get(job.id)
         if row is None:
             row = self.table.rowCount()
@@ -1938,9 +2013,106 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, job.id)
             self.table.setItem(row, col, item)
 
+    # ----------------------------------------------------------------- queue
+    def _queue_jobs(self) -> list[Job]:
+        ids = {self.table.item(i.row(), 0).data(Qt.ItemDataRole.UserRole)
+               for i in self.table.selectionModel().selectedRows()}
+        return [j for j in self.downloads.jobs.values() if j.id in ids]
+
+    def _queue_rebuild(self) -> None:
+        """Redraw the table from the job list (after entries were removed)."""
+        self.table.setRowCount(0)
+        self.job_rows = {}
+        for job in list(self.downloads.jobs.values()):
+            self._job_changed_row(job)
+        self.tabs.setTabText(self.QUEUE_TAB, f"Queue ({len(self.downloads.jobs)})")
+
+    def _queue_remove(self, jobs: list[Job]) -> None:
+        for j in jobs:
+            if j.state in DownloadManager.ACTIVE:  # cancel first; removed once it has stopped
+                self._remove_when_stopped.add(j.id)
+                self.downloads.cancel(j.id)
+            else:
+                self.downloads.remove(j.id)
+        self._queue_rebuild()
+
+    def _queue_retry(self, jobs: list[Job]) -> None:
+        jobs = [j for j in jobs if j.state not in DownloadManager.ACTIVE]
+        if not jobs:
+            return
+        rels = [j.release for j in jobs]
+        for j in jobs:
+            self.downloads.remove(j.id)  # the new attempt gets its own entry
+        self._queue_rebuild()
+        if len(rels) == 1:
+            self.start_download(rels[0])
+        else:
+            self._queue_many(rels, "retried")
+
     def _cancel_selected(self) -> None:
-        for idx in self.table.selectionModel().selectedRows():
-            self.downloads.cancel(self.table.item(idx.row(), 0).data(Qt.ItemDataRole.UserRole))
+        for j in self._queue_jobs():
+            self.downloads.cancel(j.id)
+
+    def _remove_selected(self) -> None:
+        self._queue_remove(self._queue_jobs())
+
+    def _retry_failed(self) -> None:
+        self._queue_retry([j for j in self.downloads.jobs.values() if j.state == State.FAILED])
+
+    def _clear_finished(self) -> None:
+        done = (State.DONE, State.HANDED_OFF, State.BLACKHOLE, State.CANCELLED)
+        self._queue_remove([j for j in self.downloads.jobs.values() if j.state in done])
+
+    def _clear_failed(self) -> None:
+        self._queue_remove([j for j in self.downloads.jobs.values() if j.state in (State.FAILED, State.CANCELLED)])
+        folder = Settings.resolve(self.settings.download_dir)
+        n = 0
+        for p in self.downloads.orphan_parts(folder):
+            try:
+                p.unlink()
+                n += 1
+            except OSError:
+                pass
+        if n:
+            self.status_label.setText(f"Deleted {n} leftover .part file(s) from the download folder")
+
+    def _scene_of(self, rel: Release) -> Scene | None:
+        if self._post_scene_for is not self.scenes:
+            self._post_scene = {(r.source, r.post_id): s for s in self.scenes for r in s.releases}
+            self._post_scene_for = self.scenes
+        return self._post_scene.get((rel.source, rel.post_id))
+
+    def _queue_selection(self) -> None:
+        jobs = self._queue_jobs()
+        scene = self._scene_of(jobs[0].release) if len(jobs) == 1 else None
+        if scene is not None:
+            self.queue_detail.show_scene(self.model.by_key.get(scene.key, scene))
+        elif jobs:
+            self.queue_detail.show_scene(None)
+
+    def _queue_menu(self, pos) -> None:
+        jobs = self._queue_jobs()
+        if not jobs:
+            return
+        one = jobs[0] if len(jobs) == 1 else None
+        what = "" if one else f" ({len(jobs)})"
+        menu = QMenu(self)
+        if one and (scene := self._scene_of(one.release)) is not None:
+            menu.addAction("Show scene in the side panel", lambda: self.queue_detail.show_scene(scene))
+        stopped = [j for j in jobs if j.state not in DownloadManager.ACTIVE]
+        if stopped:
+            label = "↻ Retry" if all(j.state in (State.FAILED, State.CANCELLED) for j in stopped) else "↻ Restart"
+            menu.addAction(f"{label}{'' if one else f' ({len(stopped)})'}", lambda: self._queue_retry(stopped))
+        active = [j for j in jobs if j.state in DownloadManager.ACTIVE]
+        if active:
+            menu.addAction(f"Cancel{'' if one else f' ({len(active)})'}",
+                           lambda: [self.downloads.cancel(j.id) for j in active])
+        menu.addAction(f"Remove from list{what}", lambda: self._queue_remove(jobs))
+        if one and (one.final_path or one.path) and Path(one.final_path or one.path).exists():
+            f = Path(one.final_path or one.path)
+            menu.addSeparator()
+            menu.addAction("Open containing folder", lambda: webbrowser.open(f.parent.as_uri()))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _apply_blackhole(self) -> None:
         d = self.settings.torrent_blackhole_dir.strip()

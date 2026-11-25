@@ -147,3 +147,22 @@ def test_exit_flush_without_console(monkeypatch):
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
     _flush_streams()  # must not raise
+
+
+def test_remove_job_deletes_part_file(tmp_path):
+    from scenesorter.downloader import DownloadManager, Job, State
+    from scenesorter.models import DownloadLink, LinkKind, Release
+
+    m = DownloadManager(1)
+    link = DownloadLink(url="http://x/a.mkv", kind=LinkKind.DIRECT)
+    job = Job(Release("s", "1", "", "A"), link, tmp_path)
+    job.path = tmp_path / "a.mkv"
+    (tmp_path / "a.mkv.part").write_bytes(b"half")
+    (tmp_path / "old.mkv.part").write_bytes(b"orphan")
+    m.jobs[job.id] = job
+    job.state = State.RUNNING
+    assert not m.remove(job.id)                       # running: kept
+    assert {p.name for p in m.orphan_parts(tmp_path)} == {"old.mkv.part"}
+    job.state = State.FAILED
+    assert m.remove(job.id) and job.id not in m.jobs
+    assert not (tmp_path / "a.mkv.part").exists()

@@ -52,6 +52,9 @@ class WordPressSource(Source):
         super().__init__(cfg, session)
         self.display_name = self.options.get("display_name", cfg.id)
         self.per_page = int(self.options.get("per_page", 30))
+        # Seconds to wait for a listing page. Deep pages (old posts) can take a WordPress site
+        # far longer to answer; the app raises this when a page times out (see MainWindow).
+        self.read_timeout = float(self.options.get("timeout", 30))
 
     def _api(self, path: str) -> str:
         return urljoin(self.cfg.base_url.rstrip("/") + "/", "wp-json/wp/v2/" + path)
@@ -60,7 +63,7 @@ class WordPressSource(Source):
         params = {"page": page, "per_page": self.per_page, "_embed": "wp:featuredmedia,wp:term"}
         if query:
             params["search"] = query
-        resp = self.session.get(self._api("posts"), params=params, timeout=30)
+        resp = self.session.get(self._api("posts"), params=params, timeout=(15, self.read_timeout))
         if resp.status_code == 400 and page > 1:
             return []  # past the last page
         if resp.status_code in (429, 503):

@@ -118,6 +118,40 @@ class DownloadManager:
         if job:
             job._cancel.set()
 
+    ACTIVE = (State.QUEUED, State.RUNNING, State.SORTING)
+
+    @staticmethod
+    def part_file(job: Job) -> Path | None:
+        """The unfinished download file of an HTTP job, if one is on disk."""
+        if job.path is None:
+            return None
+        part = job.path.with_name(job.path.name + ".part")
+        return part if part.exists() else None
+
+    def remove(self, job_id: str) -> bool:
+        """Drop a finished/failed/cancelled job from the list; its leftover .part file is
+        deleted (downloads restart from scratch, so it's of no use). Active jobs stay."""
+        job = self.jobs.get(job_id)
+        if job is None or job.state in self.ACTIVE:
+            return False
+        part = self.part_file(job)
+        if part is not None:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        del self.jobs[job_id]
+        return True
+
+    def orphan_parts(self, folder: Path) -> list[Path]:
+        """.part files in the download folder that no active download is writing (left by
+        failed downloads, crashes or earlier sessions)."""
+        busy = {str(p) for j in self.jobs.values() if j.state in self.ACTIVE and (p := self.part_file(j))}
+        try:
+            return [p for p in Path(folder).rglob("*.part") if p.is_file() and str(p) not in busy]
+        except OSError:
+            return []
+
     def shutdown(self) -> None:
         for j in self.jobs.values():
             j._cancel.set()
