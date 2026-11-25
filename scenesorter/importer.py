@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .filematch import FileMatch, SceneIndex, is_candidate_file, walk_videos
@@ -63,37 +63,46 @@ def match_with_folder(index: SceneIndex, p: Path, studio_folder: str = "", schem
     """Match a file by its name, falling back to its folder's name. ``studio_folder``
     is the studio a sorted library puts it under (Library/<Studio>/...): used when the
     file name doesn't carry the studio, and preferred when the two disagree. When the
-    name fits ``scheme`` (the library's naming format), its fields are read from that."""
+    name fits ``scheme`` (the library's naming format), its fields are read from that.
+    ``reason`` says how it matched."""
     m = index.match_scheme(p.name, scheme) if scheme else None
     if m is not None and m.scene is not None:
-        return m
+        return replace(m, reason=f"naming scheme ({m.reason})")
     m = index.match(p.name)
     if m.scene is None and p.parent.name and p.parent.name != studio_folder:
         m = index.match(p.parent.name + p.suffix)
+        if m.scene is not None:
+            m = replace(m, reason=f"folder name ({m.reason})")
     hint = index.resolve_studio(normalise_studio(studio_folder)) if studio_folder else ""
     if hint and (m.scene is None or index.studio_key(m.scene) != hint):
         h = index.match(f"{studio_folder} - {p.name}")
         if h.scene is not None and index.studio_key(h.scene) == hint:
-            return h
+            return replace(h, reason=f"studio folder ({h.reason})")
+    if m.scene is not None and not m.reason.startswith("folder"):
+        m = replace(m, reason=f"file name ({m.reason})")
     return m
 
 
-def file_group(name: str, scheme: str = "") -> str:
-    """Release group of a file on disk ('' if the name doesn't show one)."""
+def file_quality(name: str, scheme: str = "") -> tuple[str, str, str]:
+    """(resolution, release group, codec) of a file on disk, read from its name; '' when
+    the name doesn't show it. Your naming scheme is used first when the name fits it."""
     from .filematch import _clean_name
     from .naming import parse_with_scheme
-    from .parsing import find_group
+    from .parsing import find_codec, find_group, find_resolution
 
     parts = parse_with_scheme(scheme, name) if scheme else None
-    if parts is not None and parts.group:
-        return parts.group
-    return find_group(_clean_name(name)) or ""
+    clean = _clean_name(name)
+    res = (parts.resolution if parts else "") or find_resolution(clean) or ""
+    grp = (parts.group if parts else "") or find_group(clean) or ""
+    codec = (parts.codec if parts else "") or find_codec(clean) or ""
+    return res, grp, codec
 
 
 @dataclass
 class LibraryScan:
     owned: dict[str, list[Path]] = field(default_factory=dict)  # scene key -> files
-    groups: dict[str, set[str]] = field(default_factory=dict)    # scene key -> release groups of those files
+    # path -> (resolution, group, codec, how it matched), for every file in ``owned``
+    info: dict[str, tuple[str, str, str, str]] = field(default_factory=dict)
     rows: list[tuple] = field(default_factory=list)              # new/changed rows for save_scanned
     gone: list[str] = field(default_factory=list)                # files no longer on disk
     dirs: dict[str, tuple] = field(default_factory=dict)         # changed folders -> cache entry
@@ -172,6 +181,7 @@ def scan_library(root: str | Path, scenes: list[Scene], known: dict[str, tuple] 
     index: SceneIndex | None = None
     seen: set[str] = set()
     visited: set[str] = set()
+    how_now: dict[str, str] = {}
     for p, st in _walk_library(root, dir_cache or {}, full, res, visited):
         sp = str(p)
         seen.add(sp)
@@ -197,13 +207,17 @@ def scan_library(root: str | Path, scenes: list[Scene], known: dict[str, tuple] 
         if m.scene is not None:
             res.matched_now += 1
             res.owned.setdefault(m.scene.key, []).append(p)
-            res.rows.append((sp, *st, m.scene.key, m.release.source, m.release.post_id, m.score))
+            how_now[sp] = m.reason
+            res.rows.append((sp, *st, m.scene.key, m.release.source, m.release.post_id, m.score, m.reason))
         else:
             res.unmatched += 1
             if not k or k[2] or (k[0], k[1]) != st:
                 res.rows.append((sp, *st, None, None, None, 0.0))
-    for key, paths in res.owned.items():
-        res.groups[key] = {g for g in (file_group(p.name, scheme) for p in paths) if g}
+    for paths in res.owned.values():
+        for p in paths:
+            k = known.get(str(p))
+            how = how_now.get(str(p)) or (k[4] if k and len(k) > 4 else "") or "earlier scan"
+            res.info[str(p)] = (*file_quality(p.name, scheme), how)
     res.gone = [p for p in known if p not in seen]
     res.dirs_gone = [d for d in (dir_cache or {}) if d not in visited]
     res.seconds = time.monotonic() - t0

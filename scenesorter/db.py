@@ -174,6 +174,8 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(posts)")}
+        if "how" not in {r[1] for r in self.conn.execute("PRAGMA table_info(scanned_files)")}:
+            self.conn.execute("ALTER TABLE scanned_files ADD COLUMN how TEXT")  # how a file was matched
         if "parsed_fields" not in cols:  # which fields came from title parsing (JSON list), v6
             self.conn.execute("ALTER TABLE posts ADD COLUMN parsed_fields TEXT")
         old = int(self.get_meta("schema_version") or SCHEMA_VERSION)
@@ -440,9 +442,9 @@ class Database:
         """path -> (size, mtime, source, post_id) for files scanned below ``root``."""
         root = root.rstrip("/\\")
         with self._lock:
-            rows = self.conn.execute("SELECT path, size, mtime, source, post_id FROM scanned_files "
+            rows = self.conn.execute("SELECT path, size, mtime, source, post_id, how FROM scanned_files "
                                      "WHERE substr(path, 1, ?) = ?", (len(root), root)).fetchall()
-        return {r["path"]: (r["size"], r["mtime"], r["source"], r["post_id"]) for r in rows}
+        return {r["path"]: (r["size"], r["mtime"], r["source"], r["post_id"], r["how"] or "") for r in rows}
 
     def library_dirs(self, root: str) -> dict[str, tuple]:
         """folder -> (mtime, [sub-folder names], [video file names]) below ``root``."""
@@ -460,7 +462,8 @@ class Database:
             try:
                 self.conn.executemany(
                     "INSERT OR REPLACE INTO scanned_files(path, size, mtime, scene_key, source, post_id, score, "
-                    "scanned_at) VALUES (?,?,?,?,?,?,?,?)", [(*r, now) for r in rows])
+                    "how, scanned_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    [(*r[:7], r[7] if len(r) > 7 else None, now) for r in rows])
                 self.conn.executemany("DELETE FROM scanned_files WHERE path=?", [(p,) for p in gone])
                 self.conn.executemany("INSERT OR REPLACE INTO library_dirs VALUES (?,?,?,?)",
                                       [(k, m, json.dumps(sd), json.dumps(f)) for k, (m, sd, f) in dirs.items()])

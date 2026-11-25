@@ -29,7 +29,10 @@ from ..models import LinkKind, Release, Scene
 from ..quota import QuotaTracker
 from ..sources import RateLimited, Source, build_source
 from ..parsing import normalise_studio
-from ..status import DONE, FINISHED, GRABBED, preferred_release, scene_status, source_order, target_release
+from ..status import (
+    DONE, FINISHED, GRABBED, LIB_OK, LIB_UPGRADE, library_upgrade, preferred_release, scene_status, source_order,
+    target_release,
+)
 from .scene_grid import SceneDelegate, SceneModel, fmt_duration
 from .scene_pane import FitImage, ScenePane, breakable
 from .settings_dialog import SettingsDialog
@@ -194,6 +197,7 @@ class MainWindow(QMainWindow):
         self._rebuild_dirty = False
         self.sources: dict[str, Source] = {}
         self.owned: dict[str, list[Path]] = {}  # scene key -> files in the (Whisparr) library
+        self.lib_info: dict[str, tuple] = {}    # library file -> (resolution, group, codec, how matched)
         self._library_running = False
         self._library_checked = False
         self._scene_gen = 0       # bumps whenever the scene list is rebuilt
@@ -326,18 +330,48 @@ class MainWindow(QMainWindow):
         # --- scene panes (Browse + Downloaded share model, delegate and detail rendering)
         self.model = SceneModel(self.thumbs)
         self.model.preferred_groups = tuple(g.lower() for g in self.settings.preferred_groups)
+        self.model.wanted_resolution = self.settings.preferred_resolution
+        self.model.grabbed = self._grabbed_posts()
         self.delegate = SceneDelegate([])
         self.delegate.preferred_groups = self.settings.preferred_groups
         self.browse = ScenePane(self.model, self.delegate, self.render_detail, render_multi=self.render_multi)
         self.have_pane = ScenePane(self.model, self.delegate, self.render_detail, have="any",
                                    empty_text="Scenes you've grabbed, partly downloaded or downloaded show up here.",
                                    render_multi=self.render_multi)
-        self.panes = [self.browse, self.have_pane]
+        self.upgrade_pane = ScenePane(
+            self.model, self.delegate, self.render_detail, have="upgrade", render_multi=self.render_multi,
+            empty_text="Scenes in your library whose file is below your preference (wanted resolution + "
+                       "preferred release group), where a release that meets it has been posted.\n\n"
+                       "Set your library folder in Settings ▸ General.")
+        self.panes = [self.browse, self.have_pane, self.upgrade_pane]
         for pane in self.panes:
             pane.context_requested.connect(self._scene_menu)
             pane.busy_changed.connect(lambda busy, p=pane: self.progress.report(
                 f"view{id(p)}", "Updating the scene list…") if busy else self.progress.done(f"view{id(p)}"))
         self.have_pane.count_changed.connect(lambda n: self.tabs.setTabText(1, f"Downloaded ({n})"))
+        self.upgrade_pane.count_changed.connect(lambda n: self.tabs.setTabText(2, f"Upgrades ({n})"))
+        upg_tab = QWidget()
+        upg_lay = QVBoxLayout(upg_tab)
+        upg_lay.setContentsMargins(0, 0, 0, 0)
+        upg_bar = QHBoxLayout()
+        upg_bar.setContentsMargins(8, 4, 8, 0)
+        self.upg_all = QCheckBox("Also show ones with no upgrade posted yet")
+        self.upg_all.setToolTip("Include library scenes below your preference even when nothing better "
+                                "has been posted (or the upgrade is already grabbed)")
+        self.upg_all.toggled.connect(self._upgrade_mode)
+        self.upg_hint = QLabel()
+        self.upg_hint.setStyleSheet("color:#888")
+        upg_dl = QPushButton("⬆ Download all shown upgrades")
+        upg_dl.setToolTip("Queue the release that meets your preference for every scene listed here "
+                          "(respects logins and daily limits). Select scenes first to download only those.")
+        upg_dl.clicked.connect(lambda: self.download_upgrades(self.upgrade_pane.selected_scenes()
+                                                              or list(self.upgrade_pane.list.rows)))
+        upg_bar.addWidget(self.upg_all)
+        upg_bar.addWidget(self.upg_hint, 1)
+        upg_bar.addWidget(upg_dl)
+        upg_lay.addLayout(upg_bar)
+        upg_lay.addWidget(self.upgrade_pane)
+        self._upgrade_hint()
         self.model.on_visible = self.matcher.visible
         self.model.fav_studios = set(self.fav["studio"])
         self.model.fav_performers = set(self.fav["performer"])
@@ -381,10 +415,11 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self.browse, "Browse")
         self.tabs.addTab(self.have_pane, "Downloaded")
+        self.tabs.addTab(upg_tab, "Upgrades")
         self.tabs.addTab(self.studios, "Studios")
         self.tabs.addTab(self.performers_tab, "Performers")
         self.tabs.addTab(dl_tab, "Queue")
-        self.QUEUE_TAB = 4
+        self.QUEUE_TAB = 5
         self.setCentralWidget(self.tabs)
 
         self.progress_bar = QProgressBar()
@@ -1128,6 +1163,7 @@ class MainWindow(QMainWindow):
     def _flags_changed(self) -> None:
         """Download flags changed: recompute every scene's status off the UI thread."""
         self.flags = self.db.flags()
+        self.model.grabbed = self._grabbed_posts()
 
         def apply(status):
             self.model.set_status(status=status)
@@ -1272,9 +1308,14 @@ class MainWindow(QMainWindow):
         what = "scene" if one else f"{len(scenes)} scenes"
         menu = QMenu(self)
         states = {self.model.state(s.key) for s in scenes}
+        upgrades = [s for s in scenes if s.key in self.owned and self.upgrade_for(s)[0] == LIB_UPGRADE]
+        if upgrades:
+            menu.addAction(f"⬆ Download upgrade{'' if one else f' ({len(upgrades)} scenes)'}",
+                           lambda: self.download_upgrades(upgrades))
         if states != {"complete"} or one:
             menu.addAction(f"⬇ Download preferred{'' if one else f' ({len(scenes)} scenes)'}",
                            lambda: self.download_preferred(scenes))
+        if upgrades or states != {"complete"} or one:
             menu.addSeparator()
         if states != {"complete"}:
             menu.addAction(f"Mark {what} as downloaded", lambda: self.mark_scenes(scenes, True))
@@ -1336,24 +1377,22 @@ class MainWindow(QMainWindow):
 
     def _fill_have_box(self) -> None:
         """Download-state filter; the library options name your preferred group (PRT)."""
-        pref = self.settings.preferred_groups[0] if self.settings.preferred_groups else "preferred group"
         current = self.have_box.currentData()
         self.have_box.blockSignals(True)
         self.have_box.clear()
         for label, mode in (("Downloaded or not", ""), ("Still wanted", "missing"),
                             ("Grabbed / partial", "partial"), ("Downloaded", "have"),
-                            ("In library", "lib"), (f"In library · not {pref}", "lib_other"),
-                            (f"In library · {pref} available (upgrade)", "lib_upgrade")):
+                            ("In library", "lib")):
             self.have_box.addItem(label, mode)
         self.have_box.setCurrentIndex(max(self.have_box.findData(current), 0))
         self.have_box.blockSignals(False)
         self.have_box.setToolTip(
             "Still wanted = not downloaded at your wanted resolution yet (includes grabbed and partial)\n"
-            f"In library · not {pref} = your library file for the scene isn't from a preferred group "
-            "(Settings ▸ preferred groups)\n"
-            f"In library · {pref} available = same, and a {pref} release has been posted: ready to upgrade")
+            "In library = found in your library folder. Files below your preference are on the Upgrades tab.")
         if getattr(self, "model", None) is not None:
             self.model.preferred_groups = tuple(g.lower() for g in self.settings.preferred_groups)
+            self.model.wanted_resolution = self.settings.preferred_resolution
+            self._upgrade_hint()
             self.model.names_changed()  # refilter
 
     def rescan_library(self, manual: bool = False, full: bool = False) -> None:
@@ -1389,18 +1428,18 @@ class MainWindow(QMainWindow):
 
     def _library_scanned(self, res, manual: bool) -> None:
         self._library_running = False
-        groups = {}
         if res is None:
-            self.owned = {}
+            self.owned, self.lib_info = {}, {}
         else:
-            self.owned = res.owned
-            groups = res.groups
+            self.owned, self.lib_info = res.owned, res.info
             msg = (f"Library: {res.files} files in {res.folders} folders ({res.folders_listed} changed), "
                    f"{len(res.owned)} scenes, {res.unmatched} unmatched — {res.seconds:.1f}s")
             log.info(msg)
             if manual or res.matched_now or res.gone:
                 self.status_label.setText(msg)
-        self.model.set_status(owned=set(self.owned), library_groups=groups)
+        files = {k: [self.lib_info.get(str(p), ("", "", "", ""))[:2] for p in paths]
+                 for k, paths in self.owned.items()}
+        self.model.set_status(owned=set(self.owned), library_files=files)
 
     # --------------------------------------------------------------- detail
     def render_detail(self, pane: ScenePane, scene: Scene) -> None:
@@ -1466,7 +1505,19 @@ class MainWindow(QMainWindow):
         flagged = [r for r in scene.releases if (r.source, r.post_id) in self.flags]
         state = self.model.state(scene.key)
         if scene.key in self.owned:
-            own = QLabel("✔ In library:<br>" + "<br>".join(breakable(p.name) for p in self.owned[scene.key]))
+            lines = []
+            for p in self.owned[scene.key]:
+                res, grp, codec, how = self.lib_info.get(str(p), ("", "", "", ""))
+                q = " · ".join(x for x in (res or "resolution ?", grp or "group ?", codec) if x)
+                lines.append(f"{breakable(p.name)}<br><span style='color:#8b95a5'>{q}"
+                             f"{' — matched by ' + how if how else ''}</span>")
+            verdict, up = self.upgrade_for(scene)
+            if verdict == LIB_UPGRADE:
+                lines.append(f"<span style='color:#f59e0b'>⬆ Upgrade posted: {up.resolution} "
+                             f"{up.release_group}</span>")
+            elif verdict != LIB_OK:
+                lines.append("<span style='color:#f59e0b'>Below your preference — nothing better posted yet</span>")
+            own = QLabel("✔ In library:<br>" + "<br>".join(lines))
             own.setToolTip("\n".join(str(p) for p in self.owned[scene.key]))
             own.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             own.setWordWrap(True)
@@ -1497,6 +1548,15 @@ class MainWindow(QMainWindow):
         dl.setToolTip("Picks your wanted resolution, then preferred release group, then preferred source "
                       "(Settings ▸ General)." + ("\nAlready downloaded — this grabs it again." if complete else ""))
         dl.clicked.connect(lambda: self.download_preferred([scene]))
+        if scene.key in self.owned and (up := self.upgrade_for(scene))[0] == LIB_UPGRADE:
+            usrc = self.sources.get(up[1].source)
+            ubits = " · ".join(x for x in [up[1].resolution, up[1].release_group,
+                                           usrc.display_name if usrc else up[1].source] if x)
+            dl = QPushButton(f"⬆  Download upgrade\n{ubits}")
+            dl.setStyleSheet("QPushButton { background:#d97706; color:white; padding:6px; border-radius:4px; "
+                             "font-weight:bold } QPushButton:hover { background:#f59e0b }")
+            dl.setToolTip("Your library file is below your preference; this grabs the release that meets it.")
+            dl.clicked.connect(lambda: self.download_upgrades([scene]))
         lay.addWidget(dl)
         mark = QPushButton("Mark as not downloaded" if complete else "Mark as downloaded")
         mark.setToolTip("Clear every flag on this scene so it's wanted again" if complete else
@@ -1570,7 +1630,28 @@ class MainWindow(QMainWindow):
         if len(scenes) == 1:
             self.start_download(self._preferred(scenes[0]))
             return
-        rels = [self._preferred(sc) for sc in scenes]
+        self._queue_many([self._preferred(sc) for sc in scenes], "preferred")
+
+    def upgrade_for(self, scene: Scene):
+        """(verdict, release) for a scene in your library — see status.library_upgrade."""
+        files = self.model.library_files.get(scene.key, [])
+        return library_upgrade(scene, files, self.settings.preferred_resolution, self.model.preferred_groups)
+
+    def download_upgrades(self, scenes: list[Scene]) -> None:
+        """Grab the release that meets your preference for library scenes that don't."""
+        rels = [rel for verdict, rel in map(self.upgrade_for, scenes) if verdict == LIB_UPGRADE]
+        if not rels:
+            self.status_label.setText("No upgrades posted for the selected scenes.")
+            return
+        if len(rels) == 1:
+            self.start_download(rels[0])
+            return
+        if len(rels) > 10 and QMessageBox.question(
+                self, "Download upgrades", f"Start {len(rels)} downloads?") != QMessageBox.StandardButton.Yes:
+            return
+        self._queue_many(rels, "upgrade")
+
+    def _queue_many(self, rels: list[Release], what: str) -> None:
         # log in once per source that needs it
         for sid in {r.source for r in rels}:
             src = self.sources.get(sid)
@@ -1594,9 +1675,21 @@ class MainWindow(QMainWindow):
         self._bulk_problems = []
         for r in rels:
             self.start_download(r, quiet=True)
-        self.status_label.setText(f"Queued {len(rels)} preferred download(s)"
-                                  + (f" — see the Queue tab" if rels else ""))
+        self.status_label.setText(f"Queued {len(rels)} {what} download(s)"
+                                  + (" — see the Queue tab" if rels else ""))
         QTimer.singleShot(8000, self._report_bulk_problems)
+
+    def _grabbed_posts(self) -> frozenset:
+        return frozenset(k for k, v in self.flags.items() if v in (GRABBED, DONE, VERIFIED))
+
+    def _upgrade_mode(self, include_all: bool) -> None:
+        self.upgrade_pane.filter.have = "below" if include_all else "upgrade"
+        self.upgrade_pane.request_update()
+
+    def _upgrade_hint(self) -> None:
+        groups = ", ".join(self.settings.preferred_groups) or "any group"
+        self.upg_hint.setText(f"Preference: {self.settings.preferred_resolution or 'best'} · {groups} "
+                              "(Settings ▸ General) · Select scenes to download only those")
 
     def _report_bulk_problems(self) -> None:
         probs = getattr(self, "_bulk_problems", [])

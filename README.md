@@ -45,15 +45,18 @@ studio-sorted library to show what you already have.
   **IN LIBRARY** badge, even when your file is a different resolution or came
   from another site. When a file name doesn't name the studio, the studio
   folder is used.
-- **Library upgrade filters.** The release group of each library file is read
-  from its name, using your naming scheme when it fits. The Downloaded filter
-  in the toolbar has three library options:
-  - **In library**
-  - **In library · not PRT:** your file isn't from a preferred group
-  - **In library · PRT available (upgrade):** the same, and a PRT release has
-    been posted, so you can download the better copy
-
-  The group name follows your first preferred group in Settings.
+- **Upgrades tab.** Lists scenes in your library whose file is below your
+  preference: under your wanted resolution, or not from a preferred release
+  group. A PRT file at 720p counts, and so does a 1080p file from another
+  group. It only lists scenes where a release that meets your preference has
+  been posted and isn't grabbed yet. Tick **Also show ones with no upgrade
+  posted yet** to see the rest. **Download all shown upgrades** queues them
+  all, or only the selected ones, with the usual login and daily-limit checks.
+  Single scenes get a **⬆ Download upgrade** button and right-click entry.
+- **What's recorded per library file.** Resolution, release group and codec
+  are read from the name, using your naming scheme when it fits. The scan also
+  records how the file was matched: naming scheme, file name, folder name or
+  studio folder. The detail panel shows all of this under "In library".
 - **Fast library checks.** The scan runs in the background. It remembers each
   folder's modified date and contents. A folder's date changes whenever a file
   in it is added, removed or renamed, so unchanged folders aren't read again

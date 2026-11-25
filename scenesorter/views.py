@@ -11,6 +11,7 @@ from datetime import date
 
 from .models import Scene
 from .parsing import normalise_studio
+from .status import LIB_OK, LIB_UPGRADE, library_upgrade
 
 SORTS = {
     "posted": "Newest posted",
@@ -32,8 +33,8 @@ class ViewSpec:
     performer: str = ""     # performer key
     fav_only: bool = False
     # "" all · "missing" still wanted · "partial" grabbed/partial · "have" complete · "any" not none
-    # · "lib" in library · "lib_other" in library, no file from a preferred group
-    # · "lib_upgrade" lib_other and a preferred-group release is posted
+    # · "lib" in library · "upgrade" library file below your preference and a release that
+    # meets it is posted (not grabbed yet) · "below" library file below your preference
     have: str = ""
     show_hidden: bool = False
     sort: str = "posted"
@@ -56,8 +57,10 @@ class ViewState:
     hidden_studios: set[str] = field(default_factory=set)      # studio keys
     hidden_performers: set[str] = field(default_factory=set)   # performer keys
     fav_overrides_hidden_studio: bool = False
-    library_groups: dict[str, set[str]] = field(default_factory=dict)  # scene key -> groups of library files
+    library_files: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # key -> [(res, group)]
     preferred_groups: tuple[str, ...] = ()                             # lowercased
+    wanted_resolution: str = ""
+    grabbed: frozenset = frozenset()   # (source, post_id) of releases grabbed/done/verified
 
     def state(self, key: str) -> str:
         return "complete" if key in self.owned else self.status.get(key, "none")
@@ -123,6 +126,21 @@ def _index(scenes: list[Scene], st: ViewState) -> _Index:
         return _cache["index"]
 
 
+def upgrade_wanted(s: Scene, st: ViewState, include_unavailable: bool = False) -> bool:
+    """Library file below your preference, and (unless ``include_unavailable``) a release
+    that meets it is posted and hasn't been grabbed yet."""
+    verdict, rel = library_upgrade(s, st.library_files.get(s.key, []), st.wanted_resolution,
+                                   st.preferred_groups)
+    if verdict == LIB_OK:
+        return False
+    if include_unavailable:
+        return True
+    if verdict != LIB_UPGRADE:
+        return False
+    return not any((r.source, r.post_id) in st.grabbed for r in s.releases
+                   if r.resolution_rank == rel.resolution_rank and r.release_group.lower() in st.preferred_groups)
+
+
 def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Scene]:
     ix = _index(scenes, st)
     words = spec.text.lower().split()
@@ -140,15 +158,11 @@ def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Sce
                 continue
             if spec.have == "any" and state == "none":
                 continue
-            if spec.have.startswith("lib"):
+            if spec.have in ("lib", "upgrade", "below"):
                 if s.key not in st.owned:
                     continue
-                if spec.have != "lib":
-                    if any(g.lower() in st.preferred_groups for g in st.library_groups.get(s.key, ())):
-                        continue  # already have a preferred-group file
-                    if spec.have == "lib_upgrade" and not any(
-                            r.release_group.lower() in st.preferred_groups for r in s.releases):
-                        continue
+                if spec.have != "lib" and not upgrade_wanted(s, st, spec.have == "below"):
+                    continue
         if spec.studio and ix.studio[i] != spec.studio:
             continue
         if spec.performer and spec.performer not in st.scene_performers.get(s.key, ()):

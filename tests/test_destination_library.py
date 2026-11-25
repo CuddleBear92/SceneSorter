@@ -100,18 +100,47 @@ def test_folder_cache_skips_unchanged_folders(tmp_path):
     assert set(r5.owned) == {b.key} and r5.folders_listed == 2
 
 
-def test_library_group_filters():
+def _multi(*titles):
+    return merge_releases([enrich(Release("wp", t[:40], "", t)) for t in titles])[0]
+
+
+def test_upgrade_tab_judges_group_and_resolution():
     from scenesorter.views import ViewSpec, ViewState, compute_view
 
-    prt = _scene("Studio.24.01.01.Has.Prt.Copy.XXX.1080p.HEVC.x265.PRT")
-    other = _scene("Studio.24.01.02.Other.Group.Copy.XXX.1080p.HEVC.x265.PRT")   # PRT posted, we hold GRP
-    nogrp = _scene("Studio.24.01.03.No.Prt.Posted.XXX.1080p.MP4-GRP")            # no PRT posted at all
-    missing = _scene("Studio.24.01.04.Not.In.Library.XXX.1080p.HEVC.x265.PRT")
-    st = ViewState(owned={prt.key, other.key, nogrp.key},
-                   library_groups={prt.key: {"PRT"}, other.key: {"GRP"}, nogrp.key: set()},
-                   preferred_groups=("prt",))
-    scenes = [prt, other, nogrp, missing]
+    good = _multi("Studio.24.01.01.Has.Prt.Copy.XXX.1080p.HEVC.x265.PRT")
+    wrong_group = _multi("Studio.24.01.02.Other.Group.Copy.XXX.1080p.HEVC.x265.PRT")
+    low_res = _multi("Studio.24.01.03.Prt.But.Low.Res.XXX.1080p.HEVC.x265.PRT",
+                     "Studio.24.01.03.Prt.But.Low.Res.XXX.720p.HEVC.x265.PRT")
+    no_prt = _multi("Studio.24.01.04.No.Prt.Posted.XXX.1080p.MP4-GRP")
+    only_low_prt = _multi("Studio.24.01.05.Only.Low.Prt.XXX.1080p.MP4-GRP",
+                          "Studio.24.01.05.Only.Low.Prt.XXX.720p.HEVC.x265.PRT")
+    grabbed = _multi("Studio.24.01.06.Upgrade.Grabbed.XXX.1080p.HEVC.x265.PRT")
+    missing = _multi("Studio.24.01.07.Not.In.Library.XXX.1080p.HEVC.x265.PRT")
+    files = {good.key: [("1080p", "PRT")], wrong_group.key: [("1080p", "GRP")],
+             low_res.key: [("720p", "PRT")], no_prt.key: [("1080p", "GRP")],
+             only_low_prt.key: [("1080p", "GRP")], grabbed.key: [("1080p", "XYZ")]}
+    g = grabbed.releases[0]
+    st = ViewState(owned=set(files), library_files=files, preferred_groups=("prt",),
+                   wanted_resolution="1080p", grabbed=frozenset({(g.source, g.post_id)}))
+    scenes = [good, wrong_group, low_res, no_prt, only_low_prt, grabbed, missing]
     view = lambda mode: {s.key for s in compute_view(scenes, ViewSpec(have=mode), st)}  # noqa: E731
-    assert view("lib") == {prt.key, other.key, nogrp.key}
-    assert view("lib_other") == {other.key, nogrp.key}
-    assert view("lib_upgrade") == {other.key}
+    assert view("lib") == set(files)
+    # wrong group, and PRT at too low a resolution, both have a 1080p PRT to get;
+    # a 720p PRT is no upgrade over a 1080p file; an upgrade already grabbed is left out
+    assert view("upgrade") == {wrong_group.key, low_res.key}
+    assert view("below") == {wrong_group.key, low_res.key, no_prt.key, only_low_prt.key, grabbed.key}
+
+
+def test_file_quality_and_match_reason(tmp_path):
+    from scenesorter.importer import file_quality
+
+    assert file_quality(NAME, WHISPARR) == ("1080p", "PRT", "HEVC")
+    assert file_quality("Studio - 2024-01-15 - Title [WEBDL-720p][GRP].mp4")[:2] == ("720p", "GRP")
+    s = _scene("[LittleAsians] Kaori Ojima - Im A Woman Now But Ill Always Be Your Little Slut - Kaori Ojima Debut (2026-06-30) 1080p")
+    lib = tmp_path / "Library"
+    (lib / "Little Asians").mkdir(parents=True)
+    f = lib / "Little Asians" / NAME
+    f.write_bytes(b"x")
+    res = scan_library(lib, [s], scheme=WHISPARR)
+    assert res.info[str(f)][:3] == ("1080p", "PRT", "HEVC")
+    assert res.info[str(f)][3].startswith("naming scheme")

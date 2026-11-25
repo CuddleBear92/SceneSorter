@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Callable
 
-from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QSize, QItemSelectionModel, QModelIndex, QPoint, Qt, QTimer, Signal
 from PySide6.QtWidgets import QAbstractItemView, QLabel, QListView, QScrollArea, QSplitter, QVBoxLayout, QWidget
 
 from ..models import Scene
@@ -99,6 +99,17 @@ class FitImage(QLabel):
                                            Qt.TransformationMode.SmoothTransformation))
 
 
+class _DetailWidget(QWidget):
+    """Detail panel contents. Never asks for more width than the panel has: a long
+    unbreakable line used to make the whole panel wider than its visible area, cutting
+    off the thumbnail and the buttons on the right. Now such a line wraps or is clipped
+    on its own and everything else fits."""
+
+    def minimumSizeHint(self):  # noqa: N802
+        h = super().minimumSizeHint()
+        return QSize(0, h.height())
+
+
 class ScenePane(QSplitter):
     #: right-click on the grid: (selected scenes, global position)
     context_requested = Signal(list, QPoint)
@@ -150,14 +161,14 @@ class ScenePane(QSplitter):
         model.scenes_changed.connect(self.request_update)
         model.status_changed.connect(self.request_update)
 
-        self.detail = QWidget()
+        self.detail = _DetailWidget()
         self.detail_layout = QVBoxLayout(self.detail)
         self.detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self.detail)
-        scroll.setMinimumWidth(400)
+        scroll.setMinimumWidth(420)
         self._scroll = scroll
         self._sized = False
 
@@ -167,7 +178,8 @@ class ScenePane(QSplitter):
         self.setStretchFactor(1, 0)  # extra window width goes to the grid; the panel keeps its size
         self.show_message(empty_text)
 
-    DETAIL_W = 480  # default detail panel width: room for the thumbnail, buttons and file names
+    # default detail panel width: about a third of the window, within these limits
+    DETAIL_MIN, DETAIL_MAX, DETAIL_SHARE = 460, 620, 0.32
 
     def showEvent(self, ev) -> None:  # noqa: N802
         super().showEvent(ev)
@@ -177,7 +189,8 @@ class ScenePane(QSplitter):
 
     def _default_sizes(self) -> None:
         total = sum(self.sizes()) or self.width()
-        panel = min(self.DETAIL_W, max(400, total // 2))
+        panel = int(min(self.DETAIL_MAX, max(self.DETAIL_MIN, total * self.DETAIL_SHARE)))
+        panel = min(panel, max(420, total // 2))  # small windows: never more than half
         self.setSizes([max(total - panel, 200), panel])
 
     # ------------------------------------------------------------ filtering
