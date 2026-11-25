@@ -94,10 +94,11 @@ class SceneIndex:
         self.by_studio: dict[str, list[Scene]] = defaultdict(list)
         self.by_date: dict = defaultdict(list)
         self.toks: dict[str, set[str]] = {}
+        # official stash-box spellings ("Brazzers Exxtra") -> our studio key
+        self.alias = {normalise_studio(n): k for k, n in (studio_names or {}).items() if n}
         for s in scenes:
             k = normalise_studio(s.studio)
             self.by_studio[k].append(s)
-            # official stash-box spelling resolves to the same key, nothing extra to index
             for d in s.scene_dates:
                 self.by_date[d].append(s)
             words: set[str] = set()
@@ -105,15 +106,37 @@ class SceneIndex:
                 words |= set(tokens(" ".join(r.performers) + " " + r.title))
             self.toks[s.key] = words
 
+    def studio_key(self, s: Scene) -> str:
+        return normalise_studio(s.studio)
+
+    def resolve_studio(self, key: str) -> str:
+        """Our studio key for a normalised name, '' if no scene has that studio."""
+        if key in self.by_studio:
+            return key
+        return self.alias.get(key, "")
+
     def match(self, filename: str) -> FileMatch:
         clean = _clean_name(filename)
         p = parse_title(clean)
-        res = find_resolution(clean)
-        grp = find_group(clean)
-        studio = normalise_studio(p["studio"]) if p["studio"] else ""
-        words = set(tokens(" ".join(p["performers"]) + " " + p["title"]))
+        return self.match_fields(filename, p["studio"], p["scene_date"],
+                                 " ".join(p["performers"]) + " " + p["title"],
+                                 find_resolution(clean), find_group(clean))
+
+    def match_scheme(self, filename: str, scheme: str) -> FileMatch | None:
+        """Match using a known naming scheme; None if the name doesn't fit it."""
+        from .naming import parse_with_scheme
+        parts = parse_with_scheme(scheme, filename)
+        if parts is None or not (parts.studio or parts.scene_date):
+            return None
+        return self.match_fields(filename, parts.studio, parts.scene_date, parts.words,
+                                 parts.resolution, parts.group)
+
+    def match_fields(self, filename: str, studio_name: str, d, text: str, res: str, grp: str) -> FileMatch:
+        studio = normalise_studio(studio_name) if studio_name else ""
+        if studio not in self.by_studio and studio in self.alias:
+            studio = self.alias[studio]
+        words = set(tokens(text))
         words.discard(studio)
-        d = p["scene_date"]
 
         best: tuple[float, Scene | None, str] = (0.0, None, "no match")
 

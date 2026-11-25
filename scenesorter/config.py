@@ -36,7 +36,14 @@ OLD_DEFAULT_TEMPLATES = {"{studio}/{studio} - {date} - {performers} - {title} [{
 class Settings:
     # Relative paths are relative to the exe folder; absolute paths work too.
     download_dir: str = "downloads"
-    library_dir: str = "library"
+    # Destination: finished downloads are renamed/moved here (Whisparr picks them up from here).
+    destination_dir: str = "destination"
+    # Library: your final collection, sorted by studio (Library/<Studio>/<file>), e.g. what
+    # Whisparr imports into. Read-only for SceneSorter: scanned to mark scenes IN LIBRARY.
+    library_dir: str = ""
+    # How files in the library are named (Whisparr/Sonarr format). When a name fits it, studio,
+    # date, quality and group are read from fixed places instead of guessed. "" = guess.
+    library_naming: str = ""
     rename_template: str = DEFAULT_TEMPLATE
     preferred_resolution: str = "1080p"
     max_parallel_downloads: int = 2
@@ -46,11 +53,11 @@ class Settings:
     # Import folders: scanned regularly; video files found are matched by name and flagged as downloaded.
     import_dirs: list[str] = field(default_factory=list)
     import_scan_minutes: int = 5
-    scan_library_dir: bool = True       # treat the library folder as an import folder too
+    scan_destination_dir: bool = True   # treat the destination folder as an import folder too
     # stash-box scene matching (needs API keys under stashboxes)
     scene_matching: bool = True
     match_interval_s: int = 3           # one scene lookup every N seconds
-    auto_sort_completed: bool = True    # move finished downloads into the library
+    auto_sort_completed: bool = True    # move finished downloads into the destination folder
     rename_files: bool = True           # ...renamed with rename_template (off = keep the original name)
     preferred_source: str = ""          # source id picked first by "Download preferred" ("" = list order)
     check_updates_on_start: bool = True
@@ -81,6 +88,10 @@ class Settings:
         if not path.exists():
             return cls()
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if "destination_dir" not in raw:  # before build 32 the destination was called "library"
+            raw["destination_dir"] = raw.pop("library_dir", "library")  # keep the old folder
+            if "scan_library_dir" in raw:
+                raw["scan_destination_dir"] = raw.pop("scan_library_dir")
         srcs = [SourceConfig(**s) for s in raw.pop("sources", [])]
         boxes = raw.pop("stashboxes", None)
         known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}

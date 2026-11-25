@@ -2,8 +2,9 @@
 
 A desktop download manager and library sorter for scene releases. It
 pulls post listings from configured sources and merges them into one entry per
-scene. It can start downloads, then rename and move finished files into
-your library.
+scene. It can start downloads, then rename and move finished files into a
+destination folder for Whisparr to pick up. It also reads your final,
+studio-sorted library to show what you already have.
 
 ## Features
 
@@ -17,8 +18,8 @@ your library.
 - **Daily quota tracking.** Sources can declare a daily action limit. Each
   started download counts as one action in a rolling 24-hour window. The UI
   shows how many are left and blocks downloads once the limit is reached.
-- **Auto-sort.** Finished downloads are moved into your library. Renaming is a
-  separate toggle: turn it off to keep the original file name. The default
+- **Auto-sort.** Finished downloads are moved into the **Destination** folder.
+  Renaming is a separate toggle: turn it off to keep the original file name. The default
   template is
   `{studio}/{studio} - {date} - {performers} - {title} [{resolution}] [{group}]`.
   Available fields are `{studio} {date} {year} {performers} {title}
@@ -31,9 +32,19 @@ your library.
   3. your preferred source, then the rest in Sources order
 
   With several scenes selected, ones already downloaded are skipped.
-- **Library awareness.** The app scans your library and marks scenes you
-  already have, even when the file you have is a different resolution or came
-  from another site.
+- **Library.** Set **Settings ▸ General ▸ Library** to your final collection,
+  sorted one folder per studio (`Library/<Studio>/<file>`), for example where
+  Whisparr imports to. SceneSorter only reads it. Matching scenes get an
+  **IN LIBRARY** badge, even when your file is a different resolution or came
+  from another site. When a file name doesn't name the studio, the studio
+  folder is used. Already-matched files aren't matched again unless they
+  change, and the library is checked on the import-folder timer.
+- **Library naming.** Paste Whisparr's scene naming format, for example
+  `{Studio CleanTitleSlug}{.Release Date}.{Scene.CleanTitle}{.Scene.Performers}{.Quality.Title}{.MediaInfo VideoCodec}{-Release Group}`.
+  File names that fit it are read field by field, so studio, date, quality,
+  codec and group come from fixed places instead of being guessed. Names that
+  don't fit are matched by guessing as before. The settings page shows how an
+  example name is read.
 - **Local database and cache.** Every scraped post is stored in a local SQLite
   file (`scenesorter.db`). The stored fields are:
   - title fields: studio, performers, title, scene date and resolution
@@ -109,8 +120,8 @@ your library.
   It requires the studio and date to agree (±1 day) or a strong title match,
   and it skips unfinished downloads (`.part`, `.crdownload` and so on).
 - **Import folders.** Folders such as your browser or JDownloader download
-  folder are scanned on a timer (every 5 min by default), and so is the library
-  folder if you allow it. Files still being written are skipped until they've
+  folder are scanned on a timer (every 5 min by default), and so is the
+  destination folder if you allow it. Files still being written are skipped until they've
   been unchanged for a minute.
 - **stash-box scene matching.** Each scene is looked up on ThePornDB and
   StashDB in the background, one lookup every 3 s, with on-screen scenes first.
@@ -185,7 +196,7 @@ data/
   quota.json         daily action counters
   cache/thumbs/      cached thumbnails
 downloads/           default download folder   (configurable)
-library/             default sorted library    (configurable)
+destination/         default destination for finished downloads (configurable)
 ```
 
 Relative paths in Settings are resolved against the exe's folder, so you can
@@ -202,7 +213,9 @@ scenesorter/
   merge.py         Exact + fuzzy merging across sites/resolutions
   sources/         Source plugin interface + adapters (wordpress.py = generic WP REST)
   downloader.py    Download queue (HTTP with progress; torrent hand-off)
-  library.py       Rename templates, sort into library, scan owned files
+  library.py       Rename templates, move finished downloads to the destination
+  importer.py      Match files on disk to scenes (import folders, library scan)
+  naming.py        Read file names that follow a Whisparr-style naming format
   db.py            SQLite cache: posts, per-resolution files, download history
   quota.py         Rolling 24h per-source action counter
   updater.py       GitHub Releases self-update

@@ -18,7 +18,9 @@ from .. import __version__, updater
 from ..config import CACHE_DIR, DATA_DIR, Settings
 from ..db import Database
 from ..downloader import DownloadManager, Job, State
-from ..library import scan_library, sort_into_library
+from ..library import sort_into_library
+import logging
+from ..importer import scan_library
 from ..merge import (
     MERGE_VERSION, cache_from_groups, group_rows, merge_incremental, merge_releases, studio_key,
 )
@@ -105,6 +107,8 @@ def rebuild_bundle(releases: list[Release], flags: dict, pref: str, hidden: tupl
             "cache": new_cache, "merged": merged, "rows": group_rows(new_cache, merged)}
 
 
+log = logging.getLogger(__name__)
+
 class Progress(QObject):
     """Thread-safe progress for long steps (loading, merging, filtering, performers).
     ``report``/``done`` may be called from worker threads; the bar updates on the UI thread."""
@@ -178,7 +182,9 @@ class MainWindow(QMainWindow):
         self._rebuild_running = False
         self._rebuild_dirty = False
         self.sources: dict[str, Source] = {}
-        self.owned: dict[str, list[Path]] = {}
+        self.owned: dict[str, list[Path]] = {}  # scene key -> files in the (Whisparr) library
+        self._library_running = False
+        self._library_checked = False
         self.scenes: list[Scene] = []
 
         self.bridge = _JobBridge()
@@ -570,7 +576,8 @@ class MainWindow(QMainWindow):
 
     def _apply_import_timer(self) -> None:
         mins = self.settings.import_scan_minutes
-        if mins > 0 and (self.settings.import_dirs or self.settings.scan_library_dir):
+        if mins > 0 and (self.settings.import_dirs or self.settings.scan_destination_dir
+                         or self.settings.library_dir.strip()):
             self.import_timer.start(mins * 60_000)
             QTimer.singleShot(20_000, lambda: self.scan_import_dirs(interactive=False))
         else:
@@ -578,8 +585,9 @@ class MainWindow(QMainWindow):
 
     def scan_import_dirs(self, interactive: bool) -> None:
         dirs = [str(Settings.resolve(d)) for d in self.settings.import_dirs if d.strip()]
-        if self.settings.scan_library_dir:
-            dirs.append(str(Settings.resolve(self.settings.library_dir)))
+        self.rescan_library()  # the library is checked on the same timer
+        if self.settings.scan_destination_dir:
+            dirs.append(str(Settings.resolve(self.settings.destination_dir)))
         dirs = [d for d in dirs if Path(d).is_dir()]
         if dirs:
             self.import_paths(dirs, interactive=interactive, incremental=True)
@@ -1072,6 +1080,9 @@ class MainWindow(QMainWindow):
             self.model.covers = self._covers()
             self.model.status, self.model.hidden = bundle["status"], bundle["hidden"]
             self.model.set_scenes(scenes, set(self.owned))
+            if not self._library_checked:  # first scenes in: check the library once
+                self._library_checked = True
+                QTimer.singleShot(3000, self.rescan_library)
             self._update_group_box(bundle["groups"])
             self._update_codec_box(bundle["codecs"])
             self.studios.set_scenes(scenes, self.model.has, bool(self.logos.boxes))
@@ -1300,12 +1311,34 @@ class MainWindow(QMainWindow):
         self.group_box.blockSignals(False)
 
     def rescan_library(self) -> None:
-        lib = Settings.resolve(self.settings.library_dir)
-        run_async(scan_library, lib, on_done=self._library_scanned, pool="cpu")
+        """Scan the final, studio-sorted library (read-only) and mark what's in it."""
+        lib = self.settings.library_dir.strip()
+        if not lib:
+            if self.owned:
+                self._library_scanned(None)
+            return
+        if self._library_running or not self.scenes:
+            return
+        self._library_running = True
+        root = str(Settings.resolve(lib))
+        run_async(scan_library, root, list(self.scenes), self.db.scanned_under(root),
+                  self.db.studio_names(), self.settings.library_naming,
+                  on_done=self._library_scanned, on_fail=self._library_failed, pool="cpu")
 
-    def _library_scanned(self, owned: dict) -> None:
-        self.owned = owned
-        self.model.set_status(owned=set(owned))
+    def _library_failed(self, err: str) -> None:
+        self._library_running = False
+        log.warning("library scan failed: %s", err.splitlines()[0] if err else err)
+
+    def _library_scanned(self, res) -> None:
+        self._library_running = False
+        if res is None:
+            self.owned = {}
+        else:
+            if res.rows:
+                self.db.save_scanned(res.rows)
+            self.owned = res.owned
+            log.info("library: %d files, %d scenes, %d unmatched", res.files, len(res.owned), res.unmatched)
+        self.model.set_status(owned=set(self.owned))
 
     # --------------------------------------------------------------- detail
     def render_detail(self, pane: ScenePane, scene: Scene) -> None:
@@ -1649,7 +1682,7 @@ class MainWindow(QMainWindow):
     def _on_download_finished(self, job: Job) -> None:
         """Runs on the download thread."""
         if self.settings.auto_sort_completed and job.path:
-            job.final_path = sort_into_library(job.path, job.release, Settings.resolve(self.settings.library_dir),
+            job.final_path = sort_into_library(job.path, job.release, Settings.resolve(self.settings.destination_dir),
                                                self.settings.rename_template, rename=self.settings.rename_files)
 
     def _job_changed(self, job: Job) -> None:
@@ -1675,8 +1708,6 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(val)
             item.setData(Qt.ItemDataRole.UserRole, job.id)
             self.table.setItem(row, col, item)
-        if job.state == State.DONE and job.final_path:
-            self.rescan_library()
 
     def _cancel_selected(self) -> None:
         for idx in self.table.selectionModel().selectedRows():

@@ -35,7 +35,25 @@ class SettingsDialog(QDialog):
         gen = QWidget()
         form = QFormLayout(gen)
         self.download_dir = self._dir_row(form, "Download folder", settings.download_dir)
-        self.library_dir = self._dir_row(form, "Library (destination)", settings.library_dir)
+        self.destination_dir = self._dir_row(form, "Destination", settings.destination_dir)
+        self.destination_dir.setToolTip("Finished downloads are renamed and moved here, for Whisparr to pick up")
+        self.library_dir = self._dir_row(form, "Library", settings.library_dir)
+        self.library_dir.setPlaceholderText("your sorted collection, Library/<Studio>/<file> (read only)")
+        self.library_dir.setToolTip("Your final collection after Whisparr has sorted it, one folder per studio. "
+                                    "SceneSorter never changes it: it's scanned and matching scenes show IN LIBRARY. "
+                                    "The studio folder is used when a file name doesn't name the studio.")
+        self.library_naming = QLineEdit(settings.library_naming)
+        self.library_naming.setPlaceholderText("{Studio CleanTitleSlug}{.Release Date}.{Scene.CleanTitle}"
+                                               "{.Scene.Performers}{.Quality.Title}{.MediaInfo VideoCodec}{-Release Group}")
+        self.library_naming.setToolTip("Paste the scene naming format from Whisparr (Settings ▸ Media Management). "
+                                       "File names that fit it are read field by field; others are matched by "
+                                       "guessing. Leave empty to always guess.")
+        self.naming_preview = QLabel()
+        self.naming_preview.setWordWrap(True)
+        self.naming_preview.setStyleSheet("color:#888")
+        self.library_naming.textChanged.connect(self._update_naming_preview)
+        form.addRow("Library naming", self.library_naming)
+        form.addRow("", self.naming_preview)
         self.template = QLineEdit(settings.rename_template)
         self.preview = QLabel()
         self.preview.setWordWrap(True)
@@ -88,7 +106,7 @@ class SettingsDialog(QDialog):
         self.pref_source.setToolTip("“Download preferred” picks: wanted resolution → preferred release group → "
                                     "this source → the rest in Sources order")
         form.addRow("Preferred source", self.pref_source)
-        self.auto_sort = QCheckBox("Move finished downloads into the library")
+        self.auto_sort = QCheckBox("Move finished downloads into the destination folder")
         self.auto_sort.setChecked(settings.auto_sort_completed)
         form.addRow("", self.auto_sort)
         self.rename = QCheckBox("Rename them with the template above (off = keep the original file name)")
@@ -176,7 +194,7 @@ class SettingsDialog(QDialog):
         imp = QWidget()
         f2 = QFormLayout(imp)
         f2.addRow(QLabel("Video files in these folders are matched to scenes by file name and marked as "
-                         "downloaded — e.g. your browser or JDownloader download folder, or Whisparr's library.\n"
+                         "downloaded — e.g. your browser or JDownloader download folder.\n"
                          "Unfinished downloads (.part, .crdownload, files still being written) are skipped. "
                          "You can also drag files or folders onto the main window."))
         self.import_dirs = QPlainTextEdit("\n".join(settings.import_dirs))
@@ -191,8 +209,10 @@ class SettingsDialog(QDialog):
         self.import_minutes = QSpinBox(minimum=0, maximum=1440, value=settings.import_scan_minutes, suffix=" min")
         self.import_minutes.setSpecialValueText("off")
         f2.addRow("Scan every", self.import_minutes)
-        self.scan_lib = QCheckBox("Also scan the library folder")
-        self.scan_lib.setChecked(settings.scan_library_dir)
+        self.scan_lib = QCheckBox("Also scan the destination folder")
+        self.scan_lib.setToolTip("Files in the destination folder are marked as downloaded. "
+                                 "The library folder is always checked on the same timer.")
+        self.scan_lib.setChecked(settings.scan_destination_dir)
         f2.addRow("", self.scan_lib)
         self.matching = QCheckBox("Match scenes on stash-box (ThePornDB / StashDB) in the background")
         self.matching.setChecked(settings.scene_matching)
@@ -234,6 +254,26 @@ class SettingsDialog(QDialog):
         lay.addWidget(tabs)
         lay.addWidget(buttons)
         self._update_preview()
+        self._update_naming_preview()
+
+    def _update_naming_preview(self) -> None:
+        from ..naming import compile_scheme, parse_with_scheme
+        scheme = self.library_naming.text().strip()
+        if not scheme:
+            self.naming_preview.setText("Empty: library file names are matched by guessing.")
+            return
+        if compile_scheme(scheme) is None:
+            self.naming_preview.setText("⚠ No {tokens} recognised — names will be matched by guessing.")
+            return
+        sample = "LittleAsians.2026-06-30.Some.Scene.Title.Kaori.Ojima.WEBDL-1080p.HEVC-PRT.mp4"
+        p = parse_with_scheme(scheme, sample)
+        if p is None:
+            self.naming_preview.setText("Scheme OK. (The built-in example name doesn't fit it, which is fine "
+                                        "if your names look different.)")
+            return
+        self.naming_preview.setText(f"Example {sample} → studio: {p.studio or '?'}, date: "
+                                    f"{p.scene_date or '?'}, title + performers: {p.words or '?'}, "
+                                    f"{p.resolution or '?'} {p.codec} {p.group}".rstrip())
 
     def _dir_row(self, form: QFormLayout, label: str, value: str) -> QLineEdit:
         edit = QLineEdit(value)
@@ -348,7 +388,9 @@ class SettingsDialog(QDialog):
         self._result = replace(
             self.s,
             download_dir=self.download_dir.text(),
-            library_dir=self.library_dir.text(),
+            destination_dir=self.destination_dir.text(),
+            library_dir=self.library_dir.text().strip(),
+            library_naming=self.library_naming.text().strip(),
             rename_template=self.template.text(),
             max_parallel_downloads=self.parallel.value(),
             torrent_blackhole_dir=self.blackhole.text().strip(),
@@ -371,7 +413,7 @@ class SettingsDialog(QDialog):
             stashboxes=self._stashboxes(),
             import_dirs=[l.strip() for l in self.import_dirs.toPlainText().splitlines() if l.strip()],
             import_scan_minutes=self.import_minutes.value(),
-            scan_library_dir=self.scan_lib.isChecked(),
+            scan_destination_dir=self.scan_lib.isChecked(),
             scene_matching=self.matching.isChecked(),
             match_interval_s=self.match_interval.value(),
         )

@@ -1,4 +1,4 @@
-"""Renaming completed downloads into the library and scanning what's owned."""
+"""Renaming completed downloads into the destination folder."""
 from __future__ import annotations
 
 import re
@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from .models import Release
-from .parsing import match_key, parse_title, enrich
+from .parsing import parse_title
 
 VIDEO_EXTS = {".mp4", ".mkv", ".wmv", ".avi", ".mov", ".m4v", ".webm"}
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -52,14 +52,14 @@ def pick_video(path: Path) -> Path | None:
     return max(vids, key=lambda p: p.stat().st_size) if vids else None
 
 
-def sort_into_library(src: Path, r: Release, library_dir: Path, template: str, rename: bool = True) -> Path:
-    """Move a finished download into the library — renamed with the template, or
+def sort_into_library(src: Path, r: Release, dest_dir: Path, template: str, rename: bool = True) -> Path:
+    """Move a finished download into the destination folder — renamed with the template, or
     (rename=False) keeping its original file name."""
     video = pick_video(src)
     if video is None:
         raise FileNotFoundError(f"No video file found in {src}")
     name = render_name(template, r, video.suffix) if rename else Path(safe_component(video.name))
-    dest = Path(library_dir) / name
+    dest = Path(dest_dir) / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         stem, n = dest.stem, 2
@@ -72,18 +72,4 @@ def sort_into_library(src: Path, r: Release, library_dir: Path, template: str, r
     return dest
 
 
-def scan_library(library_dir: Path) -> dict[str, list[Path]]:
-    """Map scene match-key -> files already in the library."""
-    owned: dict[str, list[Path]] = {}
-    root = Path(library_dir)
-    if not root.exists():
-        return owned
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
-            r = enrich(Release(source="library", post_id=str(p), post_url="", raw_title=p.stem))
-            # library files carry resolution in the name; key ignores it
-            owned.setdefault(match_key(r), []).append(p)
-    return owned
-
-
-__all__ = ["render_name", "sort_into_library", "scan_library", "pick_video", "parse_title"]
+__all__ = ["render_name", "sort_into_library", "pick_video", "parse_title"]

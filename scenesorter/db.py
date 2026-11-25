@@ -429,6 +429,14 @@ class Database:
         with self._lock:
             return {r["path"]: (r["size"], r["mtime"]) for r in self.conn.execute(q)}
 
+    def scanned_under(self, root: str) -> dict[str, tuple]:
+        """path -> (size, mtime, source, post_id) for files scanned below ``root``."""
+        root = root.rstrip("/\\")
+        with self._lock:
+            rows = self.conn.execute("SELECT path, size, mtime, source, post_id FROM scanned_files "
+                                     "WHERE substr(path, 1, ?) = ?", (len(root), root)).fetchall()
+        return {r["path"]: (r["size"], r["mtime"], r["source"], r["post_id"]) for r in rows}
+
     def save_scanned(self, rows: list[tuple]) -> None:
         """rows: (path, size, mtime, scene_key, source, post_id, score)"""
         now = time.time()

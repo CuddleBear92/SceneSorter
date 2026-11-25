@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from scenesorter.library import render_name, scan_library, sort_into_library
+from scenesorter.library import render_name, sort_into_library
+from scenesorter.importer import scan_library
 from scenesorter.merge import merge_releases
 from scenesorter.models import Release
 from scenesorter.parsing import enrich, match_key
@@ -88,11 +89,10 @@ def test_sort_and_scan_roundtrip(tmp_path):
     r = sample()
     out = sort_into_library(dl, r, lib, "{studio}/{studio} - {date} - {performers} - {title} [{resolution}]")
     assert out.exists() and not dl.exists()
-    owned = scan_library(lib)
     # a 720p post of the same scene from another site should be recognised as owned
     other = enrich(Release("premium", "x", "", "StudioName.24.01.15.Jane.Doe.Some.Title.XXX.720p.MP4-GRP"))
     scene = merge_releases([other])[0]
-    assert scene.key in owned
+    assert scene.key in scan_library(lib, [scene]).owned
 
 
 def test_version_compare():
