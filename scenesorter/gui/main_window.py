@@ -304,6 +304,11 @@ class MainWindow(QMainWindow):
         self.codec_box.currentIndexChanged.connect(
             lambda _i: self._set_filter(codec=self.codec_box.currentData() or ""))
         tb.addWidget(self.codec_box)
+        self.same_file = QCheckBox("Same file")
+        self.same_file.setToolTip("On: resolution, source, group and codec must all match one release (one "
+                                  "file) of the scene.\nOff: each may match a different release of the scene.")
+        self.same_file.toggled.connect(lambda v: self._set_filter(same_file=v))
+        tb.addWidget(self.same_file)
         self.sort_box = QComboBox()
         for key, label in SORTS.items():
             self.sort_box.addItem(f"Sort: {label}", key)
@@ -1664,7 +1669,11 @@ class MainWindow(QMainWindow):
 
     def _preferred(self, scene: Scene) -> Release:
         return preferred_release(scene, self.settings.preferred_resolution, self.settings.preferred_groups,
-                                 self._source_order(), self._assume_group())
+                                 self._source_order(), self._assume_group(), self._failed_posts())
+
+    def _failed_posts(self) -> frozenset:
+        """Releases whose download failed (e.g. no links): picked only if nothing else fits."""
+        return frozenset(k for k, v in self.flags.items() if v == "failed")
 
     def _assume_group(self) -> str:
         """Group that HEVC/AV1 posts without a group count as ('' = off)."""
@@ -1692,7 +1701,7 @@ class MainWindow(QMainWindow):
         """(verdict, release) for a scene in your library — see status.library_upgrade."""
         files = self.model.library_files.get(scene.key, [])
         return library_upgrade(scene, files, self.settings.preferred_resolution, self.model.preferred_groups,
-                               self._source_order(), self._assume_group())
+                               self._source_order(), self._assume_group(), self._failed_posts())
 
     def download_upgrades(self, scenes: list[Scene]) -> None:
         """Grab the release that meets your preference for library scenes that don't."""

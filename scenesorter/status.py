@@ -83,15 +83,26 @@ def group_of(group: str, codec: str, assume: str = "") -> str:
     return group or (assume if assume and codec in ASSUME_CODECS else "")
 
 
+def release_rank(r: Release, groups: list[str], sources: list[str], assume: str = "",
+                 avoid: frozenset | set = frozenset()) -> tuple:
+    """Sort key among releases of the same resolution: preferred group first, then one
+    that hasn't failed before, then your source order, then a real group tag over an
+    assumed one ("PRT?") from the same source."""
+    gl = [g.lower() for g in groups]
+    real = r.release_group.lower()
+    g = group_of(real, r.codec, assume.lower())
+    return (gl.index(g) if g in gl else len(gl),
+            (r.source, r.post_id) in avoid,
+            sources.index(r.source) if r.source in sources else len(sources),
+            not real)
+
+
 def preferred_release(scene: Scene, preferred_resolution: str, groups: list[str], sources: list[str],
-                      assume: str = "") -> Release:
-    """What "Download preferred" grabs: wanted resolution (or the fallback that
-    counts as complete), then preferred release group, then preferred source."""
-    def key(r: Release) -> tuple[int, int]:
-        g = group_of(r.release_group, r.codec, assume)
-        return (groups.index(g) if g in groups else len(groups),
-                sources.index(r.source) if r.source in sources else len(sources))
-    return target_release(scene, preferred_resolution, key)
+                      assume: str = "", avoid: frozenset | set = frozenset()) -> Release:
+    """What "Download preferred" grabs: wanted resolution (or the fallback that counts as
+    complete), then ``release_rank`` (group, not failed before, source, real tag)."""
+    return target_release(scene, preferred_resolution,
+                          lambda r: release_rank(r, groups, sources, assume, avoid))
 
 
 # Library files vs. your preference (wanted resolution + preferred release group)
@@ -100,7 +111,7 @@ LIB_OK, LIB_UPGRADE, LIB_BELOW = "ok", "upgrade", "below"
 
 def library_upgrade(scene: Scene, files: list[tuple], preferred_resolution: str,
                     groups: tuple[str, ...] | list[str], sources: list[str] | None = None,
-                    assume: str = "") -> tuple[str, Release | None]:
+                    assume: str = "", avoid: frozenset | set = frozenset()) -> tuple[str, Release | None]:
     """Do the library files of ``scene`` ((resolution, group[, codec]) each) meet your preference?
 
     A file meets it when it's at the resolution that counts as complete (your wanted one,
@@ -125,8 +136,5 @@ def library_upgrade(scene: Scene, files: list[tuple], preferred_resolution: str,
         return LIB_BELOW, None
     order = sources or []
 
-    def key(r: Release):
-        g = group_of(r.release_group.lower(), r.codec, assume_l)
-        return (abs(r.resolution_rank - target), prefs.index(g) if g in prefs else len(prefs),
-                order.index(r.source) if r.source in order else len(order))
-    return LIB_UPGRADE, min(cands, key=key)
+    return LIB_UPGRADE, min(cands, key=lambda r: (abs(r.resolution_rank - target),
+                                                  *release_rank(r, prefs, order, assume, avoid)))

@@ -246,3 +246,42 @@ def test_full_rescan_resumes_after_interruption(tmp_path):
     assert db.get_meta("library_full_rescan") == ""
     r3 = library_job(db, str(lib), scenes, {}, "", False, False)
     assert not r3.full and r3.folders_listed == 0
+
+
+def test_upgrade_prefers_real_tag_and_skips_failed():
+    """The Vixen case: several 1080p EncodedFapFiles posts; one tagged PRT, others only HEVC."""
+    from scenesorter.status import LIB_UPGRADE, library_upgrade, preferred_release
+
+    t = "Vixen.17.07.23.Mia.Malkova.And.Natalia.Starr.Lets.Have.A.Threesome.XXX"
+    untagged = enrich(Release("efap", "a", "", "Vixen.Let's.Have.A.Threesome.1080P.X265.mkv"))
+    untagged.scene_date = untagged.scene_date or None
+    tagged = enrich(Release("efap", "b", "", f"{t}.1080p.HEVC.x265.PRT.mp4"))
+    other = enrich(Release("efap", "c", "", "Vixen.17.07.23.Mia.Malkova.And.Natalia.Starr.Lets.Have.a.Threesome.1080p.1080p.H265.HEVC.mkv"))
+    pr = enrich(Release("pornrips", "d", "", f"{t}.1080p.HEVC.x265.PRT"))
+    from scenesorter.models import Scene
+    scene = Scene(key="vixen", releases=[untagged, other, tagged, pr])
+    order = ["efap", "pornrips"]
+    files = [("720p", "", "AVC")]
+    verdict, rel = library_upgrade(scene, files, "1080p", ("prt",), order, "PRT")
+    assert verdict == LIB_UPGRADE and rel.post_id == "b"         # real PRT tag, preferred source
+    assert preferred_release(scene, "1080p", ["PRT"], order, "PRT").post_id == "b"
+    # if that one failed before (e.g. no links), the next best is used instead
+    failed = frozenset({("efap", "b")})
+    assert library_upgrade(scene, files, "1080p", ("prt",), order, "PRT", failed)[1].post_id in ("a", "c")
+
+
+def test_same_file_filter():
+    from scenesorter.views import ViewSpec, ViewState, compute_view
+
+    split = _multi("Studio.24.02.01.Split.Scene.XXX.1080p.MP4-GRP")               # 1080p but not PRT...
+    split.releases.append(enrich(Release("efap", "x", "", "Studio.24.02.01.Split.Scene.XXX.720p.HEVC.x265.PRT")))
+    whole = _multi("Studio.24.02.02.Whole.Scene.XXX.1080p.HEVC.x265.PRT")
+    scenes = [split, whole]
+    for s in scenes:
+        for r in s.releases:
+            r.source = "efap"
+    spec = ViewSpec(resolution="1080p", group="PRT", codec="HEVC", source="efap")
+    loose = {s.key for s in compute_view(scenes, spec, ViewState())}
+    spec.same_file = True
+    strict = {s.key for s in compute_view(scenes, spec, ViewState())}
+    assert loose == {split.key, whole.key} and strict == {whole.key}

@@ -191,6 +191,16 @@ studio-sorted library to show what you already have.
   finished lists. New posts no longer move what you're looking at: the card at
   the top of the view stays put. Click empty space, click the selected card
   again, or press Esc to deselect.
+- **Same-file filtering.** With **Same file** ticked in the toolbar, the
+  resolution, source, group and codec filters must all match one release of
+  the scene. "1080p · EncodedFapFiles · PRT · HEVC" then only lists scenes
+  that have such a file. Without it, each filter may match a different
+  release. The group filter matches real tags only, not "PRT?".
+- **Which release gets picked.** Download preferred and Download upgrade both
+  go by resolution first, then preferred group. Ties are broken in this order:
+  1. a release whose download hasn't failed before
+  2. your source order
+  3. a real group tag over an assumed "PRT?" from the same source
 - **Sorting and codec filter.** Sort by newest posted (the default), scene
   date, studio A–Z (newest first within each studio), title or length. Filter
   by video codec (HEVC, AVC, AV1, VP9, …), read from the release name, file

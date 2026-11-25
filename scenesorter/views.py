@@ -38,6 +38,9 @@ class ViewSpec:
     have: str = ""
     show_hidden: bool = False
     sort: str = "posted"
+    # resolution/source/group/codec must all match the *same* release (one file), not
+    # just appear somewhere among the scene's releases
+    same_file: bool = False
 
     def copy(self) -> "ViewSpec":
         return ViewSpec(**{f.name: getattr(self, f.name) for f in fields(self)})
@@ -180,6 +183,12 @@ def compute_view(scenes: list[Scene], spec: ViewSpec, st: ViewState) -> list[Sce
         if spec.group and spec.group not in ix.groups[i]:
             continue
         if spec.codec and spec.codec not in ix.codecs[i]:
+            continue
+        if spec.same_file and (spec.resolution or spec.source or spec.group or spec.codec) and not any(
+                (not spec.resolution or r.resolution == spec.resolution)
+                and (not spec.source or r.source == spec.source)
+                and (not spec.group or r.release_group == spec.group)
+                and (not spec.codec or r.codec == spec.codec) for r in s.releases):
             continue
         if words:
             hay = ix.hay[i]
